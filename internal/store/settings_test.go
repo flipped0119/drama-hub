@@ -773,3 +773,95 @@ func TestCoverTimeoutDefaultAndBounds(t *testing.T) {
 		t.Fatalf("越界写入后 cover_timeout_sec = %d, 期望仍是 60", kept)
 	}
 }
+
+// Jellyfin 五项配置（MKACG-654 / ADR-0012）：键名、类型、默认值、范围与归一化。
+//
+// 两条容易写错的：api_key 是「空 = 未配置」的密钥（空串合法、不回显、长度不设下限），
+// library_root 是容器内绝对路径（去尾 /、不能是根）。默认值与范围的真值在
+// docs/DEV-STANDARDS.md「配置」表。
+func TestJellyfinSettings(t *testing.T) {
+	db := newTestDB(t)
+	s := NewSettings(db)
+	ctx := context.Background()
+
+	// 默认值：三项启用条件都空着，前缀与超时有默认值。
+	if got, err := s.String(ctx, KeyJellyfinURL); err != nil || got != "" {
+		t.Errorf("jellyfin_url 默认 = %q, %v，期望空串", got, err)
+	}
+	if got, err := s.String(ctx, KeyJellyfinAPIKey); err != nil || got != "" {
+		t.Errorf("jellyfin_api_key 默认 = %q, %v，期望空串（= 未配置）", got, err)
+	}
+	if got, err := s.String(ctx, KeyJellyfinLibraryRoot); err != nil || got != "" {
+		t.Errorf("jellyfin_library_root 默认 = %q, %v，期望空串", got, err)
+	}
+	if got, err := s.String(ctx, KeyJellyfinLibraryPrefix); err != nil || got != "短剧 - " {
+		t.Errorf("jellyfin_library_prefix 默认 = %q, %v，期望 %q", got, err, "短剧 - ")
+	}
+	if got, err := s.Int(ctx, KeyJellyfinTimeoutSec); err != nil || got != 10 {
+		t.Errorf("jellyfin_timeout_sec 默认 = %d, %v，期望 10", got, err)
+	}
+
+	t.Run("合法值", func(t *testing.T) {
+		cases := []struct {
+			key  SettingKey
+			raw  string
+			want string // 读回的归一化值
+		}{
+			{KeyJellyfinURL, "http://jellyfin:8096/", "http://jellyfin:8096"},
+			{KeyJellyfinAPIKey, "abc123", "abc123"},
+			{KeyJellyfinAPIKey, "", ""},                 // 清空 = 回到未配置
+			{KeyJellyfinAPIKey, "  abc123  ", "abc123"}, // 手抄 key 的尾空格
+			{KeyJellyfinLibraryRoot, "/data/video/dramahub/", "/data/video/dramahub"},
+			{KeyJellyfinLibraryRoot, "", ""},
+			{KeyJellyfinLibraryPrefix, "库 - ", "库 - "},
+			{KeyJellyfinTimeoutSec, "1", "1"},
+			{KeyJellyfinTimeoutSec, "60", "60"},
+		}
+		for _, c := range cases {
+			if err := s.Set(ctx, c.key, c.raw); err != nil {
+				t.Errorf("Set(%s, %q) = %v, 期望通过", c.key, c.raw, err)
+				continue
+			}
+			var got string
+			if c.key == KeyJellyfinTimeoutSec {
+				n, err := s.Int(ctx, c.key)
+				if err != nil {
+					t.Errorf("Int(%s): %v", c.key, err)
+					continue
+				}
+				got = strconv.Itoa(n)
+			} else {
+				str, err := s.String(ctx, c.key)
+				if err != nil {
+					t.Errorf("String(%s): %v", c.key, err)
+					continue
+				}
+				got = str
+			}
+			if got != c.want {
+				t.Errorf("%s 写入 %q 后读回 %q, 期望 %q", c.key, c.raw, got, c.want)
+			}
+		}
+	})
+
+	t.Run("非法值不落库", func(t *testing.T) {
+		invalid := []struct {
+			key SettingKey
+			raw string
+		}{
+			{KeyJellyfinURL, "/relative"},        // 相对 URL
+			{KeyJellyfinURL, "http:///no-host"},  // 没有 host
+			{KeyJellyfinLibraryRoot, "/"},        // 根目录
+			{KeyJellyfinLibraryRoot, "relative"}, // 不是绝对路径
+			{KeyJellyfinLibraryPrefix, ""},       // 空前缀：会让所有库都算自管
+			{KeyJellyfinTimeoutSec, "0"},
+			{KeyJellyfinTimeoutSec, "61"},
+			{KeyJellyfinTimeoutSec, "10s"},
+		}
+		for _, c := range invalid {
+			if err := s.Set(ctx, c.key, c.raw); !errors.Is(err, ErrInvalidSetting) {
+				t.Errorf("Set(%s, %q) = %v, 期望 ErrInvalidSetting", c.key, c.raw, err)
+			}
+		}
+	})
+}

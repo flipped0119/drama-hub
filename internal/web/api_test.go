@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
@@ -79,7 +80,14 @@ func (f *fakeSchedule) Status(context.Context) ([]scheduler.SourceStatus, error)
 }
 
 // newTestServer 起一套真实依赖：临时数据库 + 真 handler。不 mock 自己的 handler。
+// 媒体库维护用空替身（未配置、没有历史），用例要给定现状时用 newTestServerWith。
 func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
+	t.Helper()
+	return newTestServerWith(t, &fakeJellyfin{})
+}
+
+// newTestServerWith 与 newTestServer 相同，只换媒体库维护的依赖。
+func newTestServerWith(t *testing.T, jellyfinMgr Jellyfin) (*Server, *store.Store, *fakeSyncer) {
 	t.Helper()
 	db, err := store.Open(context.Background(), pgtest.DSN(t))
 	if err != nil {
@@ -91,9 +99,27 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *fakeSyncer) {
 	syncer := &fakeSyncer{}
 	// 状态页的播放源清单由装配根给（生产里来自注册表），测试固定一个源。
 	sources := []Source{{Name: "web", Label: "红果官网 SSR"}}
-	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, sources, testAdminToken,
-		slog.New(slog.DiscardHandler)), st, syncer
+	return NewServer(st, store.NewSettings(db.DB), syncer, &fakeSchedule{}, jellyfinMgr, sources,
+		testAdminToken, slog.New(slog.DiscardHandler)), st, syncer
 }
+
+// fakeJellyfin 是媒体库维护依赖的替身：记下触发次数与 prune 标志，现状由用例给定。
+// 真实的差异算法、HTTP 客户端与单飞锁由 internal/jellyfin 自己覆盖（plan_test /
+// manager_test 打 httptest 假 Jellyfin），这里只关心管理面「触发后回了什么码」。
+type fakeJellyfin struct {
+	state    jellyfin.State
+	startErr error
+	calls    int
+	prune    bool
+}
+
+func (f *fakeJellyfin) Start(_ context.Context, prune bool) error {
+	f.calls++
+	f.prune = prune
+	return f.startErr
+}
+
+func (f *fakeJellyfin) State(context.Context) jellyfin.State { return f.state }
 
 // testAdminToken 是测试里的管理令牌：写操作（非 GET/HEAD/OPTIONS）要带它，
 // 与生产里 DRAMA_HUB_ADMIN_TOKEN 的作用相同。
@@ -664,8 +690,8 @@ func TestAPI_Refresh_RealScheduler(t *testing.T) {
 	sched := scheduler.New(st, settings,
 		[]plugin.Plugin{&realSource{}},
 		map[string]scheduler.Syncer{"web": syncer},
-		slog.New(slog.DiscardHandler))
-	srv := NewServer(st, settings, syncer, sched, []Source{{Name: "web", Label: "红果官网 SSR"}},
+		slog.New(slog.DiscardHandler), nil)
+	srv := NewServer(st, settings, syncer, sched, &fakeJellyfin{}, []Source{{Name: "web", Label: "红果官网 SSR"}},
 		testAdminToken, slog.New(slog.DiscardHandler))
 
 	if rec := do(t, srv, http.MethodPost, "/api/refresh", `{"source":"web"}`); rec.Code != http.StatusAccepted {

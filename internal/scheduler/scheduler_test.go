@@ -215,7 +215,7 @@ func newHarness(t *testing.T, sources ...*fakeSource) *harness {
 		syncers[src.name] = syncer
 	}
 	logger := slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	h.s = New(h.st, h.settings, plugins, syncers, logger)
+	h.s = New(h.st, h.settings, plugins, syncers, logger, nil)
 	h.s.now = h.clock.Now
 	return h
 }
@@ -428,6 +428,50 @@ func TestRound_TimeoutKeepsCursor(t *testing.T) {
 	}
 }
 
+// TestRound_AfterRoundHook 覆盖轮末钩子（MKACG-654 / AC-10）：一轮结束恰好一次，
+// 且在 saveState 之后（钩子看到的状态已经是这一轮的结果）；钩子自己的失败不改变
+// source_state —— 这是「Jellyfin 挂了不影响同步」的实现依据。
+func TestRound_AfterRoundHook(t *testing.T) {
+	src := &fakeSource{name: "web"}
+	h := newHarness(t, src)
+
+	var (
+		mu        sync.Mutex
+		calls     int
+		stateSeen store.SourceState
+	)
+	h.s.afterRound = func(context.Context) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		st, err := h.st.LoadState(context.Background(), "web")
+		if err != nil {
+			t.Errorf("钩子里读 source_state: %v", err)
+		}
+		stateSeen = st
+	}
+
+	h.runRound("web")
+
+	mu.Lock()
+	gotCalls := calls
+	seen := stateSeen
+	mu.Unlock()
+	if gotCalls != 1 {
+		t.Fatalf("钩子被调用 %d 次, 期望 1（一轮一次）", gotCalls)
+	}
+	if seen.LastRunAt == "" {
+		t.Error("钩子看到的状态里没有 last_run_at：它必须在 saveState 之后被调用")
+	}
+
+	// 钩子抛错（或者它内部的依赖挂了）不改变这一轮的状态：这里用「把 state 改成
+	// 失败样子」做不到，改为断言钩子返回后再读状态与钩子执行前一致。
+	after := h.state("web")
+	if after.LastError != "" || after.LastRunAt != seen.LastRunAt {
+		t.Errorf("钩子执行后 source_state 变了：%+v → %+v", seen, after)
+	}
+}
+
 // TestRound_FailureAdvancesNextDue 覆盖「失败也推进 next_due、不做退避」：连续三轮
 // 失败，每次 next_due 都等于 last_run_at + 现读 interval。
 func TestRound_FailureAdvancesNextDue(t *testing.T) {
@@ -593,7 +637,7 @@ func TestStatus_NextDueRestartAndNoColumn(t *testing.T) {
 
 	// 重启：同一库、同一配置，只是新的调度器实例。
 	restarted := New(h.st, h.settings, []plugin.Plugin{src},
-		map[string]Syncer{"web": h.syncers["web"]}, slog.New(slog.DiscardHandler))
+		map[string]Syncer{"web": h.syncers["web"]}, slog.New(slog.DiscardHandler), nil)
 	restarted.now = h.clock.Now
 	list, err := restarted.Status(context.Background())
 	if err != nil {
@@ -695,7 +739,7 @@ func TestIntervalHotRead(t *testing.T) {
 
 // TestWaitUntil 锁定「配置最多 60 秒被感知」这条上界：默认配置下睡眠时间不超过 60 秒。
 func TestWaitUntil(t *testing.T) {
-	s := New(nil, nil, nil, nil, slog.New(slog.DiscardHandler))
+	s := New(nil, nil, nil, nil, slog.New(slog.DiscardHandler), nil)
 	if s.poll != 60*time.Second {
 		t.Fatalf("默认感知上界 = %v, 期望 60s", s.poll)
 	}

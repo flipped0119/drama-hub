@@ -175,6 +175,9 @@ function initStatus() {
   const form = document.getElementById('settings-form');
   const saveBtn = document.getElementById('settings-save');
   const hint = document.getElementById('settings-hint');
+  const jellyfinBody = document.getElementById('jellyfin');
+  const jellyfinBtn = document.getElementById('jellyfin-sync');
+  const jellyfinHint = document.getElementById('jellyfin-hint');
 
   // 表单字段 ↔ settings 键。页面不另写一份校验：值原样交给 PATCH，越界由服务端的
   // 注册表拒（400），这里只显示服务端给的原因。
@@ -192,6 +195,16 @@ function initStatus() {
     webdav_user: 'set-webdav-user',
     webdav_pass: 'set-webdav-pass',
   };
+
+  // Jellyfin 的四项可改配置：输入框 id、settings 键、/api/status 里的字段名三者不同名，
+  // 所以逐项列出来（不靠命名约定拼字符串）。它们不在 config 块里，基线单独存一份。
+  const jellyfinFields = [
+    { key: 'jellyfin_url', id: 'set-jellyfin-url', view: 'url' },
+    { key: 'jellyfin_library_root', id: 'set-jellyfin-root', view: 'library_root' },
+    { key: 'jellyfin_library_prefix', id: 'set-jellyfin-prefix', view: 'library_prefix' },
+    { key: 'jellyfin_timeout_sec', id: 'set-jellyfin-timeout', view: 'timeout_sec' },
+  ];
+  let jellyfinBaseline = {};
 
   let baseline = {}; // 上次读到的值：提交时只发改过的项（清空 strm_prefix 也算改）
   let prefilled = false; // 表单只在首次加载与保存成功后回填，不冲掉正在打的值
@@ -316,14 +329,88 @@ function initStatus() {
   function syncHint() {
     if (!adminWritable) {
       saveBtn.disabled = true;
+      jellyfinBtn.disabled = true;
       hint.textContent = '未设置 DRAMA_HUB_ADMIN_TOKEN：后台改配置不可用（所有写操作都会 401）。' +
         '在服务端加上这个 env 再重启，然后用这个表单改配置。';
+      jellyfinHint.textContent = '同步媒体库是写操作，同样需要 DRAMA_HUB_ADMIN_TOKEN。';
       return;
     }
     saveBtn.disabled = adminToken() === '';
+    jellyfinBtn.disabled = adminToken() === '';
+    jellyfinHint.textContent = adminToken() === ''
+      ? '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再点「同步媒体库」（令牌只存在本标签页）。'
+      : '只增不删：分类消失只在这里列成「孤儿库」。';
     hint.textContent = adminToken() === ''
       ? '先在顶栏「管理令牌」里填 DRAMA_HUB_ADMIN_TOKEN，再保存（令牌只存在本标签页）。'
       : '写 PATCH /api/settings；非法值整批拒绝（400）且库里不动；密码不回显，留空表示不改。';
+  }
+
+  // renderJellyfin 渲染媒体库现状：配置四项 + 上次结果。孤儿库只报告，prune 不进 UI
+  // （破坏性动作只走 API，少一个误点路径）。
+  function renderJellyfin(j) {
+    const orphans = j.orphans.length === 0 ? '—' : j.orphans.join('、');
+    const conflicts = j.conflicts.length === 0 ? '—' : j.conflicts.join('、');
+    const missing = j.missing.length === 0 ? '' : '（缺 ' + j.missing.join('、') + '）';
+    const state = j.running
+      ? el('span', { class: 'tag', text: '正在同步' })
+      : j.configured
+        ? el('span', { class: 'tag', text: '已启用' })
+        : el('span', { class: 'tag warn', text: '未配置' });
+    jellyfinBody.replaceChildren(
+      row('状态', el('span', {}, state, missing), '即时',
+        '地址 / API key / 媒体库根三项都非空才启用；留空 = 整段关闭'),
+      row('地址', j.url === '' ? '—' : j.url, '即时', 'jellyfin_url', true),
+      row('媒体库根', j.library_root === '' ? '—' : j.library_root, '即时',
+        'jellyfin_library_root，必须是 Jellyfin 容器内看到的路径', true),
+      row('库名前缀', j.library_prefix, '即时',
+        'jellyfin_library_prefix，只操作带这个前缀的库'),
+      row('API key', flag(j.api_key_set), '即时', 'jellyfin_api_key（只写不读，状态面不返回值）'),
+      row('单次超时', j.timeout_sec + ' 秒', '即时', 'jellyfin_timeout_sec，每次出站请求一个超时'),
+      row('上次同步', fmtTime(j.last_run_at), '—', '状态只在内存里：重启后回到「未运行」'),
+      row('上次成功', fmtTime(j.last_ok_at), '—', '孤儿与同名冲突不算失败，也会推进这一项'),
+      row('上次错误', j.last_error === '' ? '—' : el('span', { class: 'mono', text: j.last_error }), '—',
+        'Jellyfin 不可用只影响这一段：同步、WebDAV、播放都不受影响'),
+      row('上次新建', String(j.created), '—', '这一轮建了几个库；0 = 幂等命中'),
+      row('结果未知', String(j.uncertain), '—',
+        '建库请求超时、Jellyfin 侧是否建成不确定的条数（不计入新建）。下一轮同步会以列库结果收口'),
+      row('被拒分类', j.failed.length === 0 ? '—' : el('span', { class: 'mono', text: j.failed.join('、') }), '—',
+        'Jellyfin 拒绝建库的分类：多半是库路径在 Jellyfin 容器内不存在。修好路径后下一轮自动补上'),
+      row('孤儿库', orphans, '—',
+        '分类已消失的自管库。默认不删，删除走 POST /api/jellyfin/libraries {"prune":true}'),
+      row('冲突库', conflicts, '—', '同名库不是本服务建的：不建、不删、不接管'));
+  }
+
+  // fillJellyfin 把媒体库配置填进表单并记基线；api key 永远留空（只写不读）。
+  function fillJellyfin(j) {
+    jellyfinBaseline = {};
+    for (const f of jellyfinFields) {
+      jellyfinBaseline[f.key] = String(j[f.view]);
+      document.getElementById(f.id).value = jellyfinBaseline[f.key];
+    }
+    setJellyfinKeyPlaceholder(j);
+  }
+
+  // setJellyfinKeyPlaceholder 只更新 key 输入框的占位符与清空值：值不回显。
+  function setJellyfinKeyPlaceholder(j) {
+    const input = document.getElementById('set-jellyfin-api-key');
+    input.value = '';
+    input.placeholder = j.api_key_set ? '已设置，留空不改' : '未设置（这一段不启用）';
+  }
+
+  // syncJellyfin 手动触发一轮媒体库同步：202 = 已派出去，409 = 上一轮还在跑，
+  // 400 = 三项没配齐（响应体点名缺哪个键）。结果一律回读 /api/status，不猜结局。
+  async function syncJellyfin() {
+    jellyfinBtn.disabled = true;
+    say('已请求同步 Jellyfin 媒体库 …', 'busy');
+    try {
+      await api('POST', '/api/jellyfin/libraries', {});
+      say('已派出一轮媒体库同步，结果看「上次同步」与「上次错误」', 'ok');
+    } catch (err) {
+      fail(err);
+    } finally {
+      await load().catch(fail);
+      syncHint();
+    }
   }
 
   async function load() {
@@ -335,14 +422,17 @@ function initStatus() {
       stat('对外集', String(t.emby_items)),
       stat('最近同步', fmtTime(t.last_sync_at), true));
     renderConfig(status.config);
+    renderJellyfin(status.jellyfin);
     sourcesBody.replaceChildren(...status.sources.map(sourceRow));
     adminWritable = status.admin_token_set === true;
     if (!prefilled) {
       prefilled = true;
       fillSettings(status.config);
+      fillJellyfin(status.jellyfin);
     } else {
       // 凭据输入框每次回读都清空：值不回显，占位符按最新的「已设置/未设置」更新。
       setCredentialPlaceholders(status.config);
+      setJellyfinKeyPlaceholder(status.jellyfin);
     }
     syncHint();
   }
@@ -358,6 +448,13 @@ function initStatus() {
       const value = document.getElementById(id).value.trim();
       if (value !== '') payload[key] = value;
     }
+    for (const f of jellyfinFields) {
+      const value = document.getElementById(f.id).value.trim();
+      if (value !== (jellyfinBaseline[f.key] || '')) payload[f.key] = value;
+    }
+    // key 只写不读：留空 = 不改（要清空就显式传空串，这条只走 API）。
+    const jellyfinKey = document.getElementById('set-jellyfin-api-key').value.trim();
+    if (jellyfinKey !== '') payload.jellyfin_api_key = jellyfinKey;
     if (Object.keys(payload).length === 0) {
       say('没有改动', 'ok');
       return;
@@ -373,7 +470,14 @@ function initStatus() {
         document.getElementById(id).value = String(value);
         baseline[key] = String(value);
       }
+      for (const f of jellyfinFields) {
+        const value = data.settings[f.key];
+        if (value === undefined || value === null) continue;
+        document.getElementById(f.id).value = String(value);
+        jellyfinBaseline[f.key] = String(value);
+      }
       for (const id of Object.values(credentials)) document.getElementById(id).value = '';
+      document.getElementById('set-jellyfin-api-key').value = '';
       say('已写入：' + Object.keys(data.settings).join('、') + '（生效时机见「运行配置」）', 'ok');
       await load();
     } catch (err) {
@@ -383,7 +487,9 @@ function initStatus() {
     }
   });
 
-  // 顶栏令牌改动后立刻更新提示与保存按钮状态。
+  jellyfinBtn.addEventListener('click', syncJellyfin);
+
+  // 顶栏令牌改动后立刻更新提示与按钮状态。
   const tokenInput = document.getElementById('admin-token');
   if (tokenInput) tokenInput.addEventListener('input', syncHint);
 

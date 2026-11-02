@@ -47,6 +47,29 @@
       <span>刷新间隔秒 · ≤60 秒</span>
       <input id="set-refresh-interval" name="refresh_interval_sec" inputmode="numeric" autocomplete="off">
     </label>
+    <label class="field">
+      <span>Jellyfin 地址 · 即时</span>
+      <input id="set-jellyfin-url" name="jellyfin_url" autocomplete="off" spellcheck="false"
+             placeholder="空 = 关闭（如 http://jellyfin:8096）">
+    </label>
+    <label class="field">
+      <span>Jellyfin API key · 即时</span>
+      <input id="set-jellyfin-api-key" name="jellyfin_api_key" type="password"
+             autocomplete="new-password" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>媒体库根（Jellyfin 容器内）· 即时</span>
+      <input id="set-jellyfin-root" name="jellyfin_library_root" autocomplete="off" spellcheck="false"
+             placeholder="空 = 关闭（如 /data/video/dramahub）">
+    </label>
+    <label class="field">
+      <span>库名前缀 · 即时</span>
+      <input id="set-jellyfin-prefix" name="jellyfin_library_prefix" autocomplete="off" spellcheck="false">
+    </label>
+    <label class="field">
+      <span>单次请求超时秒 · 即时</span>
+      <input id="set-jellyfin-timeout" name="jellyfin_timeout_sec" inputmode="numeric" autocomplete="off">
+    </label>
     <button type="submit" class="btn primary" id="settings-save">保存配置</button>
   </form>
   <p class="hint" id="settings-hint"></p>
@@ -70,6 +93,27 @@
   </p>
 </section>
 
+<section class="block">
+  <div class="block-head">
+    <h2>Jellyfin 媒体库</h2>
+    <p class="hint">
+      一分类一库：每个分类一个库，库根指向 <code>&lt;媒体库根&gt;/&lt;分类&gt;</code>。Jellyfin 只把
+      库根的直接子目录当剧集 —— 库根挂在挂载根上时，58 个分类会被认成 58 部 Series、剧目录退化成
+      普通目录（ADR-0012 的实测依据）。库根必须是 <strong>Jellyfin 容器内</strong>看到的路径。
+      三项（地址 / API key / 媒体库根）都填上才启用；只增不删：分类消失只报告「孤儿库」，删除必须走
+      <code>POST /api/jellyfin/libraries</code> 带 <code>{"prune":true}</code>。
+    </p>
+  </div>
+  <p class="hint" id="jellyfin-hint"></p>
+  <div class="scroll">
+    <table class="grid">
+      <caption class="sr-only">Jellyfin 媒体库</caption>
+      <thead><tr><th>项</th><th>值</th><th>说明</th></tr></thead>
+      <tbody id="jellyfin"></tbody>
+    </table>
+  </div>
+  <button type="button" class="btn primary" id="jellyfin-sync">同步媒体库</button>
+</section>
 <section class="block">
   <div class="block-head">
     <h2>运行配置</h2>

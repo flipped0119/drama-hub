@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
@@ -80,14 +81,73 @@ type sourceView struct {
 	NextDueAt   string `json:"next_due_at"`
 }
 
-// statusView 是 GET /api/status 的响应体：同步计数 + 运行配置 + 播放源 + 缓存面。
+// jellyfinView 是 Jellyfin 媒体库维护的现状（一分类一库，ADR-0012）。
+//
+// api_key 永不出现在响应里：只给 api_key_set。configured=false 时 missing 说明缺哪几个
+// 键 —— 这是「配了却没生效」唯一需要人看的一句话。created / uncertain / orphans /
+// conflicts 是上一轮的结果（内存状态，重启后回到「未运行」）。uncertain 是「请求超时、
+// Jellyfin 侧结果未知」的条数：不能并进 created（没收到 204），也不代表没建成。
+// failed 是被 Jellyfin 明确拒掉的分类名（实测 12.1：库路径在容器内不存在回 400）。
+type jellyfinView struct {
+	Configured    bool     `json:"configured"`
+	Missing       []string `json:"missing"`
+	URL           string   `json:"url"`
+	LibraryRoot   string   `json:"library_root"`
+	LibraryPrefix string   `json:"library_prefix"`
+	APIKeySet     bool     `json:"api_key_set"`
+	TimeoutSec    int      `json:"timeout_sec"`
+
+	Running   bool     `json:"running"`
+	LastRunAt string   `json:"last_run_at"`
+	LastOkAt  string   `json:"last_ok_at"`
+	LastError string   `json:"last_error"`
+	Created   int      `json:"created"`
+	Uncertain int      `json:"uncertain"`
+	Failed    []string `json:"failed"`
+	Orphans   []string `json:"orphans"`
+	Conflicts []string `json:"conflicts"`
+}
+
+// statusView 是 GET /api/status 的响应体：同步计数 + 运行配置 + 播放源 + 媒体库。
 type statusView struct {
-	Totals  totalsView   `json:"totals"`
-	Config  configView   `json:"config"`
-	Sources []sourceView `json:"sources"`
+	Totals   totalsView   `json:"totals"`
+	Config   configView   `json:"config"`
+	Sources  []sourceView `json:"sources"`
+	Jellyfin jellyfinView `json:"jellyfin"`
 	// AdminTokenSet 是「后台写操作能不能用」：false = 没配 DRAMA_HUB_ADMIN_TOKEN，
 	// 所有非读的 /api/ 请求都会 401。令牌本身不进任何响应，这里只报有没有。
 	AdminTokenSet bool `json:"admin_token_set"`
+}
+
+// jellyfinViewOf 把 Manager 的现状翻成响应体。时间写成 UTC RFC3339 文本（与库里一致），
+// 零值写空串，时区转换归页面 JS（fmtTime）。
+func jellyfinViewOf(state jellyfin.State) jellyfinView {
+	return jellyfinView{
+		Configured:    state.Configured,
+		Missing:       nonNilStrings(state.Missing),
+		URL:           state.URL,
+		LibraryRoot:   state.LibraryRoot,
+		LibraryPrefix: state.LibraryPrefix,
+		APIKeySet:     state.APIKeySet,
+		TimeoutSec:    state.TimeoutSec,
+		Running:       state.Running,
+		LastRunAt:     formatTime(state.LastRunAt),
+		LastOkAt:      formatTime(state.LastOKAt),
+		LastError:     state.LastError,
+		Created:       state.Created,
+		Uncertain:     state.Uncertain,
+		Failed:        nonNilStrings(state.Failed),
+		Orphans:       nonNilStrings(state.Orphans),
+		Conflicts:     nonNilStrings(state.Conflicts),
+	}
+}
+
+// nonNilStrings 把 nil 切片写成 []：页面按数组渲染，null 要多一条分支。
+func nonNilStrings(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return in
 }
 
 // handleStatus 处理 GET /api/status：看板只读，不改任何状态。
@@ -129,6 +189,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Totals:        totals,
 		Config:        cfg,
 		Sources:       s.readSources(ctx, schedule),
+		Jellyfin:      jellyfinViewOf(s.jellyfin.State(ctx)),
 		AdminTokenSet: s.adminToken != "",
 	})
 }

@@ -74,7 +74,7 @@ func mapSettingErr(err error) error {
 // isSecretSetting 判断一个键的值是否不该回显。
 func isSecretSetting(key store.SettingKey) bool {
 	switch key {
-	case store.KeyWebDAVPass, store.KeyStreamSecret:
+	case store.KeyWebDAVPass, store.KeyStreamSecret, store.KeyJellyfinAPIKey:
 		return true
 	}
 	return false

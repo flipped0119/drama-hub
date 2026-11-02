@@ -6,6 +6,8 @@
 - 出流服务：单集 MP4 透传（支持 Range），合并集自造 HLS 播放列表，按分片回源
 - 合并集：N 集合成 1 条剧集，时间轴精确到关键帧，**不落物化文件**
 - 缓存：分片级 LRU，上限与保留期后台可调
+- Jellyfin 媒体库：一个分类一个库（库根 = `<媒体库根>/<分类>`），配好 API key 后由服务
+  自动创建与维护，只增不删（ADR-0012）
 
 ## 快速开始
 
@@ -64,7 +66,8 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
 | `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集与对外集号） |
 | `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集（按 `ep_no` 升序） |
-| `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`admin_token_set`（写操作能不能用） |
+| `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
+| `/api/jellyfin/libraries` | POST | 202 / 400 / 401 / 409 | 手动跑一轮媒体库同步：body 可省或 `{"prune":true}`（显式删自管孤儿库）；400 = 三项配置没配齐（点名缺哪个键），409 = 上一轮还在跑；结果看 `/api/status` 的 `jellyfin` 块 |
 | `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |
 | 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
@@ -151,6 +154,20 @@ Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「�
 库根仍是 `/webdav`，Emby 逐层往下扫。若 Emby 在 DAV 根上把分类当成剧，退一步把具体
 分类目录（`/webdav/爱情` 等）逐个加成媒体文件夹。
 
+## 接到 Jellyfin（一分类一库）
+
+Emby 能逐层往下扫，Jellyfin 不能：它只把**库根的直接子目录**当剧集。库根挂在 DAV 根上时，
+分类会被认成 Series、剧目录退化成普通目录。所以用一分类一库，由本服务自动建：
+
+1. 在 Jellyfin 里建一个 API key（12.1 只认 `Authorization: MediaBrowser Token="…"`）；
+2. `PATCH /api/settings` 写 `jellyfin_url` / `jellyfin_api_key` / `jellyfin_library_root`
+   （库根填 **Jellyfin 容器内**看到的挂载根）；
+3. `POST /api/jellyfin/libraries` 跑一轮，或等同步轮末自动跑（幂等）。
+
+分类消失只列成「孤儿库」，不删库；要删必须显式 `{"prune":true}`。Jellyfin 不可达只影响这
+一段，同步/WebDAV/播放照常。步骤与核对命令见 `docs/DEPLOY.md`「5b」，理由与 API 事实见
+`docs/adr/0012-jellyfin-libraries.md`。
+
 ## 容器镜像
 
 `main` 与任意分支的每次 push 都会构建镜像，ci 全绿才推到
@@ -231,6 +248,7 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
   - `docs/adr/0006-framework-plugin-boundary.md` — 框架 / 插件边界决策
   - `docs/adr/0007-own-hls-and-local-cache.md` — 播放统一走自造 HLS、缓存收回本服务
   - `docs/adr/0010-auto-merge-chunking.md` — 合并集自动分块、手工编排移除
+  - `docs/adr/0012-jellyfin-libraries.md` — Jellyfin 一分类一库、自管判定、只增不删
   - `docs/adr/0008-image-publish.md` — 镜像发布口径：ghcr、双架构、ci 绿才发、`latest` 跟 main
 
 ## 状态

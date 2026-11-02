@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
 	"github.com/justforlxz/drama-hub/internal/store"
 )
@@ -51,11 +52,21 @@ type Server struct {
 	settings *store.Settings
 	syncer   SeriesSyncer
 	schedule Schedule
+	jellyfin Jellyfin
 	sources  []Source
 	// adminToken 是写操作的令牌（DRAMA_HUB_ADMIN_TOKEN）。空 = 没配 = 写操作一律 401。
 	adminToken string
 	logger     *slog.Logger
 	mux        *http.ServeMux
+}
+
+// Jellyfin 是 Jellyfin 媒体库维护的依赖：触发一轮，以及状态页要显示的现状。
+// 生产实现是 *jellyfin.Manager；测试注入假实现。
+//
+// 接口定义在消费方：本包只要这两个动作，不关心差异算法、单飞锁与内存状态。
+type Jellyfin interface {
+	Start(ctx context.Context, prune bool) error
+	State(ctx context.Context) jellyfin.State
 }
 
 // Schedule 是刷新调度的依赖：手动触发一轮，以及状态页要显示的调度现状。
@@ -67,8 +78,9 @@ type Schedule interface {
 	Status(ctx context.Context) ([]scheduler.SourceStatus, error)
 }
 
-// NewServer 构造路由表。st / settings / syncer / schedule 不可为 nil；sources 是
-// 状态页要列的播放源（装配根按注册表给，空表示没有源）；adminToken 是写操作的令牌
+// NewServer 构造路由表。st / settings / syncer / schedule / jellyfinMgr 不可为 nil；
+// jellyfinMgr 是媒体库维护（生产实现是 *jellyfin.Manager）；sources 是状态页要列的播放源
+// （装配根按注册表给，空表示没有源）；adminToken 是写操作的令牌
 // （`DRAMA_HUB_ADMIN_TOKEN`，空 = 没配 = 写操作一律 401）；logger 用于请求与同步日志。
 //
 // 路由分两类：两页界面（`/`、`/status` 与内嵌的 `/static/`）与管理 API
@@ -77,12 +89,13 @@ type Schedule interface {
 //
 // 写操作（非 GET/HEAD/OPTIONS）在 ServeHTTP 里先过令牌，路由表本身不重复这件事：
 // 新增写端点不需要记得加鉴权，忘不了。
-func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, sources []Source, adminToken string, logger *slog.Logger) *Server {
+func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, schedule Schedule, jellyfinMgr Jellyfin, sources []Source, adminToken string, logger *slog.Logger) *Server {
 	s := &Server{
 		st:         st,
 		settings:   settings,
 		syncer:     syncer,
 		schedule:   schedule,
+		jellyfin:   jellyfinMgr,
 		sources:    sources,
 		adminToken: adminToken,
 		logger:     logger,
@@ -102,6 +115,8 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	s.mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
 	s.mux.HandleFunc("PATCH /api/settings", s.handlePatchSettings)
+	// 建库是写操作：令牌闸门在 ServeHTTP 里统一过，这里不重复。
+	s.mux.HandleFunc("POST /api/jellyfin/libraries", s.handleJellyfinLibraries)
 	return s
 }
 

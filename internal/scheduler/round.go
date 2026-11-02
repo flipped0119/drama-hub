@@ -37,6 +37,9 @@ type roundStats struct {
 //
 // 状态写回用 context.WithoutCancel：本轮超时也要把 last_run_at 与游标落库
 // （「单轮超时不清游标」）；进程退出（父 ctx 被取消）不把它记成源故障。
+//
+// 钩子在 saveState 之后跑（Jellyfin 建库）：一轮结束就恰好一次，且它的失败不改变
+// 这一轮的 source_state —— 钩子拿到的是 parent，自己派生上下文与超时（AC-10）。
 func (s *Scheduler) runRound(parent context.Context, p plugin.Plugin, cfg sourceConfig) {
 	start := s.now()
 	ctx, cancel := context.WithTimeout(parent, cfg.timeout)
@@ -44,6 +47,9 @@ func (s *Scheduler) runRound(parent context.Context, p plugin.Plugin, cfg source
 
 	stats, roundErr := s.execute(ctx, p, cfg)
 	s.saveState(context.WithoutCancel(ctx), p.Name(), start, stats, roundErr, parent.Err() != nil)
+	if s.afterRound != nil {
+		s.afterRound(parent)
+	}
 
 	level := slog.LevelInfo
 	if roundErr != nil {
