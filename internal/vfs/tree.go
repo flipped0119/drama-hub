@@ -45,7 +45,7 @@ type Store interface {
 	ListGenres(ctx context.Context) ([]string, error)
 	// GenreExists 是非根层的唯一分类查询：目录名 → 取值集合是纯映射，只需存在性。
 	GenreExists(ctx context.Context, genre string) (bool, error)
-	ListDramasByShard(ctx context.Context, genres []string, shard int) ([]store.Drama, error)
+	ListDramaDirsByGenre(ctx context.Context, genres []string) ([]store.DramaDir, error)
 	DramaByTitleYear(ctx context.Context, title string, year int) (store.Drama, error)
 	DramaByProviderID(ctx context.Context, provider, providerID string) (store.Drama, error)
 	ListEmbyItems(ctx context.Context, dramaID int64) ([]store.EmbyItem, error)
@@ -93,8 +93,7 @@ const (
 // 「一个目录一次查询」」）：
 //
 //	根        1 次 DISTINCT genre
-//	分类       1 次 DISTINCT genre + 1 次 DISTINCT shard（兜底名「其他」最多两个 genre 值）
-//	分片       1 次 DISTINCT genre + 1 次 WHERE genre IN (…) AND shard = $n
+//	分类       1–2 次 genre 存在性点查 + 1 次 WHERE genre IN (…) ORDER BY title
 //	剧        1 次剧目点查 + 1 次封面行点查（tvshow.nfo、有封面时的 poster.jpg、Season 01）
 //	Season    1 次剧目点查 + 1 次 ListEmbyItems
 //
@@ -108,16 +107,14 @@ func (t *Tree) List(ctx context.Context, dir string) ([]Node, error) {
 	case 0:
 		return t.listGenres(ctx)
 	case 1:
-		return t.listShards(ctx, segs[0])
+		return t.listDramaDirs(ctx, segs[0])
 	case 2:
-		return t.listDramaDirs(ctx, segs[0], segs[1])
+		return t.listDrama(ctx, segs[0], segs[1])
 	case 3:
-		return t.listDrama(ctx, segs[0], segs[1], segs[2])
-	case 4:
-		if segs[3] != seasonDir {
+		if segs[2] != seasonDir {
 			return nil, ErrNotFound
 		}
-		return t.listSeason(ctx, segs[0], segs[1], segs[2])
+		return t.listSeason(ctx, segs[0], segs[1])
 	}
 	return nil, ErrNotFound
 }
@@ -171,39 +168,21 @@ func (t *Tree) listGenres(ctx context.Context) ([]Node, error) {
 	return out, nil
 }
 
-// listShards 列分类目录：分片目录恒为 00–7f 的全部，不查库。
+// listDramaDirs 列分类目录：只有剧目录，按目录名排序。
 //
-// docs/DIRECTORY-CONTRACT.md 的「分类目录 1 次 DISTINCT shard（或直接回 00–7f）」
-// 取后者：`DISTINCT shard` 要扫该分类的全部索引行（183k 行约 20–40ms，随分类规模
-// 线性增长），而分片集合本来就是代码常量（`store.ShardCount`）——直接回全部，
-// 空分片列出来是空目录（不发生查询），分类目录一次请求只剩一次 genre 点查。
-func (t *Tree) listShards(ctx context.Context, genreDir string) ([]Node, error) {
-	if _, err := t.genresForDir(ctx, genreDir); err != nil {
-		return nil, err
-	}
-	prefix := Root + "/" + genreDir
-	out := make([]Node, 0, store.ShardCount)
-	for shard := 0; shard < store.ShardCount; shard++ {
-		out = append(out, Node{Path: prefix + "/" + shardDirName(shard), IsDir: true})
-	}
-	return out, nil
-}
-
-// listDramaDirs 列分片目录：只有剧目录，按目录名排序。
-func (t *Tree) listDramaDirs(ctx context.Context, genreDir, shardDir string) ([]Node, error) {
-	shard, ok := parseShard(shardDir)
-	if !ok {
-		return nil, ErrNotFound
-	}
+// 一次 `WHERE genre IN (…) ORDER BY title`（走 idx_drama_genre_title），不分页、
+// 不截断：一个分类目录的全部剧都在这一层。代价与结论（单目录子项上限）的真值是
+// docs/DIRECTORY-CONTRACT.md「单目录子项上限」。
+func (t *Tree) listDramaDirs(ctx context.Context, genreDir string) ([]Node, error) {
 	genres, err := t.genresForDir(ctx, genreDir)
 	if err != nil {
 		return nil, err
 	}
-	dramas, err := t.st.ListDramasByShard(ctx, genres, shard)
+	dramas, err := t.st.ListDramaDirsByGenre(ctx, genres)
 	if err != nil {
-		return nil, fmt.Errorf("列分片剧目: %w", err)
+		return nil, fmt.Errorf("列分类剧目: %w", err)
 	}
-	prefix := Root + "/" + genreDir + "/" + shardDir
+	prefix := Root + "/" + genreDir
 	entries := dramaDirEntries(dramas)
 	out := make([]Node, 0, len(entries))
 	for _, e := range entries {
@@ -217,12 +196,12 @@ func (t *Tree) listDramaDirs(ctx context.Context, genreDir, shardDir string) ([]
 // poster.jpg 只在「这部剧有可用封面」时出现（MKACG-650）：封面是可选资产，没有它的
 // 剧目录与之前完全一致。判据是「封面本地化成功过」（artifact 行在），不看文件是否还在
 // ——文件被淘汰/手删后节点仍要留着，下一次 GET 才会按需回源。
-func (t *Tree) listDrama(ctx context.Context, genreDir, shardDir, dramaDir string) ([]Node, error) {
-	d, err := t.locateDrama(ctx, genreDir, shardDir, dramaDir)
+func (t *Tree) listDrama(ctx context.Context, genreDir, dramaDir string) ([]Node, error) {
+	d, err := t.locateDrama(ctx, genreDir, dramaDir)
 	if err != nil {
 		return nil, err
 	}
-	dir := Root + "/" + genreDir + "/" + shardDir + "/" + dramaDir
+	dir := Root + "/" + genreDir + "/" + dramaDir
 	out := make([]Node, 0, 3)
 	out = append(out, Node{Path: dir + "/tvshow.nfo"})
 	cover, err := t.hasCover(ctx, d)
@@ -236,8 +215,8 @@ func (t *Tree) listDrama(ctx context.Context, genreDir, shardDir, dramaDir strin
 }
 
 // listSeason 列季目录：每集一对 .strm / .nfo（合并集也只产出一对，硬约束 6）。
-func (t *Tree) listSeason(ctx context.Context, genreDir, shardDir, dramaDir string) ([]Node, error) {
-	d, err := t.locateDrama(ctx, genreDir, shardDir, dramaDir)
+func (t *Tree) listSeason(ctx context.Context, genreDir, dramaDir string) ([]Node, error) {
+	d, err := t.locateDrama(ctx, genreDir, dramaDir)
 	if err != nil {
 		return nil, err
 	}
@@ -245,7 +224,7 @@ func (t *Tree) listSeason(ctx context.Context, genreDir, shardDir, dramaDir stri
 	if err != nil {
 		return nil, fmt.Errorf("列对外剧集 drama_id=%d: %w", d.ID, err)
 	}
-	dir := Root + "/" + genreDir + "/" + shardDir + "/" + dramaDir + "/" + seasonDir
+	dir := Root + "/" + genreDir + "/" + dramaDir + "/" + seasonDir
 	out := make([]Node, 0, len(items)*2)
 	for _, item := range items {
 		base := embyBase(d, item)
@@ -306,16 +285,12 @@ func (t *Tree) genresForDir(ctx context.Context, name string) ([]string, error) 
 //
 // 优先走索引点查：剧目录名带冲突后缀时 `WHERE provider=? AND provider_id=?`，
 // 否则 `WHERE title=? AND year=?`（idx_drama_title）。点查命中后仍比对目录名与
-// 归属（分类、分片），防止把别的分片/分类里的同名剧渲染到本路径下。
+// 归属（分类），防止把别的分类里的同名剧渲染到本路径下。
 //
 // 标题含 `/ : * ?` 等字符时目录名是 sanitize 过的，点查查不到，于是退到
-// 「本分片内的剧目比对」（`WHERE genre IN (…) AND shard = $n`，走
-// idx_drama_genre_shard_title，不是全表扫）。
-func (t *Tree) locateDrama(ctx context.Context, genreDir, shardDir, name string) (store.Drama, error) {
-	shard, ok := parseShard(shardDir)
-	if !ok {
-		return store.Drama{}, ErrNotFound
-	}
+// 「本分类内的剧目比对」（`WHERE genre IN (…) ORDER BY title`，走
+// idx_drama_genre_title，不是全表扫）。
+func (t *Tree) locateDrama(ctx context.Context, genreDir, name string) (store.Drama, error) {
 	if provider, providerID, ok := parseSuffix(name); ok {
 		d, err := t.st.DramaByProviderID(ctx, provider, providerID)
 		if errors.Is(err, store.ErrNotFound) {
@@ -324,7 +299,7 @@ func (t *Tree) locateDrama(ctx context.Context, genreDir, shardDir, name string)
 		if err != nil {
 			return store.Drama{}, fmt.Errorf("按 provider_id 查剧目: %w", err)
 		}
-		if !located(d, genreDir, shard, name) {
+		if !located(dirFieldsOf(d), genreDir, name) {
 			return store.Drama{}, ErrNotFound
 		}
 		return d, nil
@@ -333,7 +308,7 @@ func (t *Tree) locateDrama(ctx context.Context, genreDir, shardDir, name string)
 	if title, year, ok := parseBase(name); ok {
 		d, err := t.st.DramaByTitleYear(ctx, title, year)
 		switch {
-		case err == nil && located(d, genreDir, shard, name):
+		case err == nil && located(dirFieldsOf(d), genreDir, name):
 			return d, nil
 		case err != nil && !errors.Is(err, store.ErrNotFound):
 			return store.Drama{}, fmt.Errorf("按 title/year 查剧目: %w", err)
@@ -344,21 +319,38 @@ func (t *Tree) locateDrama(ctx context.Context, genreDir, shardDir, name string)
 	if err != nil {
 		return store.Drama{}, err
 	}
-	dramas, err := t.st.ListDramasByShard(ctx, genres, shard)
+	dramas, err := t.st.ListDramaDirsByGenre(ctx, genres)
 	if err != nil {
-		return store.Drama{}, fmt.Errorf("列分片剧目: %w", err)
+		return store.Drama{}, fmt.Errorf("列分类剧目: %w", err)
 	}
 	for _, e := range dramaDirEntries(dramas) {
-		if e.dir == name {
-			return e.drama, nil
+		if e.dir != name {
+			continue
 		}
+		// 列举只带回窄列：命中后再点查一次拿完整 Drama（渲染 NFO 需要 plot）。
+		d, err := t.st.DramaByProviderID(ctx, e.drama.Provider, e.drama.ProviderID)
+		if errors.Is(err, store.ErrNotFound) {
+			return store.Drama{}, ErrNotFound
+		}
+		if err != nil {
+			return store.Drama{}, fmt.Errorf("按 provider_id 查剧目: %w", err)
+		}
+		return d, nil
 	}
 	return store.Drama{}, ErrNotFound
 }
 
-// located 判断一部剧是否就落在这个「分类/分片/目录名」上（点查结果的归属校验）。
-func located(d store.Drama, genreDirName string, shard int, name string) bool {
-	if genreDir(d.Genre) != genreDirName || d.Shard != shard {
+// dirFieldsOf 把完整 Drama 收成目录列举用的窄字段：归属校验与目录名只看这几列。
+func dirFieldsOf(d store.Drama) store.DramaDir {
+	return store.DramaDir{
+		ID: d.ID, Provider: d.Provider, ProviderID: d.ProviderID,
+		Title: d.Title, Year: d.Year, Genre: d.Genre,
+	}
+}
+
+// located 判断一部剧是否就落在这个「分类/目录名」上（点查结果的归属校验）。
+func located(d store.DramaDir, genreDirName, name string) bool {
+	if genreDir(d.Genre) != genreDirName {
 		return false
 	}
 	return dramaDir(d) == name || conflictDir(d) == name
@@ -379,32 +371,21 @@ func genreDir(genre string) string {
 	return sanitizeName(genreDirName(genre))
 }
 
-// shardDirName 是分片目录名：两位小写十六进制（00–7f，N=128）。
-func shardDirName(shard int) string {
-	return fmt.Sprintf("%02x", shard)
-}
-
-// parseShard 解析分片目录名；非十六进制或超出 ShardCount 范围返回 false。
-func parseShard(name string) (int, bool) {
-	n, err := strconv.ParseUint(name, 16, 32)
-	if err != nil || n >= uint64(store.ShardCount) {
-		return 0, false
-	}
-	return int(n), true
-}
-
 // dramaDirEntry 是一部剧与它在树里的目录名。
+//
+// drama 是目录列举拿到的窄行（store.DramaDir）：目录名只由 title / year /
+// provider / provider_id 决定，列举不需要 plot/tags 这类大列。
 type dramaDirEntry struct {
-	drama store.Drama
+	drama store.DramaDir
 	dir   string
 }
 
-// dramaDirEntries 给一个父目录（一个分片）下的剧目算目录名，并按目录名排序。
+// dramaDirEntries 给一个父目录（一个分类）下的剧目算目录名，并按目录名排序。
 //
 // 同名冲突规则（docs/DIRECTORY-CONTRACT.md「同名剧冲突规则」）：同一个父目录内
 // 基准名重复时，所有冲突成员改用 `<基准名> [<provider>-<provider_id>]`；不冲突的
 // 成员保持基准名。后缀用 provider_id 原文，不截断——截断在 60 万规模上会再撞一次。
-func dramaDirEntries(dramas []store.Drama) []dramaDirEntry {
+func dramaDirEntries(dramas []store.DramaDir) []dramaDirEntry {
 	count := make(map[string]int, len(dramas))
 	for _, d := range dramas {
 		count[dramaDir(d)]++
@@ -423,12 +404,12 @@ func dramaDirEntries(dramas []store.Drama) []dramaDirEntry {
 
 // dramaDir 是剧目录基准名：<剧名> (<年份>)。年份是命名的一部分，Year==0 显式
 // 写成 (<0>)，不省略括号——命名是纯函数，空态显式化。
-func dramaDir(d store.Drama) string {
+func dramaDir(d store.DramaDir) string {
 	return sanitizeName(d.Title) + " (" + strconv.Itoa(d.Year) + ")"
 }
 
 // conflictDir 是冲突成员的目录名：基准名 + ` [<provider>-<provider_id>]`。
-func conflictDir(d store.Drama) string {
+func conflictDir(d store.DramaDir) string {
 	return dramaDir(d) + " [" + d.Provider + "-" + d.ProviderID + "]"
 }
 
@@ -540,7 +521,7 @@ func (t *Tree) Render(ctx context.Context, p string) ([]byte, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	d, err := t.locateDrama(ctx, req.genreDir, req.shardDir, req.dramaDir)
+	d, err := t.locateDrama(ctx, req.genreDir, req.dramaDir)
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +585,6 @@ func (t *Tree) hasCover(ctx context.Context, d store.Drama) (bool, error) {
 // renderRequest 是 parsePath 的解构结果。
 type renderRequest struct {
 	genreDir string // 一级目录（分类，可能是兜底名「其他」）
-	shardDir string // 分片目录名（两位十六进制）
 	dramaDir string // 剧目录名（可能是带冲突后缀的形态）
 	isShow   bool   // true = 剧级 tvshow.nfo
 	isPoster bool   // true = 剧级 poster.jpg
@@ -614,29 +594,30 @@ type renderRequest struct {
 
 // parsePath 解析相对路径；ok=false 表示不是本树里可渲染的文件形状。
 //
-// 合法：短剧/<分类>/<分片>/<剧目录>/tvshow.nfo（5 段）
+// 合法：短剧/<分类>/<剧目录>/tvshow.nfo（4 段）
 //
-//	短剧/<分类>/<分片>/<剧目录>/poster.jpg（5 段）
-//	短剧/<分类>/<分片>/<剧目录>/Season 01/<文件名>.strm|.nfo（6 段）
+//	短剧/<分类>/<剧目录>/poster.jpg（4 段）
+//
+//	短剧/<分类>/<剧目录>/Season 01/<文件名>.strm|.nfo（5 段）
 func parsePath(p string) (renderRequest, bool) {
 	segs := strings.Split(strings.Trim(p, "/"), "/")
-	if len(segs) < 5 || segs[0] != Root {
+	if len(segs) < 4 || segs[0] != Root {
 		return renderRequest{}, false
 	}
-	base := renderRequest{genreDir: segs[1], shardDir: segs[2], dramaDir: segs[3]}
+	base := renderRequest{genreDir: segs[1], dramaDir: segs[2]}
 	switch {
-	case len(segs) == 5 && segs[4] == "tvshow.nfo":
+	case len(segs) == 4 && segs[3] == "tvshow.nfo":
 		base.isShow = true
 		return base, true
-	case len(segs) == 5 && segs[4] == posterName:
+	case len(segs) == 4 && segs[3] == posterName:
 		base.isPoster = true
 		return base, true
-	case len(segs) == 6 && segs[4] == seasonDir:
-		ext := extension(segs[5])
+	case len(segs) == 5 && segs[3] == seasonDir:
+		ext := extension(segs[4])
 		if ext != ".strm" && ext != ".nfo" {
 			return renderRequest{}, false
 		}
-		name := strings.TrimSuffix(segs[5], ext)
+		name := strings.TrimSuffix(segs[4], ext)
 		if name == "" {
 			return renderRequest{}, false
 		}

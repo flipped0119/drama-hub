@@ -6,8 +6,8 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,21 +30,13 @@ const (
 	genreA = "爱情"
 )
 
-// shardOf 独立实现目录分片号 fnv32a(provider_id) % N（不复用 store.ShardOf，
-// 避免「用被测代码验证被测代码」）。
-func shardOf(providerID string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(providerID))
-	return fmt.Sprintf("%02x", h.Sum32()%store.ShardCount)
-}
-
-// dramaDirPath 独立拼出剧目录的 vfs 路径：短剧/<分类>/<分片>/<剧目录>。
-func dramaDirPath(genre, providerID, dir string) string {
+// dramaDirPath 独立拼出剧目录的 vfs 路径：短剧/<分类>/<剧目录>。
+func dramaDirPath(genre, dir string) string {
 	g := genre
 	if g == "" {
 		g = otherGenre
 	}
-	return Root + "/" + g + "/" + shardOf(providerID) + "/" + dir
+	return Root + "/" + g + "/" + dir
 }
 
 // stubCoverer 是 Coverer 的替身：`has` 里有这个键就算「有封面」，字节就是值；
@@ -92,7 +84,6 @@ type fixture struct {
 	epA2   store.Episode
 	dirA   string // 剧 A 的 vfs 目录路径
 	dirB   string // 剧 B 的 vfs 目录路径
-	shardA string // 剧 A 所在分片目录名
 }
 
 // seed 用真实临时库（WAL / FK / busy_timeout 由 store.Open 施加）建 fixture。
@@ -176,9 +167,8 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 		db:     db,
 		epA1:   ep1,
 		epA2:   ep2,
-		dirA:   dramaDirPath(genreA, "a1", titleA+" (2024)"),
-		dirB:   dramaDirPath("", "b1", "另一部_剧 (0)"),
-		shardA: shardOf("a1"),
+		dirA:   dramaDirPath(genreA, titleA+" (2024)"),
+		dirB:   dramaDirPath("", "另一部_剧 (0)"),
 	}
 }
 
@@ -247,8 +237,8 @@ func TestListRoot_OnlyGenres(t *testing.T) {
 	}
 }
 
-// AC：分类目录只有分片目录；"短剧" 与 "" 等价（都是根）。
-func TestListGenre_OnlyShards(t *testing.T) {
+// AC-1：分类目录只有剧目录（不再有分片层）；"短剧" 与 "" 等价（都是根）。
+func TestListGenre_OnlyDramaDirs(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
 
@@ -264,41 +254,22 @@ func TestListGenre_OnlyShards(t *testing.T) {
 		t.Fatalf("List(短剧) 与 List(\"\") 不一致：%v vs %v", byRoot, byEmpty)
 	}
 
-	// 分类目录的子项是分片的全集 00–7f（docs/DIRECTORY-CONTRACT.md 允许「直接回
-	// 00–7f」）：分片集合是代码常量，查库只会把一个 O(分类规模) 的 DISTINCT 扫描
-	// 挂到每次列举上。空分片是空目录，列出它不发生查询。
 	nodes, err := f.tree.List(ctx, Root+"/"+genreA)
 	if err != nil {
 		t.Fatalf("List(分类): %v", err)
 	}
-	if len(nodes) != store.ShardCount {
-		t.Fatalf("分类目录子项 = %d, 期望 %d（00–%02x）", len(nodes), store.ShardCount, store.ShardCount-1)
-	}
-	for i, n := range nodes {
-		if want := Root + "/" + genreA + "/" + fmt.Sprintf("%02x", i); n.Path != want || !n.IsDir {
-			t.Fatalf("分片目录[%d] = %+v, 期望 %s（目录）", i, n, want)
-		}
-	}
-	if nodes[0].Path != Root+"/"+genreA+"/00" || nodes[store.ShardCount-1].Path != Root+"/"+genreA+"/7f" {
-		t.Errorf("分片目录首尾 = %q … %q, 期望 …/00 … …/7f", nodes[0].Path, nodes[store.ShardCount-1].Path)
-	}
-
-	// 空分片目录存在但没有子项（不是 ErrNotFound）。
-	empty := Root + "/" + genreA + "/" + differentShard(f.shardA)
-	if kids, err := f.tree.List(ctx, empty); err != nil || len(kids) != 0 {
-		t.Errorf("List(空分片 %s) = %v, %v, 期望空列表、无错误", empty, kids, err)
-	}
-}
-
-// AC：分片目录只有剧目录（按目录名排序）。
-func TestListShard_OnlyDramaDirs(t *testing.T) {
-	f := seed(t, "")
-	nodes, err := f.tree.List(context.Background(), Root+"/"+genreA+"/"+f.shardA)
-	if err != nil {
-		t.Fatalf("List(分片): %v", err)
-	}
 	if len(nodes) != 1 || nodes[0].Path != f.dirA || !nodes[0].IsDir {
-		t.Fatalf("分片目录子项 = %v, 期望只有 %s", nodes, f.dirA)
+		t.Fatalf("分类目录子项 = %v, 期望只有剧目录 %s", nodes, f.dirA)
+	}
+
+	// 路径里不许出现两位十六进制段（已删除的中间目录层的形状）。
+	hexSegment := regexp.MustCompile(`^[0-9a-f]{2}$`)
+	for _, n := range f.walk(t) {
+		for _, seg := range strings.Split(strings.TrimPrefix(n.Path, Root+"/"), "/") {
+			if hexSegment.MatchString(seg) {
+				t.Errorf("树里出现两位十六进制段 %q（分片层没删干净）：%s", seg, n.Path)
+			}
+		}
 	}
 }
 
@@ -385,16 +356,15 @@ func TestListNotFound(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
 	paths := []string{
-		"其他/某种剧 (2024)",             // 不在 短剧/ 下
-		Root + "/不存在",               // 分类不存在
-		Root + "/" + genreA + "/ff", // 分片越界（N=128，最大 7f）
-		Root + "/" + genreA + "/zz", // 分片不是十六进制
-		Root + "/" + genreA + "/" + f.shardA + "/不存在 (2024)",
-		Root + "/" + genreA + "/" + f.shardA + "/Season 01", // 段数不足
-		f.dirA + "/tvshow.nfo",                              // 文件当目录
-		f.dirA + "/Season 02",                               // 季目录名错
-		f.dirA + "/Season 01/x",                             // 季目录下的未知文件
-		Root + "/" + genreA + "/" + f.shardA + "/" + titleA + " (2024)/" + seasonDir + "/x",
+		"其他/某种剧 (2024)",                     // 不在 短剧/ 下
+		Root + "/不存在",                       // 分类不存在
+		Root + "/" + genreA + "/不存在 (2024)", // 剧目录不存在
+		Root + "/" + genreA + "/0a",         // 分片层已下线：两位十六进制就是普通剧名，不存在
+		Root + "/" + genreA + "/Season 01",  // 段数不足：季目录不是剧目录
+		f.dirA + "/tvshow.nfo",              // 文件当目录
+		f.dirA + "/Season 02",               // 季目录名错
+		f.dirA + "/Season 01/x",             // 季目录下的未知文件
+		f.dirA + "/" + seasonDir + "/x",
 		"/" + Root + "/" + Root,
 	}
 	for _, p := range paths {
@@ -415,7 +385,7 @@ func TestTreeEachDramaOnce_NoAllNode(t *testing.T) {
 			continue
 		}
 		segs := strings.Split(n.Path, "/")
-		if len(segs) == 4 { // 短剧/<分类>/<分片>/<剧目录>
+		if len(segs) == 3 { // 短剧/<分类>/<剧目录>
 			dramaDirs[n.Path]++
 		}
 		for _, s := range segs {
@@ -454,7 +424,7 @@ func TestTreeEachDramaOnce_NoAllNode(t *testing.T) {
 // AC：分类缺失落兜底名；上游真有同名分类则合并（两个 genre 值一个目录）。
 func TestGenreFallbackMergesUpstreamOther(t *testing.T) {
 	f := seed(t, "") // 剧 B 的 genre 为空 → 其他
-	// 上游真的有一个分类叫「其他」，且与剧 B 落在同一个分片才能并进一个目录断言列表。
+	// 上游真的有一个分类叫「其他」：它与 genre='' 的剧并进同一个目录。
 	upstream := f.addDrama(t, store.Drama{
 		Provider: "web", ProviderID: "b1", Title: "上游的其他分类剧", Year: 2025, Genre: otherGenre,
 	})
@@ -477,14 +447,14 @@ func TestGenreFallbackMergesUpstreamOther(t *testing.T) {
 	// 两个 genre 值的剧都出现在「其他」分支下，各自一次。
 	dirs := map[string]int{}
 	for _, n := range f.walk(t) {
-		if n.IsDir && strings.Count(n.Path, "/") == 3 && strings.HasPrefix(n.Path, Root+"/"+otherGenre+"/") {
+		if n.IsDir && strings.Count(n.Path, "/") == 2 && strings.HasPrefix(n.Path, Root+"/"+otherGenre+"/") {
 			dirs[n.Path]++
 		}
 	}
 	if dirs[f.dirB] != 1 {
 		t.Errorf("空分类的剧没有出现在 其他/ 下：%v", dirs)
 	}
-	upstreamDir := dramaDirPath(otherGenre, "b1", "上游的其他分类剧 (2025)")
+	upstreamDir := dramaDirPath(otherGenre, "上游的其他分类剧 (2025)")
 	if dirs[upstreamDir] != 1 {
 		t.Errorf("上游「其他」分类的剧没有并进同一目录：%v（期望含 %s）", dirs, upstreamDir)
 	}
@@ -534,22 +504,12 @@ func TestListGenresEscapesPathSeparatorGenre(t *testing.T) {
 		t.Fatalf("转义后的分类目录 %s 不在根目录里：%v", escaped, nodes)
 	}
 
-	// 2) 目录能进：分片层能列。
-	shardNodes, err := tree.List(ctx, escaped)
+	// 2) 目录能进：两部脏分类的剧都并进这一个目录（转义后同名）。
+	dirs, err := tree.List(ctx, escaped)
 	if err != nil {
 		t.Fatalf("List(%s): %v", escaped, err)
 	}
-	if len(shardNodes) != store.ShardCount {
-		t.Errorf("分片目录数 = %d, 期望 %d", len(shardNodes), store.ShardCount)
-	}
-
-	// 3) 该分类下的剧真的在这个目录里（两部脏分类都并进来）。
-	shardDir := shardOf("dirty1")
-	dirs, err := tree.List(ctx, escaped+"/"+shardDir)
-	if err != nil {
-		t.Fatalf("List(%s): %v", escaped+"/"+shardDir, err)
-	}
-	want := escaped + "/" + shardDir + "/斜杠分类剧 (2026)"
+	want := escaped + "/斜杠分类剧 (2026)"
 	found := false
 	for _, n := range dirs {
 		if n.Path == want {
@@ -570,35 +530,35 @@ func TestListGenresEscapesPathSeparatorGenre(t *testing.T) {
 		t.Errorf("strm 内容 = %q, 期望 %q", body, wantStrm)
 	}
 
-	// 5) 转义后同名的两个分类合并时留一条 debug 日志（脏数据可追溯）。
+	// 4) 转义后同名的两个分类合并时留一条 debug 日志（脏数据可追溯）。
 	if logged := buf.String(); !strings.Contains(logged, "剧情") {
 		t.Errorf("转义合并没有留日志：%q", logged)
 	}
 }
 
-// AC：同名冲突全部加后缀（同分片内所有冲突成员都改），不冲突的保持基准名。
+// AC-1：同名冲突全部加后缀（同一分类目录内的冲突成员都改），不冲突的保持基准名。
+//
+// 去掉分片层后父目录就是分类目录，所以「同名同年」在同一分类里**必定**冲突——
+// 这正是 MKACG-651 契约里要求的必然变化（见 docs/DIRECTORY-CONTRACT.md）。
 func TestConflictSuffix(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
-	// 三个同名同年的剧：前两个落在同一个分片（冲突），第三个落在别的分片。
-	shardA := shardOf("c1")
-	sameShard := providerIDsWithShard(shardA, "web", 2)
-	other := providerIDsWithShard(differentShard(shardA), "web", 1)[0]
-
-	for _, id := range sameShard {
+	ids := []string{"dup-a", "dup-b", "dup-c"}
+	for _, id := range ids {
 		f.addDrama(t, store.Drama{Provider: "web", ProviderID: id, Title: "同名剧", Year: 2026, Genre: genreA})
 	}
-	f.addDrama(t, store.Drama{Provider: "web", ProviderID: other, Title: "同名剧", Year: 2026, Genre: genreA})
+	// 另一分类里的同名剧不构成冲突。
+	f.addDrama(t, store.Drama{Provider: "web", ProviderID: "dup-other", Title: "同名剧", Year: 2026, Genre: "都市"})
 
-	nodes, err := f.tree.List(ctx, Root+"/"+genreA+"/"+shardA)
+	nodes, err := f.tree.List(ctx, Root+"/"+genreA)
 	if err != nil {
-		t.Fatalf("List(冲突分片): %v", err)
+		t.Fatalf("List(分类): %v", err)
 	}
 	got := map[string]bool{}
 	for _, n := range nodes {
 		got[baseOfPath(n.Path)] = true
 	}
-	for _, id := range sameShard {
+	for _, id := range ids {
 		want := "同名剧 (2026) [web-" + id + "]"
 		if !got[want] {
 			t.Errorf("缺冲突成员的带后缀目录 %q：%v", want, keysOf(got))
@@ -608,11 +568,10 @@ func TestConflictSuffix(t *testing.T) {
 		t.Errorf("冲突成员不该保留基准名：%v", keysOf(got))
 	}
 
-	// 另一个分片里的同名剧不构成冲突，保持基准名。
-	otherShard := shardOf(other)
-	nodes, err = f.tree.List(ctx, Root+"/"+genreA+"/"+otherShard)
+	// 另一个分类里的同名剧不构成冲突，保持基准名。
+	nodes, err = f.tree.List(ctx, Root+"/都市")
 	if err != nil {
-		t.Fatalf("List(另一分片): %v", err)
+		t.Fatalf("List(另一分类): %v", err)
 	}
 	found := false
 	for _, n := range nodes {
@@ -621,19 +580,18 @@ func TestConflictSuffix(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("不同分片的同名剧应保持基准名：%v", nodes)
+		t.Errorf("不同分类的同名剧应保持基准名：%v", nodes)
 	}
 }
 
-// AC：60 万规模不截断——一个分片里 1200 个同名剧全部出节点、全部加后缀、后缀不截断。
+// AC：大目录不截断——一个分类里 1200 个同名剧全部出节点、全部加后缀、后缀不截断。
 func TestConflictSuffixNoTruncationAtScale(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
 	const n = 1200
-	shard := shardOf("scale-0")
-	ids := providerIDsWithShard(shard, "web", n)
-	if len(ids) != n {
-		t.Fatalf("只造出 %d 个同分片身份，期望 %d", len(ids), n)
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		ids = append(ids, "scale-"+strconv.Itoa(i))
 	}
 
 	// 一个事务里批量写：这条测试要的是「列举不截断」，不是写路径的性能。
@@ -651,12 +609,13 @@ func TestConflictSuffixNoTruncationAtScale(t *testing.T) {
 		t.Fatalf("批量写入: %v", err)
 	}
 
-	nodes, err := f.tree.List(ctx, Root+"/"+genreA+"/"+shard)
+	nodes, err := f.tree.List(ctx, Root+"/"+genreA)
 	if err != nil {
-		t.Fatalf("List(分片): %v", err)
+		t.Fatalf("List(分类): %v", err)
 	}
-	if len(nodes) != n {
-		t.Fatalf("分片目录子项 = %d, 期望 %d（截断即此处失败）", len(nodes), n)
+	// seed 里已有一部剧 A，一起计入。
+	if len(nodes) != n+1 {
+		t.Fatalf("分类目录子项 = %d, 期望 %d（截断即此处失败）", len(nodes), n+1)
 	}
 	seen := map[string]bool{}
 	for _, node := range nodes {
@@ -665,6 +624,9 @@ func TestConflictSuffixNoTruncationAtScale(t *testing.T) {
 			t.Fatalf("目录名重复：%s", dir)
 		}
 		seen[dir] = true
+		if dir == titleA+" (2024)" {
+			continue // seed 里的剧 A 与「批量同名剧」不同名，不参与冲突
+		}
 		if !strings.HasPrefix(dir, "批量同名剧 (2027) [web-") || !strings.HasSuffix(dir, "]") {
 			t.Fatalf("目录名不是「基准名 + 全量后缀」形态：%s", dir)
 		}
@@ -673,29 +635,6 @@ func TestConflictSuffixNoTruncationAtScale(t *testing.T) {
 	if !seen["批量同名剧 (2027) [web-"+ids[n-1]+"]"] {
 		t.Errorf("缺完整后缀目录 批量同名剧 (2027) [web-%s]", ids[n-1])
 	}
-}
-
-// providerIDsWithShard 造 n 个落在指定分片的 provider_id。
-//
-// 用独立实现的 fnv（本文件 shardOf），因此这条断言同时钉住「分片是纯函数且
-// 稳定」：同一个 id 永远同一个分片。
-func providerIDsWithShard(shard, provider string, n int) []string {
-	out := make([]string, 0, n)
-	for i := 0; len(out) < n; i++ {
-		id := provider + "-" + strconv.Itoa(i)
-		if shardOf(id) == shard {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-// differentShard 返回一个与给定分片不同的分片目录名。
-func differentShard(shard string) string {
-	if shard == "00" {
-		return "01"
-	}
-	return "00"
 }
 
 // baseOfPath 取路径最后一段。
@@ -717,7 +656,10 @@ func keysOf[V any](m map[string]V) []string {
 
 // AC2：命名是纯函数（表驱动）。
 func TestNames(t *testing.T) {
-	drama := func(title string, year int) store.Drama {
+	dramaDirOf := func(title string, year int) store.DramaDir {
+		return store.DramaDir{Title: title, Year: year}
+	}
+	show := func(title string, year int) store.Drama {
 		return store.Drama{Title: title, Year: year}
 	}
 	single := func(epNo int, title string) store.EmbyItem {
@@ -732,10 +674,10 @@ func TestNames(t *testing.T) {
 		got  string
 		want string
 	}{
-		{"剧目录/正常", dramaDir(drama("你好世界", 2024)), "你好世界 (2024)"},
-		{"剧目录/空年显式化为0", dramaDir(drama("无年份", 0)), "无年份 (0)"},
-		{"剧目录/非法字符替换", dramaDir(drama(`a/b\c:d*e?f"g<h>i|j`, 2021)), "a_b_c_d_e_f_g_h_i_j (2021)"},
-		{"冲突后缀/全量身份", conflictDir(store.Drama{Provider: "web", ProviderID: "7503745441910017049", Title: "同名", Year: 2026}),
+		{"剧目录/正常", dramaDir(dramaDirOf("你好世界", 2024)), "你好世界 (2024)"},
+		{"剧目录/空年显式化为0", dramaDir(dramaDirOf("无年份", 0)), "无年份 (0)"},
+		{"剧目录/非法字符替换", dramaDir(dramaDirOf(`a/b\c:d*e?f"g<h>i|j`, 2021)), "a_b_c_d_e_f_g_h_i_j (2021)"},
+		{"冲突后缀/全量身份", conflictDir(store.DramaDir{Provider: "web", ProviderID: "7503745441910017049", Title: "同名", Year: 2026}),
 			"同名 (2026) [web-7503745441910017049]"},
 		{"集号/一位补零", embyNumber(single(1, "开局")), "S01E01"},
 		{"集号/两位原样", embyNumber(single(12, "")), "S01E12"},
@@ -747,12 +689,12 @@ func TestNames(t *testing.T) {
 		{"标签/标题里的非法字符也替换", embyLabel(single(1, "a/b")), "a_b"},
 		{"标签/合并集范围", embyLabel(merged(1, 1, 10)), "第1-10集"},
 		{"标签/合并集单集退化为第N集", embyLabel(merged(1, 3, 3)), "第3集"},
-		{"文件名主干/有标签", embyBase(drama("测试剧", 2024), single(1, "开局")), "测试剧 - S01E01 - 开局"},
-		{"文件名主干/无标签", embyBase(drama("测试剧", 2024), single(2, "")), "测试剧 - S01E02 - 第2集"},
+		{"文件名主干/有标签", embyBase(show("测试剧", 2024), single(1, "开局")), "测试剧 - S01E01 - 开局"},
+		{"文件名主干/无标签", embyBase(show("测试剧", 2024), single(2, "")), "测试剧 - S01E02 - 第2集"},
 		{"文件名主干/单集块回退取源集号",
-			embyBase(drama("测试剧", 2024), store.EmbyItem{Kind: "single", Season: 1, EpNo: 3, EpFrom: 21, EpTo: 21}),
+			embyBase(show("测试剧", 2024), store.EmbyItem{Kind: "single", Season: 1, EpNo: 3, EpFrom: 21, EpTo: 21}),
 			"测试剧 - S01E03 - 第21集"},
-		{"文件名主干/合并集", embyBase(drama("测试剧", 2024), merged(1, 1, 10)), "测试剧 - S01E01 - 第1-10集"},
+		{"文件名主干/合并集", embyBase(show("测试剧", 2024), merged(1, 1, 10)), "测试剧 - S01E01 - 第1-10集"},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -761,26 +703,17 @@ func TestNames(t *testing.T) {
 	}
 }
 
-// 分类目录名与分片目录名是纯函数（表驱动）：空 genre 落兜底名，分片两位十六进制。
+// 分类目录名是纯函数（表驱动）：空 genre 落兜底名，脏分类按文件名规则转义。
 func TestDirNames(t *testing.T) {
-	if got, want := genreDirName(""), otherGenre; got != want {
-		t.Errorf("genreDirName(\"\") = %q, 期望 %q", got, want)
+	tests := []struct{ genre, want string }{
+		{"", otherGenre},
+		{"爱情", "爱情"},
+		{"剧情/古装", "剧情_古装"},
+		{`剧情\古装`, "剧情_古装"},
 	}
-	if got, want := genreDirName("爱情"), "爱情"; got != want {
-		t.Errorf("genreDirName(爱情) = %q, 期望 %q", got, want)
-	}
-	for shard, want := range map[int]string{0: "00", 10: "0a", 127: "7f"} {
-		if got := shardDirName(shard); got != want {
-			t.Errorf("shardDirName(%d) = %q, 期望 %q", shard, got, want)
-		}
-		// 目录名 → 分片号必须可逆（Render 靠它定位分片）。
-		if got, ok := parseShard(want); !ok || got != shard {
-			t.Errorf("parseShard(%q) = %d, %v, 期望 %d", want, got, ok, shard)
-		}
-	}
-	for _, bad := range []string{"", "zz", "80", "ff", "100"} {
-		if _, ok := parseShard(bad); ok {
-			t.Errorf("parseShard(%q) 应失败（N=128，合法范围 00–7f）", bad)
+	for _, tt := range tests {
+		if got := genreDir(tt.genre); got != tt.want {
+			t.Errorf("genreDir(%q) = %q, 期望 %q", tt.genre, got, tt.want)
 		}
 	}
 }
@@ -820,18 +753,17 @@ func TestRenderNotFound(t *testing.T) {
 		Root,
 		dir,    // 剧目录当文件
 		season, // 季目录当文件
-		"其他/" + titleA + " (2024)/tvshow.nfo",                           // 不在 短剧/ 下
-		Root + "/" + genreA + "/" + f.shardA + "/不存在 (2024)/tvshow.nfo", // 剧不存在
-		dir + "/tvshow.txt",   // 剧级扩展名非法
-		dir + "/tvshow.nfo/x", // 段数多余
-		dir + "/Season 02/" + titleA + " - S01E01 - 开局.strm", // 季目录错
-		season + "/" + titleA + " - S01E99 - 第99集.strm",      // 集不存在
-		season + "/" + titleA + " - S01E01 - 开局.mp4",         // 集扩展名非法
-		season + "/" + titleA + " - S01E01 - 开局",             // 无扩展名
-		season + "/tvshow.nfo",                               // 季目录下的 tvshow.nfo 不是合法形状
-		season + "/.strm",                                    // 空主干
-		Root + "/" + genreA + "/" + differentShard(f.shardA) + "/" + titleA + " (2024)/tvshow.nfo", // 分片不符
-		Root + "/" + otherGenre + "/" + f.shardA + "/" + titleA + " (2024)/tvshow.nfo",             // 分类不符
+		"其他/" + titleA + " (2024)/tvshow.nfo",                         // 不在 短剧/ 下
+		Root + "/" + genreA + "/不存在 (2024)/tvshow.nfo",                // 剧不存在
+		dir + "/tvshow.txt",                                           // 剧级扩展名非法
+		dir + "/tvshow.nfo/x",                                         // 段数多余
+		dir + "/Season 02/" + titleA + " - S01E01 - 开局.strm",          // 季目录错
+		season + "/" + titleA + " - S01E99 - 第99集.strm",               // 集不存在
+		season + "/" + titleA + " - S01E01 - 开局.mp4",                  // 集扩展名非法
+		season + "/" + titleA + " - S01E01 - 开局",                      // 无扩展名
+		season + "/tvshow.nfo",                                        // 季目录下的 tvshow.nfo 不是合法形状
+		season + "/.strm",                                             // 空主干
+		Root + "/" + otherGenre + "/" + titleA + " (2024)/tvshow.nfo", // 分类不符
 	}
 	for _, p := range paths {
 		body, err := f.tree.Render(context.Background(), p)
@@ -955,7 +887,7 @@ func TestListRemainderSingleRendersSourceEpisodeNumber(t *testing.T) {
 		t.Fatalf("第 3 块 = %+v, 期望 single / ep_no=3 / 源集号=21", last)
 	}
 
-	dir := dramaDirPath(genreA, "z21", "余数剧 (2026)")
+	dir := dramaDirPath(genreA, "余数剧 (2026)")
 	base := "余数剧 - S01E03 - 第21集"
 	nodes, err := f.tree.List(ctx, dir+"/"+seasonDir)
 	if err != nil {
@@ -1014,9 +946,9 @@ func (c *countingStore) GenreExists(ctx context.Context, genre string) (bool, er
 	return c.inner.GenreExists(ctx, genre)
 }
 
-func (c *countingStore) ListDramasByShard(ctx context.Context, genres []string, shard int) ([]store.Drama, error) {
-	c.calls["ListDramasByShard"]++
-	return c.inner.ListDramasByShard(ctx, genres, shard)
+func (c *countingStore) ListDramaDirsByGenre(ctx context.Context, genres []string) ([]store.DramaDir, error) {
+	c.calls["ListDramaDirsByGenre"]++
+	return c.inner.ListDramaDirsByGenre(ctx, genres)
 }
 
 func (c *countingStore) DramaByTitleYear(ctx context.Context, title string, year int) (store.Drama, error) {
@@ -1045,21 +977,21 @@ func TestListDoesNotScanAllGenres(t *testing.T) {
 	tree := NewTree(cs, store.NewSettings(f.db.DB), stubID, f.covers, slog.New(slog.DiscardHandler))
 
 	tests := []struct {
-		name          string
-		dir           string
-		wantListGenre int // ListGenres 调用次数
-		wantExists    int // GenreExists 调用次数下限
-		wantTitle     int // DramaByTitleYear 调用次数下限
+		name           string
+		dir            string
+		wantListGenre  int // ListGenres 调用次数
+		wantExists     int // GenreExists 调用次数下限
+		wantTitle      int // DramaByTitleYear 调用次数下限
+		wantListDramas int // ListDramasByGenre 调用次数
 	}{
 		{name: "根/必须拿全部分类", dir: "", wantListGenre: 1},
-		{name: "分类层", dir: Root + "/" + genreA, wantExists: 1},
-		{name: "分片层", dir: Root + "/" + genreA + "/" + f.shardA, wantExists: 1},
+		{name: "分类层", dir: Root + "/" + genreA, wantExists: 1, wantListDramas: 1},
 		{name: "剧目录", dir: f.dirA, wantTitle: 1},
-		// 剧名被 sanitize 过的目录：title 点查不中 → 退到「本分片内比对」，
+		// 剧名被 sanitize 过的目录：title 点查不中 → 退到「本分类内比对」，
 		// 分类解析走 GenreExists（绝不能退回全表 DISTINCT genre）。
-		{name: "sanitize 过的剧目录", dir: f.dirB, wantExists: 1},
+		{name: "sanitize 过的剧目录", dir: f.dirB, wantExists: 1, wantListDramas: 1},
 		{name: "季目录", dir: f.dirA + "/" + seasonDir, wantTitle: 1},
-		{name: "兜底分类层", dir: Root + "/" + otherGenre, wantExists: 1},
+		{name: "兜底分类层", dir: Root + "/" + otherGenre, wantExists: 1, wantListDramas: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1083,9 +1015,9 @@ func TestListDoesNotScanAllGenres(t *testing.T) {
 			if tt.dir == Root+"/"+otherGenre && cs.count("GenreExists") != 2 {
 				t.Errorf("兜底分类层的 GenreExists 次数 = %d, 期望 2（'' 与 其他）", cs.count("GenreExists"))
 			}
-			// 分类/分片层的查询次数与库规模无关：不出现任何列举式扫描。
-			if cs.count("ListDramasByShard") > 1 {
-				t.Errorf("List(%q) 调了 %d 次 ListDramasByShard, 期望 ≤ 1", tt.dir, cs.count("ListDramasByShard"))
+			// 每层至多一次列举式查询，且只在该层真正需要列剧时才发生。
+			if got := cs.count("ListDramaDirsByGenre"); got != tt.wantListDramas {
+				t.Errorf("List(%q) 调了 %d 次 ListDramaDirsByGenre, 期望 %d", tt.dir, got, tt.wantListDramas)
 			}
 		})
 	}

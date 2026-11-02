@@ -520,21 +520,20 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 ```
 短剧/                                  ← vfs 根（DAV 挂载点根映射到它，DAV 路径里没有这一段）
 └── <分类>/                            ← drama.genre；缺失落兜底名「其他」
-    └── <分片>/                        ← fnv32a(provider_id) % 128 的两位十六进制（00–7f）
-        └── <剧名> (<年份>)/
-            ├── tvshow.nfo
-            ├── poster.jpg              ← 仅当这部剧有可用封面（MKACG-650）
-            └── Season 01/
-                ├── <剧名> - S01E01 - <标签>.strm
-                └── <剧名> - S01E01 - <标签>.nfo
+    └── <剧名> (<年份>)/
+        ├── tvshow.nfo
+        ├── poster.jpg              ← 仅当这部剧有可用封面（MKACG-650）
+        └── Season 01/
+            ├── <剧名> - S01E01 - <标签>.strm
+            └── <剧名> - S01E01 - <标签>.nfo
 ```
 
 - 顶层只有分类目录，没有 `全部/`：一部剧只出现在它自己那一个分类下。
-- 分片是纯函数（用 `provider_id` 而非标题，剧改名、重扫都不换分片），只为把每个目录的
-  子项数摊到 PROPFIND 能列出来的量级。`N = store.ShardCount`（128）是代码常量，
-  不是 schema：改 N 只是重算 `drama.shard` 这一列的数据（`TestShardRecountKeepsSchema`）。
+- **分类与剧之间没有中间层**（MKACG-651 v5）：分片层已删除，`00`–`7f` 不出现在任何路径，
+  也不存在 `store.ShardCount` / `ShardOf` / `drama.shard`。为什么删、代价与实测见
+  `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」——别再把它加回来。
 - 兜底名「其他」同时覆盖 `genre` 为空与上游真的叫「其他」两种取值，它们并进同一目录。
-- 同名冲突（同一个分片目录内基准名重复）：所有冲突成员改用
+- 同名冲突（同一个分类目录内基准名重复）：所有冲突成员改用
   `<基准名> [<provider>-<provider_id>]`，后缀是 `provider_id` 原文、不截断；不冲突的
   成员保持基准名。
 - 剧目录 `<剧名> (<年份>)`：年份来自 `drama.year`；`year=0` 显式写成 `(<0>)`，不省略。
@@ -558,22 +557,23 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 | `dir` | 子项 | 查询 |
 |---|---|---|
 | `""`（根） | 分类目录 | 1 次 `SELECT DISTINCT genre`（覆盖索引全扫，唯一 O(行数) 的一条） |
-| `<分类>` | 分片目录 `00`–`7f` | 1–2 次 genre 存在性点查（`GenreExists`），分片集合是代码常量、不查库 |
-| `<分类>/<分片>` | 剧目录 | 1–2 次 genre 存在性点查 + 1 次 `WHERE genre IN (…) AND shard = ? ORDER BY title` |
+| `<分类>` | 剧目录 | 1–2 次 genre 存在性点查（`GenreExists`）+ 1 次 `WHERE genre IN (…) ORDER BY title` |
 | `<剧目录>` | `tvshow.nfo`（+ 有封面时的 `poster.jpg`）+ `Season 01` | 1 次剧目点查 + 1 次封面行点查（目录名被 sanitize 时再加 1–2 次 genre 存在性点查） |
 | `<剧目录>/Season 01` | 集文件对 | 同上 + 1 次 `ListEmbyItems` |
 
-两类查询都走索引（`idx_drama_genre_shard_title` / `idx_drama_title`），由
-`internal/store` 的 `TestDirectoryQueryPlans` 用 `EXPLAIN QUERY PLAN` 钉住。
+两类查询都走索引（`idx_drama_genre_title` / `idx_drama_title`），由
+`internal/store` 的 `TestDirectoryQueryPlans` 用 `EXPLAIN ANALYZE` 钉住。
+
+分类目录那次列举用**窄列**（`store.ListDramaDirsByGenre` → `store.DramaDir`：只取
+`id/provider/provider_id/title/year/genre`）：它是唯一会一次物化整个分类的查询，
+21.6 万子项时含 `plot`/`tags` 的 `[]Drama` 堆峰值 ≈100–130 MB，窄列 ≈51 MB
+（MKACG-651 实测，数字与判据见契约文档）。命中目录名后再点查一次拿完整 `Drama` 去渲染。
+
 **不存在「枚举整棵树」的路径**：旧实现每次请求 1 次 `ListDramas` + 每剧 1 次
 `ListEmbyItems`，在 L1 规模（60 万部 × 46.8 集）下不可能完成。
 
-两个实现选择（契约允许、此处留档）：
+两条实现口径（此处留档，改动前先读）：
 
-- **分片目录恒回 `00`–`7f` 全部 128 个**（契约原文「分类目录 1 次 `DISTINCT shard`
-  （或直接回 `00`–`7f`）」取了后者）。`DISTINCT shard` 要扫该分类的全部索引行
-  （183k 行约 20–40ms，随分类规模线性增长），而分片集合本来就是
-  `store.ShardCount`；空分片列出来是空目录，列它不发生查询。
 - **分类目录名解析只用存在性点查**（`GenreExists`，`SELECT EXISTS(SELECT 1 … WHERE genre = ?)`，
   O(log n)）：目录名 → genre 取值集合是纯映射（`其他` → `{"", "其他"}`，其余就是目录名
   本身），不需要把行集取回来。不要换成 `SELECT DISTINCT genre` 再过滤（整条覆盖索引
@@ -597,10 +597,13 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
   「转义后等于目录名」的分类 —— 这条路径只对脏分类与不存在的目录付代价。
 
 剧目录名 → 剧目：先按 `WHERE title = ? AND year = ?`（`idx_drama_title`）点查，带冲突
-后缀的形态按 `WHERE provider = ? AND provider_id = ?` 点查；命中后**仍比对「分类 + 分片 +
-目录名」**，不一致即 `ErrNotFound`（防止其他分片/分类的同名剧被渲染到本路径下）。
-标题含 `/ : * ?` 等字符时目录名是 sanitize 过的、点查必然不中，此时退到「本分片内比对」
-（`WHERE genre IN (…) AND shard = ?`，索引区间查询，不是全表扫）。
+后缀的形态按 `WHERE provider = ? AND provider_id = ?` 点查；命中后**仍比对「分类 +
+目录名」**，不一致即 `ErrNotFound`（防止其他分类的同名剧被渲染到本路径下）。
+标题含 `/ : * ?` 等字符时目录名是 sanitize 过的、点查必然不中，此时退到「本分类内比对」
+（`WHERE genre IN (…) ORDER BY title`，索引区间查询，不是全表扫）。**代价**：这条回退
+路径要扫整个分类，21.6 万部时实测 0.77–1.41 s/文件（`docs/DIRECTORY-CONTRACT.md`
+「单目录子项上限」第 4 条）；这类脏标题在真实库里是少数，量大时升级路径是加派生列/
+函数索引，**不要**恢复分片层。
 
 ### strm 形态
 
@@ -666,25 +669,51 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 本包只提供两件事：`x/net/webdav.FileSystem` 适配（`fs.go`）与 Basic 认证（`handler.go`）。
 路径与目录形状见 `docs/DIRECTORY-CONTRACT.md`。
 
-### `Depth` 只支持 0 / 1（MKACG-623）
+### `Depth` 的三档取值与整树递归（MKACG-623 / MKACG-651 实测修正）
 
-`PROPFIND` 的 `Depth` 由协议库解析（`x/net/webdav` 的 `parseDepth`：只认 `0`、`1`、
-`infinity` 三种字面量），**数值深度 ≥2 一律 `400 Bad Request`**。这是协议库的实现限制，
-不是本服务的缺陷：不要为它加兼容层，也不要把「按数值深度 ≥2 验一遍」写成验收步骤。
+`PROPFIND` 的 `Depth` 由协议库解析（`x/net/webdav` 的 `parseDepth`）：**只认 `0`、`1`、
+`infinity` 三个字面量**，任何数值 ≥2 一律 `400 Bad Request`（协议库实现限制，不是本服务
+的缺陷；不要为它加兼容层）。
 
-客户端适配方式（rclone / Emby 都这么干）：**逐层 `Depth: 1` 递归**，每层一次请求。
-所以验收与排障只写 `Depth: 0` / `Depth: 1`；「一次请求拉多层」在本服务上不存在，
-看到 400 先去查请求头，而不是查 vfs 树。
+**关键的一条（旧版本节写错过，2026-11-02 功能检测实测纠正）**：**省略 `Depth` 头等于
+`infinity`**——RFC 4918 §9.1 就是这么规定的，`x/net/webdav` 的 `handlePropfind` 里
+`depth := infiniteDepth` 正是缺头时的默认值。`infinity` 会**递归整棵子树**：
+
+| 请求 | 行为 |
+|---|---|
+| `Depth: 0` | 只回资源自己 |
+| `Depth: 1` | 回直接子项（**唯一应该用的形状**） |
+| `Depth: infinity` / 省略 `Depth` 头 | 递归整棵子树（最贵的形状） |
+| `Depth: 2` 及以上 | `400` |
+
+所以「一次请求拉多层」在本服务上**是存在的**，代价实测（MKACG-651，冷启动真服务）：
+
+| 场景 | `Depth: 1` | 省略 `Depth`（= infinity） |
+|---|---|---|
+| 分类目录 21.6 万剧 | 114.7 MB / 4.06 s / RSS +137 MB | **369.0 MB / 116 s / RSS +501 MB** |
+| 一个分类 5,000 剧 × 10 集（50k item） | 2.6 MB / 0.10 s | **83.3 MB / 58.2 s** |
+
+口径与判据见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。
+
+客户端与排障口径：
+
+- rclone mount / Emby / Jellyfin **逐层 `Depth: 1`**，不受影响；`rclone lsf -R` 实测正常。
+- 手工排障一律带 `-H 'Depth: 1'`：`curl -X PROPFIND <url>`（不带 `Depth`）会打整棵树，
+  在 20 万级目录上就是几分钟、几百 MB 响应 + 服务端 RSS 涨 0.5 GB。
+- 看到 `400` 先去查请求头（数值深度 ≥2），而不是查 vfs 树。
+- 本服务**没有**拦截 `infinity` 的逻辑，这是刻意的：拦截要改 `Depth` 支持，属另一件决策
+  （本任务的 Planner 契约明确 MUST NOT 动它）。要改先走 ADR。
 
 ### 路径映射
 
-**DAV 根 = vfs 根目录**（`vfs.Root`）：`/` → `短剧`，`/爱情/0a/剧名 (2024)/…` →
-`短剧/爱情/0a/剧名 (2024)/…`。DAV 路径里没有 `短剧` 这一段，根目录名来自 `vfs.Root`，
+**DAV 根 = vfs 根目录**（`vfs.Root`）：`/` → `短剧`，`/爱情/剧名 (2024)/…` →
+`短剧/爱情/剧名 (2024)/…`。DAV 路径里没有 `短剧` 这一段，根目录名来自 `vfs.Root`，
 不在本包复制字面量。
 
-因此 `rclone lsf --max-depth 5 dramahub:/` 的层级是 分类 → 分片 → 剧 → Season 01 →
-strm/nfo（`docs/ACCEPTANCE.md` P2）：Emby 库路径 `rclone mount dramahub:/ /mnt/dramahub`
-→ `/mnt/dramahub`（一个「剧集」库，库根 `=` DAV 根）。
+因此 `rclone lsf --max-depth 4 dramahub:/` 的层级是 分类 → 剧 → Season 01 → strm/nfo
+（`docs/ACCEPTANCE.md` P2）。Emby/Jellyfin 的库根**必须挂在分类目录上**
+（每个分类一个 media folder），挂 DAV 根时分类目录会被当 Series ——
+`docs/DIRECTORY-CONTRACT.md`「被推翻的做法」。
 
 ### 定位一个节点 = 列一次父目录
 
@@ -757,7 +786,8 @@ Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**�
 - **单目录成本随子项数线性增长，季层不摊薄**：`walkFS` 对一次 `PROPFIND` 的每个子项都要取
   props，所以一个 1000 集的季（2000 个子项）就是 2000 次渲染 + 一份大 XML。MKACG-610
   验收在 17,558 部真库上实测：该季 `Season 01` 的 `Depth: 1` = **1.8 MB / 25.9 s**（单请求）。
-  分片摊薄的是分类层（20 万级）；季层只能靠「单季集数量级本身有限」兜住（当前库实测最大单季
+  分类层已不再摊薄（分片层删除，见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）；
+  季层只能靠「单季集数量级本身有限」兜住（当前库实测最大单季
   1000 集，代码里没有任何集数上限常量），没有更强的摊薄手段——再切一层就改变了 Emby 认的季结构。
 
 ### 测试（两层，都不需要外部 rclone）
@@ -769,14 +799,17 @@ HTTP**。覆盖：DAV 根 = vfs 根、长度只来自 `len(渲染字节)`、`os.
 不跨请求复用）、列举/渲染错误透传。
 
 **集成**（`webdav_test.go`）：真 PostgreSQL（独立 schema）+ 真 handler（`httptest`），验证协议契约。
-客户端游览（等同 `rclone lsf --max-depth 5`、Emby 扫库的请求序列）由进程内的递归
+客户端游览（等同 `rclone lsf --max-depth 4`、Emby 扫库的请求序列）由进程内的递归
 PROPFIND 客户端完成，不依赖外部二进制、不起守护进程、不落盘：
 
-- `TestPropfindDepth1_Layers`：`Depth: 1` 逐层只有该层节点（根只有分类、分类只有分片、
-  分片只有剧目录、剧目录是 `tvshow.nfo` + `Season 01`），且 DAV 路径里没有 `短剧` / `全部`。
-- `TestWalkTree_Complete`：max-depth 5 枚举出完整树（分类 → 分片 → 剧 → Season 01 →
-  strm/nfo），并对每个文件项断言 `getcontentlength == GET 实际 body 长度`。
+- `TestPropfindDepth1_Layers`：`Depth: 1` 逐层只有该层节点（根只有分类、分类只有剧目录、
+  剧目录是 `tvshow.nfo` + `Season 01`），且 DAV 路径里没有 `短剧` / `全部` / 两位十六进制段。
+- `TestWalkTree_Complete`：max-depth 4 枚举出完整树（分类 → 剧 → Season 01 → strm/nfo），
+  并对每个文件项断言 `getcontentlength == GET 实际 body 长度`。
 - `TestWalkTree_DepthBounded`：遍历在预算内结束、深度不超过 max-depth。
+- `TestPropfindDepthSemantics`：`Depth` 四种形状的真实语义——`0` 只回自己、`1` 只回直接
+  子项、**省略头与 `infinity` 都会递归到孙级文件**、数值 `2` 回 `400`。这条盯的是文档
+  口径（曾经写错成「不存在一次请求拉多层」），不是新的代码行为。
 - `TestPropfindNotFoundIs404`：不存在的路径在**线缆上**必须是 404（不是 405）。
 - `TestPropfindDepth1_QueryCountIndependentOfSize`：200 部与 12,000 部两种规模的
   `Depth:1` 查询次数必须相同（每层一次），且不渲染任何孙级文件。

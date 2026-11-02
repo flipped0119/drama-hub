@@ -266,14 +266,20 @@ stage_D() {
     pass D2 "顶层无 全部/ — $(printf '%s\n' "$top" | tr '\n' ' ' | head -c 120)"
   fi
 
-  # 形状：<分类>/<分片>/<剧>/Season 01/<文件>，分片是两位十六进制
+  # 形状：<分类>/<剧>/Season 01/<文件>（分片层已下线，见 docs/DIRECTORY-CONTRACT.md v5）
   local shape
-  shape='^[^/]+/[0-9a-f]{2}/[^/]+/(tvshow\.nfo|Season 01/[^/]+\.(strm|nfo))$'
+  shape='^[^/]+/[^/]+/(tvshow\.nfo|Season 01/[^/]+\.(strm|nfo))$'
   badshape=$(grep -vcE "$shape" "$list" || true)
   if [ "$badshape" -eq 0 ]; then
-    pass D3 "全部文件形状为 <分类>/<分片两位十六进制>/<剧>/{tvshow.nfo,Season 01/*.{strm,nfo}}"
+    pass D3 "全部文件形状为 <分类>/<剧>/{tvshow.nfo,Season 01/*.{strm,nfo}}"
   else
     fail D3 "$badshape 个文件形状不符 — $(grep -vE "$shape" "$list" | head -3)"
+  fi
+  # 分片层已下线：任何两层十六进制段出现即失败（分片目录叫 00–7f）。
+  if grep -qE '^[^/]+/[0-9a-f]{2}/' "$list"; then
+    fail D3b "路径里仍有两位十六进制段（分片层没删干净）— $(grep -E '^[^/]+/[0-9a-f]{2}/' "$list" | head -3)"
+  else
+    pass D3b "路径里没有两位十六进制段（分片层已下线）"
   fi
 
   if ! db_ready; then
@@ -308,7 +314,7 @@ find_show_dir() { # find_show_dir —— 本次验收的剧目录（C 段未跑�
     DRAMA_ID=$(dbq "SELECT id FROM drama ORDER BY id LIMIT 1")
   fi
   [ -n "$DRAMA_ID" ] || return 1
-  grep -E "^[^/]+/[0-9a-f]{2}/.*/tvshow\.nfo$" "$WORK/list.txt" | head -1 | sed 's#/tvshow\.nfo$##'
+  grep -E "^[^/]+/[^/]+/tvshow\.nfo$" "$WORK/list.txt" | head -1 | sed 's#/tvshow\.nfo$##'
 }
 
 season_files() { # season_files <show dir> <strm|nfo> —— 该剧季目录下的文件（固定串匹配，
@@ -329,7 +335,7 @@ stage_E() {
   local show
   show=$(find_show_dir)
   if [ -z "$show" ]; then
-    fail E1 "找不到剧目录（<分类>/<分片>/<剧>/tvshow.nfo）"
+    fail E1 "找不到剧目录（<分类>/<剧>/tvshow.nfo）"
     return
   fi
   info "" "剧目录: $show"

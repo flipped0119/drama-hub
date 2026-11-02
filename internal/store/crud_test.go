@@ -26,7 +26,6 @@ func newCRUDTestDB(t *testing.T) *DB {
 	return db
 }
 
-// countRows 统计 table 的行数。
 // countRows 统计 table 的行数。形参用 dbtx：根 Store 与事务内 Store 都适用。
 func countRows(t *testing.T, db dbtx, table string) int {
 	t.Helper()
@@ -38,9 +37,6 @@ func countRows(t *testing.T, db dbtx, table string) int {
 }
 
 // assertDramaEqual 逐字段比较两部剧（不含 ID）。
-//
-// Shard 不读 want.Shard：它由 provider_id 派生（UpsertDrama 重算、入参被忽略），
-// 所以期望值是 ShardOf(want.ProviderID)。
 func assertDramaEqual(t *testing.T, got, want Drama) {
 	t.Helper()
 	if got.Provider != want.Provider || got.ProviderID != want.ProviderID ||
@@ -48,9 +44,6 @@ func assertDramaEqual(t *testing.T, got, want Drama) {
 		got.CoverURL != want.CoverURL || got.EpisodeTotal != want.EpisodeTotal ||
 		got.SyncAt != want.SyncAt || got.Genre != want.Genre || got.Tags != want.Tags {
 		t.Errorf("Drama 字段不一致：got %+v, want %+v", got, want)
-	}
-	if wantShard := ShardOf(want.ProviderID); got.Shard != wantShard {
-		t.Errorf("Drama.Shard = %d, 期望按身份派生 %d", got.Shard, wantShard)
 	}
 }
 

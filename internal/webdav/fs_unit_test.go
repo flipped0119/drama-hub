@@ -61,25 +61,23 @@ func (f *fakeTree) Render(_ context.Context, p string) ([]byte, error) {
 	return body, nil
 }
 
-// 假树的固定形状：短剧/<分类>/<分片>/<剧>/Season 01/<文件>。
+// 假树的固定形状：短剧/<分类>/<剧>/Season 01/<文件>。
 const (
 	fakeRoot     = "短剧"
 	fakeGenreDir = fakeRoot + "/爱情"
-	fakeShardDir = fakeGenreDir + "/0a"
-	fakeDramaDir = fakeShardDir + "/测试剧 (2024)"
+	fakeDramaDir = fakeGenreDir + "/测试剧 (2024)"
 	fakeSeason   = fakeDramaDir + "/Season 01"
 	fakeStrm     = fakeSeason + "/测试剧 - S01E01 - 开局.strm"
 	fakeNFO      = fakeSeason + "/测试剧 - S01E01 - 开局.nfo"
 )
 
-// newFakeTree 造一棵最小树：根 → 分类 → 分片 → 一部剧 → 一季 → 一集的两个文件。
+// newFakeTree 造一棵最小树：根 → 分类 → 一部剧 → 一季 → 一集的两个文件。
 func newFakeTree() *fakeTree {
 	return &fakeTree{
 		dirs: map[string][]vfs.Node{
 			"":           {{Path: fakeGenreDir, IsDir: true}},
 			fakeRoot:     {{Path: fakeGenreDir, IsDir: true}},
-			fakeGenreDir: {{Path: fakeShardDir, IsDir: true}},
-			fakeShardDir: {{Path: fakeDramaDir, IsDir: true}},
+			fakeGenreDir: {{Path: fakeDramaDir, IsDir: true}},
 			fakeDramaDir: {
 				{Path: fakeDramaDir + "/tvshow.nfo"},
 				{Path: fakeSeason, IsDir: true},
@@ -173,9 +171,8 @@ func TestFS_NotFoundWrapsFSNotExist(t *testing.T) {
 	fsys := NewFS(ft)
 	for _, name := range []string{
 		"/不存在",
-		"/爱情/7f",            // 分片目录不存在
-		"/爱情/0a/不存在 (2024)", // 剧目录不存在
-		"/爱情/0a/测试剧 (2024)/nope.strm",
+		"/爱情/不存在 (2024)", // 剧目录不存在
+		"/爱情/测试剧 (2024)/nope.strm",
 	} {
 		_, err := fsys.Stat(testCtx(t), name)
 		if !errors.Is(err, fs.ErrNotExist) {
@@ -234,19 +231,20 @@ func TestFS_OpenDirIsLazy(t *testing.T) {
 	fsys := NewFS(ft)
 	ctx := withSnapshot(testCtx(t))
 
-	f, err := fsys.OpenFile(ctx, davPath(fakeShardDir), 0, 0)
+	f, err := fsys.OpenFile(ctx, davPath(fakeGenreDir), 0, 0)
 	if err != nil {
-		t.Fatalf("OpenFile(分片目录): %v", err)
+		t.Fatalf("OpenFile(分类目录): %v", err)
 	}
-	// 只查了父目录（用来定位分片目录自身），分片目录还没查、孙级文件一个都没渲染。
-	if ft.lists != 1 || ft.listed[0] != fakeGenreDir {
-		t.Errorf("打开目录后 List 调用 = %d 次（%v）, 期望只查父目录 %q", ft.lists, ft.listed, fakeGenreDir)
+	// 只查了父目录（DAV 根 = vfs 根 ""，用来定位分类目录自身），
+	// 分类目录还没查、孙级文件一个都没渲染。
+	if ft.lists != 1 || ft.listed[0] != "" {
+		t.Errorf("打开目录后 List 调用 = %d 次（%v）, 期望只查根目录 \"\"", ft.lists, ft.listed)
 	}
 	if ft.renders != 0 {
 		t.Errorf("打开目录就渲染了 %d 个文件, 期望 0", ft.renders)
 	}
 
-	// Readdir 才真正列子项：查分片目录一次，仍然不渲染孙级文件。
+	// Readdir 才真正列子项：查分类目录一次，仍然不渲染孙级文件（只有目录）。
 	children, err := f.Readdir(0)
 	if err != nil {
 		t.Fatalf("Readdir: %v", err)
@@ -254,11 +252,11 @@ func TestFS_OpenDirIsLazy(t *testing.T) {
 	if len(children) != 1 || children[0].Name() != "测试剧 (2024)" {
 		t.Fatalf("子项 = %v, 期望只有剧目录", children)
 	}
-	if ft.lists != 2 || ft.listed[1] != fakeShardDir {
-		t.Errorf("Readdir 后 List 调用 = %d 次（%v）, 期望追加查 %q", ft.lists, ft.listed, fakeShardDir)
+	if ft.lists != 2 || ft.listed[1] != fakeGenreDir {
+		t.Errorf("Readdir 后 List 调用 = %d 次（%v）, 期望追加查 %q", ft.lists, ft.listed, fakeGenreDir)
 	}
 	if ft.renders != 0 {
-		t.Errorf("列举分片目录渲染了 %d 个孙级文件, 期望 0", ft.renders)
+		t.Errorf("列举分类目录渲染了 %d 个孙级文件, 期望 0", ft.renders)
 	}
 
 	// 再 Readdir 一次不重复查（已加载）。
@@ -274,7 +272,7 @@ func TestFS_OpenDirIsLazy(t *testing.T) {
 // 分流，普通 %w 包装会让它落到 405（协议层），线上表现为「不存在的路径返回 405」。
 func TestFS_NotFoundIsPathError(t *testing.T) {
 	ft := newFakeTree()
-	_, err := NewFS(ft).Stat(testCtx(t), "/爱情/7f")
+	_, err := NewFS(ft).Stat(testCtx(t), "/爱情/不存在 (2024)")
 	if err == nil {
 		t.Fatalf("Stat(不存在) 没有报错")
 	}
@@ -341,7 +339,7 @@ func TestFS_SnapshotRendersOncePerRequest(t *testing.T) {
 	}
 }
 
-// 列一个分片目录（PROPFIND Depth:1 的形态）时，每个子项只 Stat，不再逐项查库：
+// 列一个分类目录（PROPFIND Depth:1 的形态）时，每个子项只 Stat，不再逐项查库：
 // 快照让「一次目录列举」= 每层一次 List + 每个文件一次 Render。
 func TestFS_DepthOneListsEachDirOnce(t *testing.T) {
 	ft := newFakeTree()

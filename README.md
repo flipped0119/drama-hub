@@ -49,7 +49,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 路径返回 404。
 
 > **2.0 口径**：WebDAV 挂在 `/webdav/`（`/dav/` 不留兼容别名），目录形状是
-> `/{分类}/{分片}/{剧名} ({年份})/Season 01/…`；播放面只有 `/video` 两个口子，
+> `/{分类}/{剧名} ({年份})/Season 01/…`；播放面只有 `/video` 两个口子，
 > `.strm` 里写的是 `{strm_prefix}/video/{id}.m3u8`（单集与合并集同一形态）。
 > 1.0 的 `/s/{token}/*` 已退役、不留兼容层。契约真值：`docs/PLAYBACK-CONTRACT.md`；
 > 目录形状：`docs/DIRECTORY-CONTRACT.md`。
@@ -57,7 +57,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
-| `/webdav/` 及全部子路径 | 任意 | 207/200/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength，**只支持 `Depth: 0/1`**——数值深度 ≥2 由 `x/net/webdav` 直接 400，不是本服务的缺陷）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
+| `/webdav/` 及全部子路径 | 任意 | 207/200/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength；**排障请带 `Depth: 1`**——数值深度 ≥2 由 `x/net/webdav` 直接 400，而**省略 `Depth` 等价于 `infinity`，会递归整棵树**，21.6 万剧的分类目录实测 369 MB / 116 s / RSS +501 MB，见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）、GET strm/nfo 200；树是 `/{分类}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/404/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
@@ -131,7 +131,7 @@ curl -i -X POST -H 'Content-Type: application/json' \
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
 curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/webdav/  # 207 + getcontentlength
-# PROPFIND 只认 Depth: 0 / 1（数值深度 ≥2 → 400，x/net/webdav 的限制）；递归靠逐层 Depth: 1
+# Depth 只认 0 / 1 / infinity（数值深度 ≥2 → 400，x/net/webdav 的限制）；省略 Depth = infinity（递归整棵树），所以手工请求一律显式带 Depth: 1
 ```
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
@@ -146,13 +146,16 @@ curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8
 rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \
   user <webdav_user> pass <webdav_pass>
 rclone mount dramahub:/ /mnt/dramahub --dir-cache-time 30s
-rclone lsf --max-depth 5 dramahub:/     # 分类 → 分片 → 剧 → Season 01 → strm/nfo
+rclone lsf --max-depth 4 dramahub:/     # 分类 → 剧 → Season 01 → strm/nfo
 ```
 
-Emby 库路径指向 `/mnt/dramahub`（DAV 根即剧集库根），类型选「电视节目」。分片目录
-（`00`–`7f`）只是把每个目录的子项数摊薄到 `PROPFIND` 能列出来的量级，对 Emby 透明——
-库根仍是 `/webdav`，Emby 逐层往下扫。若 Emby 在 DAV 根上把分类当成剧，退一步把具体
-分类目录（`/webdav/爱情` 等）逐个加成媒体文件夹。
+Emby / Jellyfin 的库**按分类目录分挂**：一个「电视节目」库，媒体文件夹逐个加
+`/mnt/dramahub/<分类>`（真实 `genre` 词表 68 个）。库根直接挂 `/mnt/dramahub` 会把分类
+目录当 Series（1436 部剧只识别出 59 部，`jellyfin.db` 实测）。
+
+分类目录一次 `PROPFIND` 要列出该分类的全部剧（`PROPFIND` 没有分页），实测 10 万子项
+2.6 s / 54 MB 响应体、21.6 万子项 3.5 s / 117 MB，判据与越线项的升级路径见
+`docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。
 
 ## 接到 Jellyfin（一分类一库）
 
@@ -249,6 +252,7 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
   - `docs/adr/0007-own-hls-and-local-cache.md` — 播放统一走自造 HLS、缓存收回本服务
   - `docs/adr/0010-auto-merge-chunking.md` — 合并集自动分块、手工编排移除
   - `docs/adr/0012-jellyfin-libraries.md` — Jellyfin 一分类一库、自管判定、只增不删
+  - `docs/adr/0013-drop-directory-shard-layer.md` — 去掉分片目录层、单目录子项上限实测
   - `docs/adr/0008-image-publish.md` — 镜像发布口径：ghcr、双架构、ci 绿才发、`latest` 跟 main
 
 ## 状态

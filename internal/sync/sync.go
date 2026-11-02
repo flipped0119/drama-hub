@@ -68,8 +68,8 @@ func (s *Syncer) Name() string { return s.source.Name() }
 // episode.vid 取插件的源侧集标识；episode.title / duration_sec 留零值（源侧批量拿不到；
 // duration_sec 由首播建索引时回填，见 internal/segment 与 docs/DEV-STANDARDS.md），
 // 直链不落库（同步只保证剧与集齐全，见 docs/DEV-STANDARDS.md「直链不落库的契约」）。
-// 2.0 新增三列按 docs/DATA-MODEL.md「类型 / 分类」落：genre = Genres[0]（主类型，
-// 空 = 上游未声明）、tags = 全部标签的 JSON 数组（保真）、shard 由 store 按身份派生。
+// 2.0 新增两列按 docs/DATA-MODEL.md「类型 / 分类」落：genre = Genres[0]（主类型，
+// 空 = 上游未声明）、tags = 全部标签的 JSON 数组（保真）。
 //
 // 取数与解析在事务之外完成；库里任何一步失败整体回滚，不留「有剧无集」的半截数据。
 // 错误是插件哨兵（ErrUpstream / ErrRejected / ErrSchema / ErrNotFound / ErrNoStream）

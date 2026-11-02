@@ -45,15 +45,9 @@ ALTER TABLE drama ADD COLUMN genre TEXT NOT NULL DEFAULT '';
 -- 的保真，不做检索；归类只认 genre 单值。
 ALTER TABLE drama ADD COLUMN tags TEXT NOT NULL DEFAULT '[]';
 
--- 目录分片键：fnv32a(provider_id) % N（N 是代码常量，默认 128），写库时由框架算好存下。
--- 只服务分类目录的分页列举，不参与任何业务语义；改 N 时一条 UPDATE 重算，不改 schema。
--- 为什么必须有分片层：PROPFIND 没有分页，单个目录子项上万时 Emby 扫不动
--- （docs/DIRECTORY-CONTRACT.md「D2」）。
-ALTER TABLE drama ADD COLUMN shard INTEGER NOT NULL DEFAULT 0;
-
--- 目录列举：WHERE genre = ? AND shard = ? ORDER BY title 走本索引
--- （同一索引也覆盖纯 genre / 纯 shard 的 DISTINCT 与 GROUP BY）。
-CREATE INDEX IF NOT EXISTS idx_drama_genre_shard_title ON drama (genre, shard, title);
+-- 目录列举：WHERE genre = ? ORDER BY title 走本索引
+-- （同一索引也覆盖纯 genre 的 DISTINCT 与 GROUP BY）。
+CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
 
 -- 剧目录名 → 行的点查：WHERE title = ? AND year = ?（Render 每个请求一次）。
 CREATE INDEX IF NOT EXISTS idx_drama_title ON drama (title);
@@ -79,8 +73,7 @@ CREATE TABLE IF NOT EXISTS source_state (
 |---|---|---|---|
 | `drama.genre` | `/<类型>/` 一级目录的分类键；一条剧只属一个类型 | 框架（`Work().Genres[0]`） | `internal/vfs` 目录列举 |
 | `drama.tags` | 保真：上游声明的全部标签 | 框架（`Work().Genres`） | 只出现在管理面/AI 检索，不进目录 |
-| `drama.shard` | 分片目录键：`fnv32a(provider_id) % N`，把每个分类目录摊薄到 ≤3000 子项 | 框架（写 `drama` 时算） | `internal/vfs` 分类目录列举 |
-| `idx_drama_genre_shard_title` | `/<类型>/<分片>/` 的分页列举（`WHERE genre=? AND shard=? ORDER BY title`）；也覆盖 `SELECT DISTINCT genre` 与 `GROUP BY genre` | — | `internal/vfs`、`internal/web` |
+| `idx_drama_genre_title` | `/<类型>/` 的剧目录列举（`WHERE genre IN (…) ORDER BY title`）；也覆盖 `SELECT DISTINCT genre` 与 `GROUP BY genre`（`genre` 是索引前缀） | — | `internal/vfs`、`internal/web` |
 | `idx_drama_title` | 剧目录名点查（`WHERE title=? AND year=?`），`Render` 每请求一次 | — | `internal/vfs` |
 | `source_state.cursor` | 枚举断点，38 小时全量灌库续跑 | 调度器（每轮成功后写） | 调度器 |
 | `source_state.last_run_at` | 算 `next_due` 的唯一真值来源（重启可算） | 调度器 | 调度器、状态页 |
@@ -192,6 +185,26 @@ ALTER TABLE artifact ADD CONSTRAINT artifact_kind_check CHECK (kind IN ('cover',
 | `episode.duration_sec` | 唯一的时长真值：playlist 的 `#EXTINF`、`#EXT-X-TARGETDURATION`、`.nfo` 的 `<runtime>` 都用它 |
 | `artifact(kind='segment')` | 每集一片的缓存行（见上） |
 
+### 0007：删除目录分片列
+
+```sql
+-- 0007_drop_shard.sql
+
+-- 分片层下线（MKACG-651 方案 A）：Jellyfin 把分类目录当 Series、把分片目录当 Season
+-- （东方仙侠/66 → 「第 66 季」），真正的剧目录退化成普通 Folder。见 docs/DIRECTORY-CONTRACT.md
+-- 「被推翻的做法」。DROP COLUMN 会一并删掉依赖它的 idx_drama_genre_shard_title。
+ALTER TABLE drama DROP COLUMN IF EXISTS shard;
+
+-- 分类目录一次列举 = 一次 WHERE genre IN (…) ORDER BY title。
+CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
+```
+
+| 对象 | 变化 |
+|---|---|
+| `drama.shard` | **删除**（`DROP COLUMN`，不可回滚；同一二进制既迁移也不再读该列） |
+| `idx_drama_genre_shard_title` | 随 `shard` 列一起消失 |
+| `idx_drama_genre_title` | **新增**，服务分类目录列举与 `DISTINCT genre` |
+
 ## 字段来源逐个定稿
 
 ### 类型 / 分类
@@ -295,19 +308,20 @@ ALTER TABLE artifact ADD CONSTRAINT artifact_kind_check CHECK (kind IN ('cover',
 
 > 本节是换 PostgreSQL 之前（SQLite 后端）的一次 dry-run 记录：SQL 块、命令与输出都按
 > 当时的口径，保留下来只为说明「本文曾是 SQL 的唯一真值、文档与代码一起改」这条工作方式。
-> **现行迁移文件是 `internal/store/migrations/0001…0006` 的 PG DDL**（ADR-0009），
-> 与本节的 SQLite 版本不要互相校对：`0003` 现在是就地 drop/add CHECK，`0004` 的列名
-> 与顺序也不变但表类型是 PostgreSQL；`0005` 删掉合并表（ADR-0010），`0006` 是 segment
-> 收窄 + artifact 去掉 index kind（PG 版 SQL 见上「0006：每集一片 fMP4」）。
+> **现行迁移文件是 `internal/store/migrations/0001…0007` 的 PG DDL**（ADR-0009），
+> 与本节的 SQLite 版本不要互相校对：列类型、`COLLATE "C"` 与文件编号都不同
+> （PG 版 `0003` 是 segment 缓存扩 kind，`0004` 删 `play_url`、`0005` 删合并表、
+> `0006` 是 segment 收窄 + artifact 去掉 index kind、`0007` 删 `shard`）。
 
-验证方式：把本文上面三个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
+
+验证方式：把本文上面四个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
 `internal/store/migrations/`，用**仓库自己的迁移 runner**（`store.Open` → `migrate`）跑：
 
 ```sh
-# 从本文抽出三个 SQL 块 → 0002 / 0003 / 0004（顺序即它们在文中出现的顺序）
-python3 -c 'import re,io,pathlib;s=io.open("docs/DATA-MODEL.md",encoding="utf-8").read();n=["0002_add_genre_and_source_state.sql","0003_drop_play_url.sql","0004_segment_cache.sql"];[pathlib.Path("/tmp/d",a).write_text(b,encoding="utf-8") for a,b in zip(n,re.findall(r"```sql\n(.*?)```",s,re.S))]'
-cp /tmp/d/0002_*.sql /tmp/d/0003_*.sql /tmp/d/0004_*.sql <repo-copy>/internal/store/migrations/
-cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
+# 从本文抽出四个 SQL 块 → 0002 / 0005 / 0003 / 0004（按块在文中出现的顺序命名）
+python3 -c 'import re,io,pathlib;s=io.open("docs/DATA-MODEL.md",encoding="utf-8").read();n=["0002_add_genre_and_source_state.sql","0005_drop_shard.sql","0003_drop_play_url.sql","0004_segment_cache.sql"];[pathlib.Path("/tmp/d",a).write_text(b,encoding="utf-8") for a,b in zip(n,re.findall(r"```sql\n(.*?)```",s,re.S))]'
+cp /tmp/d/*.sql <repo-copy>/internal/store/migrations/
+cd <repo-copy> && go test ./internal/store/ -v
 ```
 
 这样本文就是 SQL 的唯一真值：文档改了而验证没重跑，抽取出来的文件就会跑失败
@@ -316,18 +330,23 @@ cd <repo-copy> && go test ./internal/store/ -run TestS1 -v
 结果：
 
 ```
-首次 applied=4                       # 空库 → 最新（0001+0002+0003+0004）
+首次 applied=7                       # 空库 → 最新（0001…0007）
 二次 applied=0                       # 重复执行幂等
-schema 版本=4                        # 两次打开后都停在 4
+schema 版本=7                        # 两次打开后都停在 7
 play_url 已移除: no such column: play_url
-索引 idx_drama_genre_shard_title / idx_drama_title / idx_artifact_kind_last_used 均存在
-默认值 genre="" tags="[]" shard=0
+shard 已移除: no such column: shard
+索引 idx_drama_genre_title / idx_drama_title / idx_artifact_kind_last_used 均存在
+旧索引 idx_drama_genre_shard_title 不存在
+默认值 genre="" tags="[]"
 artifact 允许 kind='segment'；CHECK 拒绝未知 kind
-重建前插入的 cover/index 两行在重建后仍在（逐字段相同，总行数 2）
-迁移 0001 0001_init.sql    (3806 bytes)
-迁移 0002 ...              (2099 bytes)
-迁移 0003 ...              (275 bytes)
-迁移 0004 ...              (996 bytes)
+# 现行 PG 迁移文件（按文件名排序，就是 runner 的执行顺序）
+0001_init.sql                      4920 bytes
+0002_add_genre_and_source_state.sql 2221 bytes
+0003_segment_cache.sql              735 bytes
+0004_drop_play_url.sql              365 bytes
+0005_drop_merge_tables.sql          (MKACG-649)
+0006_segment_per_episode.sql        (MKACG-652)
+0007_drop_shard.sql                 1214 bytes
 ```
 
 三条要写清楚的幂等边界：
@@ -337,14 +356,16 @@ artifact 允许 kind='segment'；CHECK 拒绝未知 kind
 2. **裸重复执行 SQL 不幂等**，且这是 SQL DDL 的语义决定的（PostgreSQL 同）：`ADD COLUMN` /
    `DROP COLUMN` 重复执行必然报错。不许为此写成「先查 `pragma_table_info` 再决定」
    的动态 SQL —— 那会让迁移文件变成不可 review 的脚本。
-3. **迁移文件名必须从 0001 连续递增**（`migrate.go` 强制），所以 0002–0004 之间
-   不能留空号；如果 S5 决定把删列提前，编号整体前移，内容不变。
+3. **迁移文件名必须从 0001 连续递增**（`migrate.go` 强制），所以 0002–0007 之间
+   不能留空号、不能撞号：`0005` 是 MKACG-649（删合并表）、`0006` 是 MKACG-652
+   （segment 收窄）、`0007` 是 MKACG-651（删分片列）。编号按合并顺序，先合入的占
+   前面的号；后合入的分支 rebase 时顺延（本文件就是这么从 0006 改到 0007 的）。
 
 ## 对现有代码的影响清单（给 S5 的输入，不是本文的实现）
 
 | 文件 | 影响 |
 |---|---|
-| `internal/store/crud.go` | `Drama` 加 `Genre`/`Tags`/`Shard`；`Episode` 删 `PlayURL`/`PlayURLAt`；列清单与 scan 同步；`UpsertDrama` 写入 `shard` |
+| `internal/store/crud.go` | `Drama` 加 `Genre`/`Tags`（`Shard` 已于 0007 删除）；`Episode` 删 `PlayURL`/`PlayURLAt`；列清单与 scan 同步 |
 | `internal/store/migrations/0002_*.sql`、`0003_*.sql` | 新增（内容见上） |
 | `internal/store/state.go`（新） | `source_state` 的读写：`LoadState` / `SaveState` |
 | `internal/store/stats.go` | 删 `PlayableEpisodes` |
