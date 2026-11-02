@@ -348,3 +348,72 @@ func TestRenderConflictSuffixDirs(t *testing.T) {
 		}
 	}
 }
+
+// MKACG-650 AC：poster.jpg 的字节就是该剧本地封面缓存的字节（逐字节相等）。
+func TestRenderPosterFromCoverCache(t *testing.T) {
+	f := seed(t, "")
+	f.covers.has[coverKey("web", "a1")] = coverStub
+
+	body, err := f.tree.Render(context.Background(), f.dirA+"/poster.jpg")
+	if err != nil {
+		t.Fatalf("Render poster.jpg: %v", err)
+	}
+	if !bytes.Equal(body, coverStub) {
+		t.Fatalf("poster 字节 = %q, 期望 %q", body, coverStub)
+	}
+}
+
+// MKACG-650 AC：没有可用封面时 poster.jpg 是「不存在」（404），不是 0 字节文件——
+// 三种情形都按不存在处理：源未声明封面、索引行缺失、回源失败。
+func TestRenderPosterUnavailable(t *testing.T) {
+	f := seed(t, "")
+	ctx := context.Background()
+
+	// 剧 A 声明了封面 URL，但替身里没有本地封面 → 未命中。
+	if body, err := f.tree.Render(ctx, f.dirA+"/poster.jpg"); !errors.Is(err, ErrNotFound) || body != nil {
+		t.Fatalf("无本地封面时 Render = (%q, %v), 期望 (nil, ErrNotFound)", body, err)
+	}
+
+	// 本地有行但回源失败 → 仍然是「不存在」，且不返回半截字节。
+	f.covers.has[coverKey("web", "a1")] = coverStub
+	f.covers.fails[coverKey("web", "a1")] = true
+	if body, err := f.tree.Render(ctx, f.dirA+"/poster.jpg"); !errors.Is(err, ErrNotFound) || body != nil {
+		t.Fatalf("回源失败时 Render = (%q, %v), 期望 (nil, ErrNotFound)", body, err)
+	}
+}
+
+// MKACG-650 AC：有封面的剧 tvshow.nfo 带 <thumb aspect="poster">poster.jpg</thumb>
+// （相对路径，不写外链）；没有封面的剧一个 <thumb> 都没有。
+func TestRenderShowNFOThumb(t *testing.T) {
+	f := seed(t, "")
+	ctx := context.Background()
+
+	without, err := f.tree.Render(ctx, f.dirB+"/tvshow.nfo")
+	if err != nil {
+		t.Fatalf("Render(剧 B tvshow.nfo): %v", err)
+	}
+	if bytes.Contains(without, []byte("<thumb")) {
+		t.Fatalf("无封面的剧 nfo 里出现了 thumb：%s", without)
+	}
+
+	f.covers.has[coverKey("web", "a1")] = coverStub
+	with, err := f.tree.Render(ctx, f.dirA+"/tvshow.nfo")
+	if err != nil {
+		t.Fatalf("Render(剧 A tvshow.nfo): %v", err)
+	}
+	// 逐字节钉住元素形态：属性在前、值是相对路径、不是外链。
+	if want := []byte(`<thumb aspect="poster">poster.jpg</thumb>`); !bytes.Contains(with, want) {
+		t.Fatalf("有封面的剧 nfo 缺 %s：\n%s", want, with)
+	}
+
+	var got showNFO
+	if err := xml.Unmarshal(with, &got); err != nil {
+		t.Fatalf("解析带 thumb 的剧 NFO 失败（不是合法 XML）: %v\n%s", err, with)
+	}
+	if got.Thumb == nil || got.Thumb.Aspect != "poster" || got.Thumb.Value != "poster.jpg" {
+		t.Fatalf("thumb = %+v, 期望 aspect=poster、值=poster.jpg", got.Thumb)
+	}
+	if got.Title != titleA || got.Year != 2024 {
+		t.Errorf("带 thumb 后 title/year = %q/%d, 期望 %q/2024", got.Title, got.Year, titleA)
+	}
+}

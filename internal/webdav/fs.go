@@ -134,6 +134,12 @@ func (f *FS) children(ctx context.Context, dir vfs.Node) ([]os.FileInfo, error) 
 	for _, n := range l.nodes {
 		info, err := f.stat(ctx, n)
 		if err != nil {
+			// 子项渲染成「不存在」时跳过它，而不是让整份列举失败：poster.jpg 的封面
+			// 回源失败就是这样（MKACG-650）。一个可选资产取不回来，不该让整个剧目录的
+			// PROPFIND 变成错误响应，把客户端的扫描停在这一层。
+			if errors.Is(err, vfs.ErrNotFound) {
+				continue
+			}
 			return nil, err
 		}
 		out = append(out, info)

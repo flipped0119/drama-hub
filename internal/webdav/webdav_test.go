@@ -12,12 +12,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/store"
 	"github.com/justforlxz/drama-hub/internal/vfs"
@@ -44,6 +48,16 @@ type fixture struct {
 	shard    string // 剧 A 的分片目录名（两位十六进制）
 	epIDs    []int64
 	settings *store.Settings
+
+	// covers 是接到树上的海报缓存（与生产装配同一个实例）；cdn 是它的假封面源，
+	// coverPath 是本地已落盘的封面文件路径。三者只在 newFixtureWithCover 里填。
+	covers    *cache.CoverCache
+	cdn       *fakeCoverCDN
+	coverPath string
+
+	// st 是这套 fixture 的 store（与树、封面缓存同一个库）。测试用它把封面行改老，
+	// 再跑一轮真的淘汰，验证「系统淘汰后按需回源」整条链路。
+	st *store.Store
 }
 
 // stubID 是 IDFunc 替身：webdav（rank 40）不能 import stream（rank 40），
@@ -61,8 +75,75 @@ func shardOf(providerID string) string {
 	return fmt.Sprintf("%02x", h.Sum32()%128)
 }
 
+// fakeCoverCDN 是假封面源：记请求次数，用来断言「命中不回源 / 按需回源一次」。
+type fakeCoverCDN struct {
+	mu     sync.Mutex
+	hits   int
+	status int
+	body   []byte
+}
+
+// set 切换下一次响应的状态码与字节。
+func (c *fakeCoverCDN) set(status int, body []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.status, c.body = status, body
+}
+
+// count 返回累计请求次数。
+func (c *fakeCoverCDN) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.hits
+}
+
+// newFakeCoverCDN 起一个假封面源，默认回 200 + 一小段 JPEG 字节。
+func newFakeCoverCDN(t *testing.T) (*fakeCoverCDN, string) {
+	t.Helper()
+	cdn := &fakeCoverCDN{status: http.StatusOK, body: coverBytes}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		cdn.mu.Lock()
+		cdn.hits++
+		status, body := cdn.status, cdn.body
+		cdn.mu.Unlock()
+		if status == http.StatusOK {
+			w.Header().Set("Content-Type", "image/jpeg")
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return cdn, srv.URL + "/cover.jpg"
+}
+
+// coverBytes 是假封面源的字节（JPEG 魔数 + 可断言的尾巴；测试不解析图像）。
+var coverBytes = []byte("\xff\xd8\xff\xe0 dav poster bytes")
+
+// coverFixture 描述「剧 A 的封面源」：cdn 记请求次数，url 写进 drama.cover_url。
+type coverFixture struct {
+	cdn *fakeCoverCDN
+	url string
+}
+
 // newFixture 起一个用真 handler 的 httptest.Server（不 mock 自己的 handler）。
+// 默认没有封面：poster.jpg 不出现在树里。
 func newFixture(t *testing.T) fixture {
+	t.Helper()
+	return newFixtureWith(t, nil)
+}
+
+// newFixtureWithCover 建一个「剧 A 的封面已经本地化成功」的 fixture：按生产路径把封面
+// 落进临时 cache_dir 并写 artifact 行，再把同一个 *cache.CoverCache 接到 vfs 树上。
+func newFixtureWithCover(t *testing.T) fixture {
+	t.Helper()
+	cdn, url := newFakeCoverCDN(t)
+	return newFixtureWith(t, &coverFixture{cdn: cdn, url: url})
+}
+
+// newFixtureWith 起一个用真 handler 的 httptest.Server（不 mock 自己的 handler）。
+// cover 非 nil 时把剧 A 的 cover_url 指向它，并在装配树之前做一次封面本地化
+// （等价于「同步已经跑过一轮」）。
+func newFixtureWith(t *testing.T, cover *coverFixture) fixture {
 	t.Helper()
 	ctx := context.Background()
 	const (
@@ -88,15 +169,21 @@ func newFixture(t *testing.T) fixture {
 		store.KeyStreamSecret: secret,
 		// 夹具是「每集一条对外剧集」：本文件验的是 WebDAV 协议，不是分块。
 		store.KeyMergeChunkSize: "1",
+		// 海报缓存落临时目录：poster.jpg 的命中 / 按需回源都在这里发生（MKACG-650）。
+		store.KeyCacheDir: filepath.Join(t.TempDir(), "cache"),
 	} {
 		if err := settings.Set(ctx, key, value); err != nil {
 			t.Fatalf("Set %s: %v", key, err)
 		}
 	}
 
+	coverURL := ""
+	if cover != nil {
+		coverURL = cover.url
+	}
 	dramaID, err := st.UpsertDrama(ctx, store.Drama{
 		Provider: "web", ProviderID: "a1", Title: title, Year: 2024, Plot: "简介",
-		Genre: "爱情",
+		Genre: "爱情", CoverURL: coverURL,
 	})
 	if err != nil {
 		t.Fatalf("UpsertDrama: %v", err)
@@ -118,17 +205,36 @@ func newFixture(t *testing.T) fixture {
 		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 
+	// 海报缓存与 cmd 的装配方式一致：同步（真实部署里由 scheduler 触发）与 poster.jpg
+	// 的按需回源共用一份实例。
+	covers := cache.NewCoverCache(st, settings, &http.Client{Timeout: requestTimeout}, newDiscardLogger())
+	coverPath := ""
+	if cover != nil {
+		if err := covers.LocalizeCover(ctx, "web", "a1", cover.url); err != nil {
+			t.Fatalf("LocalizeCover: %v", err)
+		}
+		row, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, "web/a1")
+		if err != nil {
+			t.Fatalf("封面本地化后 ArtifactByKey: %v", err)
+		}
+		coverPath = row.Path
+	}
+
 	// 与 cmd 的装配方式一致：handler 挂在 MountPath 上，路径前缀由它自己剥。
 	mux := http.NewServeMux()
-	mux.Handle(MountPath, NewHandler(vfs.NewTree(st, settings, stubID, newDiscardLogger()), settings, newDiscardLogger()))
+	mux.Handle(MountPath, NewHandler(vfs.NewTree(st, settings, stubID, covers, newDiscardLogger()), settings, newDiscardLogger()))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	return fixture{
+	f := fixture{
 		srv: srv, client: &http.Client{Timeout: requestTimeout}, user: user, pass: pass,
 		prefix: prefix, titleA: title, genre: "爱情", shard: shardOf("a1"),
-		epIDs: epIDs, settings: settings,
+		epIDs: epIDs, settings: settings, covers: covers, coverPath: coverPath, st: st,
 	}
+	if cover != nil {
+		f.cdn = cover.cdn
+	}
+	return f
 }
 
 // newDiscardLogger 是丢弃输出的 logger：测试不关心日志内容。
@@ -859,7 +965,7 @@ func newBulkFixture(t *testing.T, n int) bulkFixture {
 		t.Fatalf("灌入 %d 部剧: %v", n, err)
 	}
 
-	tree := newCountingTree(vfs.NewTree(st, settings, stubID, newDiscardLogger()))
+	tree := newCountingTree(vfs.NewTree(st, settings, stubID, nil, newDiscardLogger()))
 	mux := http.NewServeMux()
 	mux.Handle(MountPath, NewHandler(tree, settings, newDiscardLogger()))
 	srv := httptest.NewServer(mux)
@@ -926,5 +1032,234 @@ func TestPropfindDepth1_QueryCountIndependentOfSize(t *testing.T) {
 				t.Errorf("%s 查了 %d 个目录（%v），期望 ≤ 2 个", s.name, len(fl.tree.dirs), fl.tree.dirs)
 			}
 		})
+	}
+}
+
+// MKACG-650 AC：有封面的剧，剧目录里能列到 poster.jpg，PROPFIND 的 getcontentlength
+// 与 GET 的实际字节数一致；内容就是本地封面，列举与读取都不回源。
+func TestPropfindDramaDirIncludesPoster(t *testing.T) {
+	f := newFixtureWithCover(t)
+	posterHref := "/webdav" + f.dramaPath() + "/poster.jpg"
+
+	code, ms := f.propfind(t, f.dramaPath())
+	if code != http.StatusMultiStatus {
+		t.Fatalf("PROPFIND Depth:1 %s 状态码 = %d, 期望 207", f.dramaPath(), code)
+	}
+	entry, ok := entries(t, ms)[posterHref]
+	if !ok {
+		t.Fatalf("有封面的剧目录里没有 poster.jpg：%v", entries(t, ms))
+	}
+	if entry.isDir || !entry.hasCL {
+		t.Fatalf("poster.jpg 的列举项 = %+v, 期望「文件 + 带 getcontentlength」", entry)
+	}
+
+	body := f.getBody(t, f.dramaPath()+"/poster.jpg", true)
+	if !bytes.Equal(body, coverBytes) {
+		t.Fatalf("poster.jpg 字节 = %q, 期望本地封面 %q", body, coverBytes)
+	}
+	if entry.size != int64(len(body)) {
+		t.Fatalf("getcontentlength = %d, GET 字节数 = %d", entry.size, len(body))
+	}
+	if got := f.cdn.count(); got != 1 {
+		t.Fatalf("列举 + 读取封面回源 %d 次, 期望 1（只有建 fixture 时那次本地化）", got)
+	}
+
+	// 同一个剧目录的 tvshow.nfo：thumb 指同目录的 poster.jpg（相对路径）。
+	nfo := f.getBody(t, f.dramaPath()+"/tvshow.nfo", true)
+	if want := []byte(`<thumb aspect="poster">poster.jpg</thumb>`); !bytes.Contains(nfo, want) {
+		t.Fatalf("tvshow.nfo 缺 %s：\n%s", want, nfo)
+	}
+}
+
+// MKACG-650 AC（按需重新下载）：封面文件被淘汰（手删）后请求 poster.jpg → 200 +
+// 有效内容，且恰好回源一次；下一次请求不再回源（索引行已指回真实文件）。
+func TestPosterRefetchesAfterCoverFileRemoved(t *testing.T) {
+	f := newFixtureWithCover(t)
+	if err := os.Remove(f.coverPath); err != nil {
+		t.Fatalf("删本地封面 %s: %v", f.coverPath, err)
+	}
+	before := f.cdn.count()
+
+	body := f.getBody(t, f.dramaPath()+"/poster.jpg", true)
+	if !bytes.Equal(body, coverBytes) {
+		t.Fatalf("按需回源后 poster.jpg 字节 = %q, 期望 %q", body, coverBytes)
+	}
+	after := f.cdn.count()
+	if after != before+1 {
+		t.Fatalf("回源次数 %d → %d, 期望 +1", before, after)
+	}
+
+	if body := f.getBody(t, f.dramaPath()+"/poster.jpg", true); !bytes.Equal(body, coverBytes) {
+		t.Fatalf("第二次读取的字节 = %q, 期望 %q", body, coverBytes)
+	}
+	if got := f.cdn.count(); got != after {
+		t.Fatalf("第二次请求仍回源：%d → %d", after, got)
+	}
+}
+
+// MKACG-650 AC-6（系统淘汰子项，真 DAV 请求）：走生产淘汰路径（cache_lru_days 过期）
+// 把封面淘汰之后，poster.jpg 必须**仍然出现在目录里**、GET 200 且恰好回源一次。
+//
+// 这条对应用户报告的现场：旧实现在淘汰时连 artifact 行一起删，HasCover 转假，
+// poster.jpg 直接从剧目录消失、GET 404，要等该剧被下一轮同步重新本地化才回来。
+func TestPosterSurvivesSystemEviction(t *testing.T) {
+	f := newFixtureWithCover(t)
+	ctx := context.Background()
+
+	// 走真的淘汰：把封面行的 last_used_at 改到 40 天前，再跑一轮 Cache.Evict
+	// （与装配根起的 5 分钟循环是同一份实现）。cache_lru_days 默认 30。
+	if err := f.st.TouchArtifact(ctx, store.ArtifactKindCover, "web/a1", "2020-01-01T00:00:00Z"); err != nil {
+		t.Fatalf("把封面行改老: %v", err)
+	}
+	evictor := cache.New(f.st, f.settings, newDiscardLogger())
+	if err := evictor.Evict(ctx); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+	if _, err := os.Stat(f.coverPath); !os.IsNotExist(err) {
+		t.Fatalf("淘汰后封面文件仍在: %v", err)
+	}
+
+	posterHref := "/webdav" + f.dramaPath() + "/poster.jpg"
+	code, ms := f.propfind(t, f.dramaPath())
+	if code != http.StatusMultiStatus {
+		t.Fatalf("淘汰后剧目录 PROPFIND = %d, 期望 207", code)
+	}
+	entry, ok := entries(t, ms)[posterHref]
+	if !ok {
+		t.Fatalf("淘汰后 poster.jpg 从剧目录消失（MKACG-650 的失败项）：%v", entries(t, ms))
+	}
+	if entry.isDir || !entry.hasCL {
+		t.Fatalf("poster.jpg 列举项 = %+v, 期望「文件 + 带 getcontentlength」", entry)
+	}
+
+	// PROPFIND 要给 getcontentlength 就必须渲染一次（硬约束 3），所以那次渲染已经是
+	// 「第一次按需回源」——它把字节写回了本地。这里断言的是「整条列举+GET 只回源一次」：
+	// 淘汰后的第一次渲染回源、之后完全命中本地。
+	before := f.cdn.count()
+	body := f.getBody(t, f.dramaPath()+"/poster.jpg", true)
+	if !bytes.Equal(body, coverBytes) {
+		t.Fatalf("淘汰后 poster.jpg 字节 = %q, 期望 %q", body, coverBytes)
+	}
+	if got := f.cdn.count(); got != before {
+		t.Fatalf("PROPFIND 已回源并写回本地，GET 却再回源：%d → %d", before, got)
+	}
+	if entry.size != int64(len(body)) {
+		t.Fatalf("getcontentlength = %d, GET 字节数 = %d", entry.size, len(body))
+	}
+
+	// 回源成功后写回了真实行：再请求一次完全命中本地。
+	recount := f.cdn.count()
+	if body := f.getBody(t, f.dramaPath()+"/poster.jpg", true); !bytes.Equal(body, coverBytes) {
+		t.Fatalf("第二次读取的字节 = %q, 期望 %q", body, coverBytes)
+	}
+	if got := f.cdn.count(); got != recount {
+		t.Fatalf("回源成功后仍再回源：%d → %d", recount, got)
+	}
+}
+
+// MKACG-650 AC（single-flight）：并发 3 个请求同一个已淘汰的封面 → 回源计数 = 1。
+func TestPosterConcurrentRequestsFetchOnce(t *testing.T) {
+	f := newFixtureWithCover(t)
+	if err := os.Remove(f.coverPath); err != nil {
+		t.Fatalf("删本地封面 %s: %v", f.coverPath, err)
+	}
+	before := f.cdn.count()
+	target := f.srv.URL + strings.TrimSuffix(MountPath, "/") + f.dramaPath() + "/poster.jpg"
+
+	const n = 3
+	start := make(chan struct{})
+	bodies := make([][]byte, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, target, nil)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			req.SetBasicAuth(f.user, f.pass)
+			resp, err := f.client.Do(req)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				errs[i] = fmt.Errorf("状态码 %d", resp.StatusCode)
+				return
+			}
+			bodies[i], errs[i] = io.ReadAll(resp.Body)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("第 %d 个请求: %v", i, errs[i])
+		}
+		if !bytes.Equal(bodies[i], coverBytes) {
+			t.Fatalf("第 %d 个请求的字节 = %q, 期望 %q", i, bodies[i], coverBytes)
+		}
+	}
+	if got := f.cdn.count(); got != before+1 {
+		t.Fatalf("并发 %d 个请求回源 %d 次, 期望 1（single-flight）", n, got-before)
+	}
+}
+
+// MKACG-650 AC（无封面）：没有 poster.jpg、nfo 没有 thumb，目录列举与 GET 都不报错。
+func TestPosterAbsentForDramaWithoutCover(t *testing.T) {
+	f := newFixture(t) // 默认没有封面
+	posterHref := "/webdav" + f.dramaPath() + "/poster.jpg"
+
+	resp := f.request(t, http.MethodGet, f.dramaPath()+"/poster.jpg", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("GET 无封面剧的 poster.jpg 状态码 = %d, 期望 404", resp.StatusCode)
+	}
+
+	code, ms := f.propfind(t, f.dramaPath())
+	if code != http.StatusMultiStatus {
+		t.Fatalf("无封面剧的 PROPFIND 状态码 = %d, 期望 207（不因为封面缺失报错）", code)
+	}
+	if _, ok := entries(t, ms)[posterHref]; ok {
+		t.Fatalf("没有封面的剧却列出了 poster.jpg：%v", entries(t, ms))
+	}
+	nfo := f.getBody(t, f.dramaPath()+"/tvshow.nfo", true)
+	if bytes.Contains(nfo, []byte("<thumb")) {
+		t.Fatalf("没有封面的剧 nfo 里出现了 thumb：\n%s", nfo)
+	}
+}
+
+// MKACG-650 AC（回源失败）：封面取不回来 → poster.jpg 404（不是 0 字节、不是半截），
+// 该剧目录的列举仍然成功——失败的封面只是被跳过。
+func TestPosterFetchFailureIsNotFound(t *testing.T) {
+	f := newFixtureWithCover(t)
+	if err := os.Remove(f.coverPath); err != nil {
+		t.Fatalf("删本地封面 %s: %v", f.coverPath, err)
+	}
+	f.cdn.set(http.StatusNotFound, []byte("nope"))
+
+	resp := f.request(t, http.MethodGet, f.dramaPath()+"/poster.jpg", nil, nil)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("回源失败时 GET poster.jpg 状态码 = %d, 期望 404", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("读 404 body: %v", err)
+	}
+	if bytes.Contains(body, coverBytes) || bytes.Contains(body, []byte("\xff\xd8")) {
+		t.Fatalf("回源失败却回了图片字节：%q", body)
+	}
+
+	code, ms := f.propfind(t, f.dramaPath())
+	if code != http.StatusMultiStatus {
+		t.Fatalf("回源失败时 PROPFIND 状态码 = %d, 期望 207（跳过取不回来的封面）", code)
+	}
+	if _, ok := entries(t, ms)["/webdav"+f.dramaPath()+"/poster.jpg"]; ok {
+		t.Fatal("回源失败的 poster.jpg 仍出现在列举里")
 	}
 }

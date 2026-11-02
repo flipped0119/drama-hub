@@ -47,10 +47,46 @@ func dramaDirPath(genre, providerID, dir string) string {
 	return Root + "/" + g + "/" + shardOf(providerID) + "/" + dir
 }
 
+// stubCoverer 是 Coverer 的替身：`has` 里有这个键就算「有封面」，字节就是值；
+// `fails` 里的键模拟「回源失败」。
+//
+// 封面能力在 vfs 里只有两个用途（列出 poster.jpg、渲染它 / nfo 的 thumb），所以替身
+// 只需要「有没有」与「给我字节」两个回答，不必碰缓存、HTTP 与数据库。
+type stubCoverer struct {
+	has   map[string][]byte
+	fails map[string]bool
+}
+
+// coverKey 是 stubCoverer 的键：与生产实现的 artifact 键同形（provider/provider_id）。
+func coverKey(provider, providerID string) string { return provider + "/" + providerID }
+
+// HasCover 报告替身里有没有这部剧的封面。
+func (s *stubCoverer) HasCover(_ context.Context, provider, providerID string) (bool, error) {
+	_, ok := s.has[coverKey(provider, providerID)]
+	return ok, nil
+}
+
+// Poster 返回替身里的封面字节；标了 fails 的键按「回源失败」报不可用。
+func (s *stubCoverer) Poster(_ context.Context, provider, providerID, url string) ([]byte, bool, error) {
+	k := coverKey(provider, providerID)
+	if s.fails[k] || url == "" {
+		return nil, false, nil
+	}
+	body, ok := s.has[k]
+	if !ok {
+		return nil, false, nil
+	}
+	return body, true, nil
+}
+
+// coverStub 是 fixture 里剧 A 的封面字节（JPEG 魔数 + 可断言的尾巴，内容不参与解析）。
+var coverStub = []byte("\xff\xd8\xff\xe0 stub poster bytes")
+
 // fixture 是一套两剧三集的数据：剧 A（有分类）有「有标签」与「无标签」两集，
-// 剧 B（无分类）无集。
+// 剧 B（无分类）无集。默认两部剧都没有封面（poster.jpg 不出现）。
 type fixture struct {
 	tree   *Tree
+	covers *stubCoverer
 	db     *store.DB
 	epA1   store.Episode
 	epA2   store.Episode
@@ -94,6 +130,8 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 	aID, err := st.UpsertDrama(ctx, store.Drama{
 		Provider: "web", ProviderID: "a1", Title: titleA, Year: 2024,
 		Plot: "第一行 & <第二行>", EpisodeTotal: 2, Genre: genreA,
+		// 剧 A 声明了封面地址：poster.jpg 的按需回源要用它（替身只看 url 是否为空）。
+		CoverURL: "https://cdn.example/a1.jpg",
 	})
 	if err != nil {
 		t.Fatalf("UpsertDrama A: %v", err)
@@ -131,8 +169,10 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 		}
 	}
 
+	covers := &stubCoverer{has: map[string][]byte{}, fails: map[string]bool{}}
 	return fixture{
-		tree:   NewTree(st, settings, stubID, slog.New(slog.DiscardHandler)),
+		tree:   NewTree(st, settings, stubID, covers, slog.New(slog.DiscardHandler)),
+		covers: covers,
 		db:     db,
 		epA1:   ep1,
 		epA2:   ep2,
@@ -262,7 +302,7 @@ func TestListShard_OnlyDramaDirs(t *testing.T) {
 	}
 }
 
-// AC：剧目录只有 tvshow.nfo 与 Season 01；季目录只有该剧的文件对。
+// AC：剧目录是 tvshow.nfo + Season 01（无封面时没有 poster.jpg）；季目录只有该剧的文件对。
 func TestListDramaAndSeason(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
@@ -302,6 +342,41 @@ func TestListDramaAndSeason(t *testing.T) {
 		if nodes[i] != want[i] {
 			t.Errorf("节点[%d] = %+v, 期望 %+v", i, nodes[i], want[i])
 		}
+	}
+}
+
+// MKACG-650 AC：有封面的剧，剧目录里有 poster.jpg；没有封面的剧目录一个节点都不多。
+func TestListDramaDirPosterOnlyWithCover(t *testing.T) {
+	f := seed(t, "")
+	ctx := context.Background()
+
+	// 剧 A 有一份本地封面（同步已本地化过）：目录里出现 poster.jpg。
+	f.covers.has[coverKey("web", "a1")] = coverStub
+	nodes, err := f.tree.List(ctx, f.dirA)
+	if err != nil {
+		t.Fatalf("List(剧 A 目录): %v", err)
+	}
+	want := []Node{
+		{Path: f.dirA + "/tvshow.nfo"},
+		{Path: f.dirA + "/poster.jpg"},
+		{Path: f.dirA + "/" + seasonDir, IsDir: true},
+	}
+	if len(nodes) != len(want) {
+		t.Fatalf("有封面的剧目录子项 = %v, 期望 %v", nodes, want)
+	}
+	for i := range want {
+		if nodes[i] != want[i] {
+			t.Errorf("节点[%d] = %+v, 期望 %+v", i, nodes[i], want[i])
+		}
+	}
+
+	// 剧 B 没有封面（源未声明 / 同步时下载失败）：没有 poster.jpg，其余不变。
+	nodes, err = f.tree.List(ctx, f.dirB)
+	if err != nil {
+		t.Fatalf("List(剧 B 目录): %v", err)
+	}
+	if len(nodes) != 2 || nodes[0].Path != f.dirB+"/tvshow.nfo" || nodes[1].Path != f.dirB+"/"+seasonDir {
+		t.Fatalf("无封面的剧目录子项 = %v, 期望只有 tvshow.nfo 与 Season 01", nodes)
 	}
 }
 
@@ -439,7 +514,7 @@ func TestListGenresEscapesPathSeparatorGenre(t *testing.T) {
 	}
 
 	buf := &bytes.Buffer{}
-	tree := NewTree(store.NewStore(f.db.DB), store.NewSettings(f.db.DB), stubID,
+	tree := NewTree(store.NewStore(f.db.DB), store.NewSettings(f.db.DB), stubID, f.covers,
 		slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	// 1) 根目录能列出转义后的分类，且每个子项仍是一个路径段。
@@ -967,7 +1042,7 @@ func TestListDoesNotScanAllGenres(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
 	cs := newCountingStore(f.store())
-	tree := NewTree(cs, store.NewSettings(f.db.DB), stubID, slog.New(slog.DiscardHandler))
+	tree := NewTree(cs, store.NewSettings(f.db.DB), stubID, f.covers, slog.New(slog.DiscardHandler))
 
 	tests := []struct {
 		name          string

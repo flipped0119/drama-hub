@@ -15,6 +15,7 @@ v4 变更（2026-10-30，S8 / MKACG-612）：**分类名按 `sanitizeName` 转�
 │   └── <分片 00–7f>/        ← 纯函数分片，见「D2」
 │       └── <剧名> (<年份>)/
 │           ├── tvshow.nfo
+│           ├── poster.jpg          ← 仅当这部剧有可用封面
 │           └── Season 01/
 │               ├── <剧名> - S01E01 - <第1集标签>.strm
 │               └── <剧名> - S01E01 - <第1集标签>.nfo
@@ -39,6 +40,12 @@ v4 变更（2026-10-30，S8 / MKACG-612）：**分类名按 `sanitizeName` 转�
 - DAV 挂载点根 = vfs 的 `短剧`（`internal/vfs/tree.go:root`；`internal/webdav/fs.go:resolve`
   已有映射）。vfs 路径是 `短剧/<类型>/…`，DAV 路径是 `/<类型>/…`。
 - 季目录仍只有 `Season 01`（`emby_item.season` 恒为 1，不改）。
+- 剧目录里可以有 `poster.jpg`（Emby / Jellyfin 认的剧集封面名，MKACG-650）：**虚拟文件**，
+  字节取自该剧的本地封面缓存（`artifact(kind='cover')`），磁盘上不多出实体文件。
+  判据是「这部剧的封面曾经本地化成功」（有 artifact 行）：源未声明封面或同步时下载失败的剧
+  没有这个节点，`tvshow.nfo` 也没有 `<thumb>`。文件被手删、或被 `cache_lru_days` 淘汰
+  （淘汰只清空行的 `path`/`bytes`/`sha256`，**不删行**）之后节点仍在，请求时按需回源一次
+  （取不回来即 404，不产出 0 字节文件）。细节见 `docs/DEV-STANDARDS.md`「poster.jpg」。
 - 文件名、`tvshow.nfo`、集 `.nfo` 的内容**一个字都不改**：`embyBase` / `embyLabel` /
   `renderItemNFO` / `renderShowNFO` 全部照旧。本契约只改「剧目录挂在哪一级」
   与「`.strm` 里写什么」（后者见 `docs/PLAYBACK-CONTRACT.md`）。

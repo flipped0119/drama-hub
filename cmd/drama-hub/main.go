@@ -62,8 +62,11 @@ func main() {
 	}
 
 	st := store.NewStore(db.DB)
+	// 海报缓存只有一份实例：同步的「刷新时本地化」与 poster.jpg 的「请求时按需回源」
+	// 共用它，同一个封面在这两个调用点撞在一起时也只回源一次（cache.flightGroup）。
+	covers := cache.NewCoverCache(st, settings, &http.Client{}, logger)
 	sourcePlugins := pluginList(plugins)
-	syncers := newSyncers(sourcePlugins, st, settings, logger)
+	syncers := newSyncers(sourcePlugins, covers, logger)
 	syncer := syncers[hongguo.Name]
 	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger)
 
@@ -86,7 +89,7 @@ func main() {
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr: addr,
-		Handler: newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, resolver,
+		Handler: newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, covers, resolver,
 			playbackHeaders(boots), adminToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -171,12 +174,12 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份，两个通道各一份
 // （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
 // 本函数不认识具体源。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, resolver *stream.Resolver, playbackHeaders segment.Headers, adminToken string) http.Handler {
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, playbackHeaders segment.Headers, adminToken string) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, playbackHeaders)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signID, logger), settings, logger))
+	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signID, covers, logger), settings, logger))
 	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
@@ -199,15 +202,15 @@ func pluginList(reg *plugin.Registry) []plugin.Plugin {
 
 // newSyncers 给每个源造一个写库编排（一个源的剧只写进它自己的 provider）。
 //
-// 海报本地化对每个源共用同一个 cache.CoverCache：落盘布局按 (provider, provider_id)
-// 分文件，不同源不会互相覆盖。
+// 海报本地化对所有源、以及对 WebDAV 的 poster.jpg 共用同一个 cache.CoverCache：
+// 落盘布局按 (provider, provider_id) 分文件，不同源不会互相覆盖；同一个封面的
+// 并发调用也只回源一次。
 //
 // 封面出站的超时不在这里定型：cache 每次下载现读 settings 的 cover_timeout_sec
 // （MKACG-620）。它不跟插件超时走 —— 封面 URL 是上游页面里的三方 CDN 绝对地址
 // （`p3-novel.byteimg.com`），插件 base_url 与 request_timeout_sec 管不到这条出站；
 // client 因此不带 Timeout，超时由每次请求的 ctx 决定（DEV-STANDARDS「错误处理」）。
-func newSyncers(sources []plugin.Plugin, st *store.Store, settings *store.Settings, logger *slog.Logger) map[string]scheduler.Syncer {
-	covers := cache.NewCoverCache(st, settings, &http.Client{})
+func newSyncers(sources []plugin.Plugin, covers *cache.CoverCache, logger *slog.Logger) map[string]scheduler.Syncer {
 	out := make(map[string]scheduler.Syncer, len(sources))
 	for _, p := range sources {
 		out[p.Name()] = sync.New(p, covers, logger)

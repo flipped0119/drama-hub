@@ -400,7 +400,7 @@ func TestSingleFlightPublishesBeforeRemoving(t *testing.T) {
 			t.Errorf("钩子 id = %q, 期望 %q", gotID, id)
 			return
 		}
-		f, ok := tc.c.flights[id]
+		f, ok := tc.c.flights.flights[id]
 		if !ok {
 			t.Error("发布时 flight 已不在 map 里：摘除早于发布")
 			return
@@ -432,7 +432,7 @@ func TestSingleFlightPublishesBeforeRemoving(t *testing.T) {
 	if n := gens.Load(); n != 1 {
 		t.Fatalf("生成次数 = %d, 期望 1", n)
 	}
-	if n := len(tc.c.flights); n != 0 {
+	if n := len(tc.c.flights.flights); n != 0 {
 		t.Fatalf("结束后 flights 里还剩 %d 条，期望空", n)
 	}
 }
@@ -495,7 +495,7 @@ func TestSingleFlightLeaderRechecksHit(t *testing.T) {
 	if n := gens.Load(); n != 1 {
 		t.Fatalf("生成次数 = %d, 期望 1（当上 leader 后复查 hit 应命中）", n)
 	}
-	if n := len(tc.c.flights); n != 0 {
+	if n := len(tc.c.flights.flights); n != 0 {
 		t.Fatalf("结束后 flights 里还剩 %d 条，期望空", n)
 	}
 	if files := contentFiles(t, tc.root); len(files) != 1 {

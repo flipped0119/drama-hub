@@ -20,7 +20,21 @@ type Tree struct {
 	st       Store
 	settings *store.Settings
 	id       IDFunc
+	covers   Coverer
 	logger   *slog.Logger
+}
+
+// Coverer 是树需要的封面能力（生产实现：*cache.CoverCache）。
+//
+// 接口定义在消费方（docs/DEV-STANDARDS.md「代码组织」）：vfs 只关心两件事——「这部剧
+// 有没有封面」与「把封面字节给我」。回源、落盘、single-flight、超时全在实现方，
+// vfs 不认识 HTTP 也不认识 artifact 表。
+type Coverer interface {
+	// HasCover 报告这部剧有没有可用封面。不触网、不读文件。
+	HasCover(ctx context.Context, provider, providerID string) (bool, error)
+	// Poster 返回封面字节；本地没有时回源一次。available=false 表示当前没有可用
+	// 封面（源未声明或回源失败），树按「文件不存在」处理。
+	Poster(ctx context.Context, provider, providerID, url string) (body []byte, available bool, err error)
 }
 
 // Store 是本包消费的只读能力（接口定义在消费方，见 docs/DEV-STANDARDS.md「代码组织」；
@@ -44,8 +58,9 @@ type Store interface {
 type IDFunc func(secret, uid string) string
 
 // NewTree 构造 Tree。id 与 logger 不可为 nil（渲染 strm 与报告「分类名转义后同名」必需）。
-func NewTree(st Store, settings *store.Settings, id IDFunc, logger *slog.Logger) *Tree {
-	return &Tree{st: st, settings: settings, id: id, logger: logger}
+// covers 为 nil 等价于「这个库没有封面」：poster.jpg 永远不出现（单测可以用它省掉缓存）。
+func NewTree(st Store, settings *store.Settings, id IDFunc, covers Coverer, logger *slog.Logger) *Tree {
+	return &Tree{st: st, settings: settings, id: id, covers: covers, logger: logger}
 }
 
 // Node 是 List 输出的一个条目：相对 vfs 根（无前导 /）的路径与其类型。
@@ -60,6 +75,11 @@ const (
 	Root = "短剧"
 	// seasonDir 是季目录名。2.0 只有单季，emby_item.season 恒为 1。
 	seasonDir = "Season 01"
+	// posterName 是剧目录下的封面文件名（Emby / Jellyfin 认的剧集封面名）。
+	//
+	// 它和 tvshow.nfo 一样是**按请求渲染的虚拟文件**，字节取自该剧的本地封面缓存
+	// （artifact(kind='cover')），磁盘上不会多出任何实体文件（硬约束 1）。
+	posterName = "poster.jpg"
 	// otherGenre 是分类缺失（drama.genre 为空）时的兜底目录名
 	// （docs/DIRECTORY-CONTRACT.md「分类缺失的兜底名」）。上游真有同名分类时
 	// 两者并进同一个目录：目录名不做区分。
@@ -75,7 +95,7 @@ const (
 //	根        1 次 DISTINCT genre
 //	分类       1 次 DISTINCT genre + 1 次 DISTINCT shard（兜底名「其他」最多两个 genre 值）
 //	分片       1 次 DISTINCT genre + 1 次 WHERE genre IN (…) AND shard = $n
-//	剧        1 次剧目点查（tvshow.nfo 与 Season 01 两个子项）
+//	剧        1 次剧目点查 + 1 次封面行点查（tvshow.nfo、有封面时的 poster.jpg、Season 01）
 //	Season    1 次剧目点查 + 1 次 ListEmbyItems
 //
 // 与全库规模无关：不枚举整棵树、不做全表扫。
@@ -192,16 +212,27 @@ func (t *Tree) listDramaDirs(ctx context.Context, genreDir, shardDir string) ([]
 	return out, nil
 }
 
-// listDrama 列剧目录：tvshow.nfo 与 Season 01。
+// listDrama 列剧目录：tvshow.nfo、有封面时的 poster.jpg、Season 01。
+//
+// poster.jpg 只在「这部剧有可用封面」时出现（MKACG-650）：封面是可选资产，没有它的
+// 剧目录与之前完全一致。判据是「封面本地化成功过」（artifact 行在），不看文件是否还在
+// ——文件被淘汰/手删后节点仍要留着，下一次 GET 才会按需回源。
 func (t *Tree) listDrama(ctx context.Context, genreDir, shardDir, dramaDir string) ([]Node, error) {
-	if _, err := t.locateDrama(ctx, genreDir, shardDir, dramaDir); err != nil {
+	d, err := t.locateDrama(ctx, genreDir, shardDir, dramaDir)
+	if err != nil {
 		return nil, err
 	}
 	dir := Root + "/" + genreDir + "/" + shardDir + "/" + dramaDir
-	return []Node{
-		{Path: dir + "/tvshow.nfo"},
-		{Path: dir + "/" + seasonDir, IsDir: true},
-	}, nil
+	out := make([]Node, 0, 3)
+	out = append(out, Node{Path: dir + "/tvshow.nfo"})
+	cover, err := t.hasCover(ctx, d)
+	if err != nil {
+		return nil, err
+	}
+	if cover {
+		out = append(out, Node{Path: dir + "/" + posterName})
+	}
+	return append(out, Node{Path: dir + "/" + seasonDir, IsDir: true}), nil
 }
 
 // listSeason 列季目录：每集一对 .strm / .nfo（合并集也只产出一对，硬约束 6）。
@@ -501,9 +532,9 @@ func sanitizeName(s string) string {
 // Render 渲染 path 处的文件字节：解析路径 → 查库 → 一次返回完整字节。
 //
 // 路径以 / 分隔、相对 vfs 根、无前导 /（WebDAV 的绝对路径由 internal/webdav 映射）。
-// 合法形状只有剧级 tvshow.nfo 与季级 .strm/.nfo 两种；目录、未知路径、段数不符、
-// 不存在的剧/集一律 ErrNotFound。返回字节的长度就是 len(body)（硬约束 3），
-// 本包没有任何独立的长度字段或方法。
+// 合法形状只有剧级 tvshow.nfo / poster.jpg 与季级 .strm/.nfo 两种（后者为文件）；目录、
+// 未知路径、段数不符、不存在的剧/集一律 ErrNotFound。返回字节的长度就是 len(body)
+// （硬约束 3），本包没有任何独立的长度字段或方法。
 func (t *Tree) Render(ctx context.Context, p string) ([]byte, error) {
 	req, ok := parsePath(p)
 	if !ok {
@@ -513,8 +544,15 @@ func (t *Tree) Render(ctx context.Context, p string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if req.isPoster {
+		return t.renderPoster(ctx, d)
+	}
 	if req.isShow {
-		return renderShowNFO(d)
+		cover, err := t.hasCover(ctx, d)
+		if err != nil {
+			return nil, err
+		}
+		return renderShowNFO(d, cover)
 	}
 	items, err := t.st.ListEmbyItems(ctx, d.ID)
 	if err != nil {
@@ -532,20 +570,53 @@ func (t *Tree) Render(ctx context.Context, p string) ([]byte, error) {
 	return nil, ErrNotFound
 }
 
+// renderPoster 渲染剧目录下的 poster.jpg：字节直接来自该剧的本地封面缓存。
+//
+// 本地没有（文件被手删或淘汰）时由 Coverer 按需回源一次（同一封面并发只回源一次）；
+// 取不回来就让它「不存在」——不是 0 字节文件，也不是半截文件（MKACG-650 的 AC）。
+// 「不存在」在 webdav 层映射成 404，且目录列举会跳过它，整份 multistatus 不受影响。
+func (t *Tree) renderPoster(ctx context.Context, d store.Drama) ([]byte, error) {
+	if t.covers == nil {
+		return nil, ErrNotFound
+	}
+	body, available, err := t.covers.Poster(ctx, d.Provider, d.ProviderID, d.CoverURL)
+	if err != nil {
+		return nil, fmt.Errorf("取封面 provider=%s id=%s: %w", d.Provider, d.ProviderID, err)
+	}
+	if !available {
+		return nil, ErrNotFound
+	}
+	return body, nil
+}
+
+// hasCover 报告这部剧在树里是否带 poster.jpg（判据见 listDrama）。
+func (t *Tree) hasCover(ctx context.Context, d store.Drama) (bool, error) {
+	if t.covers == nil {
+		return false, nil
+	}
+	cover, err := t.covers.HasCover(ctx, d.Provider, d.ProviderID)
+	if err != nil {
+		return false, fmt.Errorf("查封面 provider=%s id=%s: %w", d.Provider, d.ProviderID, err)
+	}
+	return cover, nil
+}
+
 // renderRequest 是 parsePath 的解构结果。
 type renderRequest struct {
 	genreDir string // 一级目录（分类，可能是兜底名「其他」）
 	shardDir string // 分片目录名（两位十六进制）
 	dramaDir string // 剧目录名（可能是带冲突后缀的形态）
-	isShow   bool   // true = 剧级 tvshow.nfo；false = 季级文件
-	itemBase string // 文件名主干（isShow 时为空）
-	ext      string // ".strm" / ".nfo"（isShow 时为空）
+	isShow   bool   // true = 剧级 tvshow.nfo
+	isPoster bool   // true = 剧级 poster.jpg
+	itemBase string // 文件名主干（剧级文件时为空）
+	ext      string // ".strm" / ".nfo"（剧级文件时为空）
 }
 
 // parsePath 解析相对路径；ok=false 表示不是本树里可渲染的文件形状。
 //
 // 合法：短剧/<分类>/<分片>/<剧目录>/tvshow.nfo（5 段）
 //
+//	短剧/<分类>/<分片>/<剧目录>/poster.jpg（5 段）
 //	短剧/<分类>/<分片>/<剧目录>/Season 01/<文件名>.strm|.nfo（6 段）
 func parsePath(p string) (renderRequest, bool) {
 	segs := strings.Split(strings.Trim(p, "/"), "/")
@@ -556,6 +627,9 @@ func parsePath(p string) (renderRequest, bool) {
 	switch {
 	case len(segs) == 5 && segs[4] == "tvshow.nfo":
 		base.isShow = true
+		return base, true
+	case len(segs) == 5 && segs[4] == posterName:
+		base.isPoster = true
 		return base, true
 	case len(segs) == 6 && segs[4] == seasonDir:
 		ext := extension(segs[5])

@@ -64,8 +64,8 @@ func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings,
 		reg = plugin.NewRegistry()
 	}
 	return newHandler(logger, st, settings, syncer, schedule, sources,
-		cache.New(st, settings, logger), stream.NewResolver(st, reg),
-		playbackHeaders(map[string]pluginBoot{}), testAdminToken)
+		cache.New(st, settings, logger), cache.NewCoverCache(st, settings, &http.Client{}, logger),
+		stream.NewResolver(st, reg), playbackHeaders(map[string]pluginBoot{}), testAdminToken)
 }
 
 // testAdminToken 是装配测试用的管理令牌：生产里来自 DRAMA_HUB_ADMIN_TOKEN。
@@ -958,7 +958,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 		playbackHeaders(nil))
 	mux := http.NewServeMux()
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
-	tree := vfs.NewTree(st, settings, stream.ID, logger)
+	tree := vfs.NewTree(st, settings, stream.ID, nil, logger)
 
 	season := "短剧/爱情/" + shardOf("g1") + "/回填剧 (2026)/Season 01"
 	nfoOf := func(epNo int) string {

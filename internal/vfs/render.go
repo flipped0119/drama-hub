@@ -71,10 +71,20 @@ type episodeNFO struct {
 
 // showNFO 是剧 NFO 的 XML 结构，根元素 tvshow（Emby SeriesNfoParser 契约）。
 type showNFO struct {
-	XMLName xml.Name `xml:"tvshow"`
-	Title   string   `xml:"title"`
-	Year    int      `xml:"year"`
-	Plot    string   `xml:"plot"`
+	XMLName xml.Name   `xml:"tvshow"`
+	Title   string     `xml:"title"`
+	Year    int        `xml:"year"`
+	Plot    string     `xml:"plot"`
+	Thumb   *showThumb `xml:"thumb,omitempty"`
+}
+
+// showThumb 是剧 NFO 的封面元素：`<thumb aspect="poster">poster.jpg</thumb>`。
+//
+// 值是**相对路径**（poster.jpg 与 tvshow.nfo 同目录），不写外链：Emby 用同目录文件，
+// 外链会在源图换址 / 失效时把客户端指向错内容，也绕过了本服务的缓存与淘汰（MKACG-650）。
+type showThumb struct {
+	Aspect string `xml:"aspect,attr"`
+	Value  string `xml:",chardata"`
 }
 
 // renderItemNFO 渲染集 NFO：根 episodedetails，字段 title/season/episode/runtime。
@@ -91,13 +101,20 @@ func renderItemNFO(item store.EmbyItem) ([]byte, error) {
 	})
 }
 
-// renderShowNFO 渲染剧 NFO：根 tvshow，字段 title/year/plot。
-func renderShowNFO(d store.Drama) ([]byte, error) {
-	return marshalNFO(showNFO{
+// renderShowNFO 渲染剧 NFO：根 tvshow，字段 title/year/plot（+ 有封面时的 thumb）。
+//
+// cover 由调用方按「这部剧有可用封面」算好（listDrama 同一判据）：没有封面时不写
+// `<thumb>`，也不写空元素——空 thumb 会让 Emby 去找一张不存在的图（MKACG-650）。
+func renderShowNFO(d store.Drama, cover bool) ([]byte, error) {
+	nfo := showNFO{
 		Title: d.Title,
 		Year:  d.Year,
 		Plot:  d.Plot,
-	})
+	}
+	if cover {
+		nfo.Thumb = &showThumb{Aspect: "poster", Value: posterName}
+	}
+	return marshalNFO(nfo)
 }
 
 // marshalNFO 序列化为「固定头 + 两空格缩进体 + 尾换行」的字节。

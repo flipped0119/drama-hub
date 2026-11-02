@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -146,10 +147,25 @@ func TestEvictExpired(t *testing.T) {
 		t.Fatalf("Evict: %v", err)
 	}
 
-	for _, spec := range oldSpecs {
+	// 分片与索引：行与文件都不在。
+	for _, spec := range oldSpecs[:2] {
 		if _, err := tc.st.ArtifactByKey(ctx, spec.Kind, spec.Key); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("%s 过期后行 = %v, 期望 ErrNotFound", spec.Kind, err)
 		}
+	}
+	// 海报：文件删掉，**行留着**（行是「这部剧有封面」的真值，MKACG-650）；
+	// path 清空表示本地没有字节，下一轮过期查询不会又选中它（last_used_at 已推到当下）。
+	coverSpec := oldSpecs[2]
+	coverRow, err := tc.st.ArtifactByKey(ctx, coverSpec.Kind, coverSpec.Key)
+	if err != nil {
+		t.Fatalf("海报过期后行 = %v, 期望保留（MKACG-650）", err)
+	}
+	if coverRow.Path != "" || coverRow.Bytes != 0 || coverRow.SHA256 != "" {
+		t.Fatalf("过期海报行 = %+v, 期望 path/bytes/sha256 都清空", coverRow)
+	}
+	if coverRow.LastUsedAt != stamp(now) {
+		t.Fatalf("过期海报行 last_used_at = %q, 期望 %q（推到当下，避免下一轮再选中）",
+			coverRow.LastUsedAt, stamp(now))
 	}
 	if _, err := os.Stat(freshRow.Path); err != nil {
 		t.Fatalf("未过期的分片文件被删了: %v", err)
@@ -261,5 +277,118 @@ func TestEvictSweepsStaleTmp(t *testing.T) {
 	}
 	if _, err := os.Stat(fresh); err != nil {
 		t.Fatalf("仍在写入的临时文件被误删: %v", err)
+	}
+}
+
+// MKACG-650 AC-6（系统淘汰子项）：cache_lru_days 把海报淘汰之后，那一行必须留着——
+// 文件删掉、path/bytes 清空。行是「这部剧有封面」的唯一真值，连行删掉会让 poster.jpg
+// 从剧目录里消失，请求根本到不了 Render，「按需重新下载」永远不发生。这正是功能检测
+// 抓到的失败项。
+func TestEvictExpiredCoverKeepsRow(t *testing.T) {
+	tc := newTestCache(t)
+	ctx := context.Background()
+	now := tc.clock.now()
+
+	tc.clock.set(now.AddDate(0, 0, -40))
+	spec := Spec{Kind: store.ArtifactKindCover, Key: CoverKey("web", "p1"), Ext: ".jpg"}
+	if _, err := tc.c.GetOrGenerate(ctx, spec, genOf("old cover")); err != nil {
+		t.Fatalf("写封面: %v", err)
+	}
+	row, err := tc.st.ArtifactByKey(ctx, spec.Kind, spec.Key)
+	if err != nil {
+		t.Fatalf("ArtifactByKey: %v", err)
+	}
+
+	tc.clock.set(now)
+	if err := tc.c.Evict(ctx); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	// 文件删掉。
+	if _, err := os.Stat(row.Path); !os.IsNotExist(err) {
+		t.Fatalf("过期封面的文件仍在: %v", err)
+	}
+	// 行留着，且已降级为「本地没有字节」；last_used_at 推到当下，下一轮不会再选中它。
+	released, err := tc.st.ArtifactByKey(ctx, spec.Kind, spec.Key)
+	if err != nil {
+		t.Fatalf("过期封面行 = %v, 期望保留（MKACG-650）", err)
+	}
+	if released.Path != "" || released.Bytes != 0 || released.SHA256 != "" {
+		t.Fatalf("过期封面行 = %+v, 期望 path/bytes/sha256 都清空", released)
+	}
+	if released.LastUsedAt != stamp(now) {
+		t.Fatalf("过期封面行 last_used_at = %q, 期望 %q", released.LastUsedAt, stamp(now))
+	}
+
+	// 再跑一轮：行已经不在过期区间，不该被第二轮再处理一次（旧实现会原地打转）。
+	if err := tc.c.Evict(ctx); err != nil {
+		t.Fatalf("第二轮 Evict: %v", err)
+	}
+	if again, err := tc.st.ArtifactByKey(ctx, spec.Kind, spec.Key); err != nil || again != released {
+		t.Fatalf("第二轮淘汰后行 = (%+v, %v), 期望与第一轮后一致", again, err)
+	}
+}
+
+// MKACG-650 AC-6：走完系统淘汰路径后，下一次 Poster 仍然「有封面」，按需回源一次并写回
+// 真实行，之后完全命中本地。端到端覆盖「淘汰 → HasCover 仍真 → Poster 未命中 → 回源 →
+// 行写回」整条链路（上一条只验淘汰那一半）。
+func TestPosterRefetchesAfterSystemEviction(t *testing.T) {
+	cdn, srv := newFakeCDN(t)
+	tc := newTestCache(t) // 真库 + 临时 cache_dir + 可注入时钟
+	c := NewCoverCache(tc.st, tc.settings, srv.Client(), slog.New(slog.DiscardHandler))
+	c.now = tc.clock.now
+	ctx := context.Background()
+	url := srv.URL + "/cover.jpg"
+	key := CoverKey(testProvider, testProviderID)
+
+	if err := c.LocalizeCover(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("LocalizeCover: %v", err)
+	}
+
+	// 走生产淘汰路径：把行改老 → Cache.Evict（与 5 分钟循环里的动作同一份实现）。
+	tc.clock.set(tc.clock.now().AddDate(0, 0, -40))
+	if err := c.LocalizeCover(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("第二次 LocalizeCover（只为 touch 到 40 天前）: %v", err)
+	}
+	tc.clock.set(tc.clock.now().AddDate(0, 0, 40))
+	if err := tc.c.Evict(ctx); err != nil {
+		t.Fatalf("Evict: %v", err)
+	}
+
+	// 淘汰之后这部剧**仍然**「有封面」：树里还有 poster.jpg，请求才有入口。
+	if has, err := c.HasCover(ctx, testProvider, testProviderID); err != nil || !has {
+		t.Fatalf("系统淘汰后 HasCover = (%v, %v), 期望仍 (true, nil)", has, err)
+	}
+	before := cdn.count()
+
+	body, available, err := c.Poster(ctx, testProvider, testProviderID, url)
+	if err != nil || !available {
+		t.Fatalf("系统淘汰后 Poster available=%v err=%v, 期望按需回源成功", available, err)
+	}
+	if string(body) != string(coverBody) {
+		t.Fatalf("回源字节 = %q, 期望 %q", body, coverBody)
+	}
+	if got := cdn.count(); got != before+1 {
+		t.Fatalf("回源计数 %d → %d, 期望 +1", before, got)
+	}
+
+	after, err := tc.st.ArtifactByKey(ctx, store.ArtifactKindCover, key)
+	if err != nil {
+		t.Fatalf("回源后 ArtifactByKey: %v", err)
+	}
+	if after.Path == "" || after.Bytes != int64(len(coverBody)) {
+		t.Fatalf("回源后行 = %+v, 期望 path 与 bytes 都写回", after)
+	}
+	if onDisk, err := os.ReadFile(after.Path); err != nil || string(onDisk) != string(coverBody) {
+		t.Fatalf("回源后落盘字节 = %q（err=%v）, 期望 %q", onDisk, err, coverBody)
+	}
+
+	// 再请求一次：完全命中本地，不再回源。
+	recount := cdn.count()
+	if _, _, err := c.Poster(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("第二次 Poster: %v", err)
+	}
+	if got := cdn.count(); got != recount {
+		t.Fatalf("回源成功后仍再回源：%d → %d", recount, got)
 	}
 }

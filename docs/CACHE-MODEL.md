@@ -104,15 +104,44 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
 1. `DELETE` 过期：`artifact WHERE last_used_at < now - cache_lru_days`
 2. 若 `SUM(bytes) WHERE kind='segment' > cache_max_mb`：
    按 `last_used_at` 升序删到上限以下（一次删一批，避免长事务）
-3. 每删一条：先删文件、再删行；文件已不存在也算成功（自愈）
+3. 每删一条：先删文件、再处理行；文件已不存在也算成功（自愈）。行的处理**按 kind 分两种**：
+   - **分片与索引**：行与文件一起删。行只是「文件在哪」的登记，没有字节就没有意义。
+   - **海报**：**行留着**，只把 `path` / `bytes` / `sha256` 清空、`last_used_at` 推到当轮时间
+     （`store.ReleaseArtifact`）。这一行同时是「这部剧有封面」的唯一真值——`poster.jpg`
+     挂在树里、请求能到 `Render`，全靠它。连行一起删会让剧目录少掉 `poster.jpg`、`GET` 404，
+     要等该剧被下一轮同步重新本地化才回来，「淘汰后按需重新下载」永远不发生
+     （MKACG-650 功能检测抓到的失败项）。清空 path 表达「本地没有字节」，下一次请求按未命中
+     回源并写回行；`last_used_at` 推到当下，下一轮过期查询不会再选中同一行。
 
 不做的事：不做跨进程锁（单实例）、不做热/冷分区、不做按剧 pin 的例外。
+
+## 海报：按需回源（MKACG-650）
+
+剧目录下的 `poster.jpg` 是虚拟文件，字节取自这里缓存的封面文件（`artifact(kind='cover')`）。
+请求它时的路径与播放面同构：
+
+```
+GET /webdav/<分类>/<剧>/poster.jpg
+  → 查 artifact(kind='cover', key=<provider>/<provider_id>)    1 次主键查询
+  → 命中（行在、文件在）：读文件 → 返回字节，touch last_used_at
+  → 未命中（文件被手删、或被淘汰降级为空 path）：single-flight 回源一次 → 原子落盘 → 写回 artifact 行 → 回字节
+  → 源未声明封面 / 回源失败：WebDAV 404，不写缓存、不返回半截字节，下次请求可再试
+```
+
+- **复用同一套回源逻辑**：回源、落盘布局、键、超时（`cover_timeout_sec`）与同步时的
+  `LocalizeCover` 是同一份实现（`CoverCache.download`），没有第二套。
+- **single-flight 与同步共用一组**：`CoverCache` 的 `flightGroup` 同时服务「刷新时本地化」
+  与「请求时按需回源」，所以一次刷新与一堆 poster 请求撞在同一个封面上时也只回源一次。
+- **`HasCover` 只看 artifact 行、不看文件**：行在 = 这部剧在树里有 `poster.jpg`。文件被淘汰
+  后节点仍要留着，否则请求根本到不了 `Render`，谈不上「按需重新下载」。
+- 这里**只**复用已有的 `cover` kind 与 `<cache_dir>/cover/…` 布局，不新增缓存类型。
 
 ## 并发
 
 | 场景 | 做法 |
 |---|---|
 | 同一 `(id, seq)` 并发请求 | single-flight：一个生成，其余等结果 |
+| 同一封面的并发请求（同步 + poster.jpg） | 同一套 single-flight（`CoverCache` 的 `flightGroup`），只回源一次 |
 | 多个不同分片同时生成 | 受现有 ffmpeg 闸限制（`min(4, max(1, NumCPU/2))`，不新增配置） |
 | 淘汰与读取撞车 | 读先打开文件句柄再查行；行被删但文件还在 → 命中；文件被删 → 重新生成。不需要锁 |
 | 写缓存 | 临时文件 + `rename`，同名并发写同一个内容无害 |
@@ -155,12 +184,20 @@ WebDAV 只承载元数据（`.strm` / `.nfo` / 目录），**不经手分片**�
 必须真跑的：
 
 1. **缓存命中不再回源**：第一次请求分片 → 假 CDN 计数 +1；第二次 → 计数不变。
+   海报同理：`poster.jpg` 命中本地时计数不变（`TestPosterReadsLocalWithoutRefetch`）。
 2. **命中/未命中的字节一致**：两次响应 `len(body)` 与 `sha256(body)` 相同。
 3. **生成失败不写缓存**：假 CDN 返回 500 → 502，且 `artifact` 无该行、目录无该文件。
 4. **淘汰按上限生效**：写入超过 `cache_max_mb` 的数据 → 触发淘汰后 `SUM(bytes)` 回落到上限内，
    且被删的是 `last_used_at` 最旧的那些。
 5. **`cache_lru_days` 过期**：把一条 `last_used_at` 改到 40 天前 → 淘汰后该行与文件都不在。
-6. **single-flight**：并发 10 个同 `(id, seq)` 请求 → 假 CDN 只被调用 1 次。
+   海报是唯一的例外，且必须单独测：过期后**文件删掉、行留着且 `path`/`bytes`/`sha256` 清空、
+   `last_used_at` 推到当轮时间**；此后 `poster.jpg` 仍在目录里、GET 200 且恰好回源一次
+   （`TestEvictExpiredCoverKeepsRow`、`TestPosterRefetchesAfterSystemEviction`、
+   `TestPosterSurvivesSystemEviction`——最后一条走真 handler + 真 DAV 请求）。
+6. **single-flight**：并发 10 个同 `(id, seq)` 请求 → 假 CDN 只被调用 1 次；
+   并发 3 个 `poster.jpg` 请求 → 封面假 CDN 只被调用 1 次（`internal/cache` 与
+   `internal/webdav` 各有一条 `TestPosterConcurrentRequestsFetchOnce`：前者测缓存层，
+   后者测「真 handler + 真 DAV 请求」）。
 
 不测：文件系统异常（磁盘满、权限拒绝）的具体错误文案；跨进程并发。
 
