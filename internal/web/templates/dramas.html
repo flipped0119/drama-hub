@@ -2,7 +2,8 @@
 <section class="block">
   <div class="block-head">
     <h1>剧目</h1>
-    <p class="hint">按上游剧 id 同步入库。删剧会连带删掉它的集、合并组与对外集号。</p>
+    <p class="hint">按上游剧 id 同步入库。删剧会连带删掉它的集与对外集号；合并集按
+      <code>merge_chunk_size</code> 自动分块，不需要人工编排。</p>
   </div>
   <form class="row-form" id="drama-form">
     <label class="field">
@@ -25,7 +26,6 @@
           <th class="num">年份</th>
           <th class="num">集 / 上游</th>
           <th class="num">对外集</th>
-          <th class="num">合并组</th>
           <th>同步时间</th>
           <th></th>
         </tr>

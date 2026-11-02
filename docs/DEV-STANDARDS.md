@@ -67,15 +67,15 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 迁移文件 `internal/store/migrations/NNNN_<verb>_<subject>.sql`，只向前，不改历史文件。启动时自动执行到最新；版本真值在 `schema_migrations`（不是数据库的 user_version），并发保护用会话级 `pg_advisory_lock`（锁与迁移共用一条连接，多副本同时启动只有一个真正执行）。迁移失败即返回错误，`main` 记日志后退出——不提供半迁移服务。
 - 所有 SQL 只在 `internal/store` 出现；其它包通过方法访问。占位符是 PostgreSQL 的 `$n`（`IN (…)` 的序号由 `placeholders(from, n)` 算偏移），值一律走绑定，不拼进 SQL 文本。
 - 连接串是必填项 `DRAMA_HUB_DB_URL`；连接池参数走 env（`DRAMA_HUB_DB_MAX_OPEN_CONNS` / `DRAMA_HUB_DB_MAX_IDLE_CONNS` / `DRAMA_HUB_DB_CONN_MAX_LIFETIME_SEC`），非法值启动即报错，不静默退回默认。
-- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）、合并变更（`CreateMergeGroup` / `DeleteMergeGroup`）与首播回填时长（`store.BackfillEpisodeDuration`，事务内直接调 `rebuildEmbyItems`）三处。重建是「整体替换」：先删该剧全部行再按源集号顺序插入，对外集号从 1 起连续；单集占 1 个集号、合并组也只占 1 个。
-- 合并编排只在 `internal/store/merge.go`：`merge_group`（组）+ `merge_item`（组内成员，`ord` 即时间轴顺序）+ `emby_item`（派生）。`CreateMergeGroup` 校验成员至少 2 集、同剧、不重复、不与已有组重叠（违反返回 `ErrInvalid`，不落库）。
+- 派生的 `emby_item` 表由 `store.RebuildEmbyItems(dramaID)` 幂等重建，调用点只有同步完成（`internal/sync` 的 `Syncer.SyncSeries`）与首播回填时长（`store.BackfillEpisodeDuration`，事务内直接调 `rebuildEmbyItems`）两处。重建是「整体替换」：先删该剧全部行再按 `ep_no` 顺序插入；一块占 1 个对外集号，块内 1 集走单集规则、≥2 集是合并集。
+- 合并分块只在 `internal/store/merge.go`：`chunkEpisodes` 是纯函数（按列表连续切片），`merge_chunk_size` 每次重建现读 `settings`，结果只落 `emby_item`（ADR-0010）。没有 `merge_group` / `merge_item` 表，也没有人工编排入口。
 - 时间统一存 UTC 的 RFC3339 文本（列类型是不透明 `TEXT`，`空串 = 还没发生过`）；展示时区转换在 Web 层做。只有 `schema_migrations.applied_at` 是 `TIMESTAMPTZ`（runner 自己的时间）。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突（SQLSTATE `23505`）由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*pgconn.PgError`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。其中 `episode.duration_sec` 只在插件给了非零值时覆盖，否则保留库里已有的值 —— 上游批量拿不到时长（恒 0），首播建索引回填的实测值不能被下一轮刷新清零。
 - 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（PostgreSQL 外键默认强制，不需要连接参数），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
 - `segment` 表是「每集的分片索引」，由 `internal/segment` 索引任务整体重建：`ReplaceSegments` 一事务内先删后插（重复索引幂等、失败整体回滚），`ListSegments` 按 `start_sec` 升序（即片内序）；无行返回空切片而非 `ErrNotFound`（「还没索引」是正常状态，由分片端点按 503 处理）。
 - 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（长事务持行锁，会挡住同剧的其它写者）。
-- **写事务的锁序固定为「drama → 子表」**：任何按剧写入子表的事务，第一条写语句之前先 `lockDrama`（`SELECT … FOR UPDATE`，`internal/store/lock.go`），再动 `episode` / `merge_*` / `emby_item`。两条事务以相反顺序请求同两行即 40P01 死锁（一方被中止）：同步事务先锁 `drama`（`UpsertDrama`）再逐集锁 `episode`，所以首播回填必须先锁 `drama` 再 `UPDATE episode`，合并编排必须先锁 `drama` 再写/删 `merge_*`。新增按剧写入的入口必须遵守，并用「外部持锁 + `FOR UPDATE NOWAIT` 探针」的测试钉住（`internal/store/crud_test.go` 的 `TestBackfillLocksDramaBeforeEpisode`）。
+- **写事务的锁序固定为「drama → 子表」**：任何按剧写入子表的事务，第一条写语句之前先 `lockDrama`（`SELECT … FOR UPDATE`，`internal/store/lock.go`），再动 `episode` / `emby_item`。两条事务以相反顺序请求同两行即 40P01 死锁（一方被中止）：同步事务先锁 `drama`（`UpsertDrama`）再逐集锁 `episode`，所以首播回填必须先锁 `drama` 再 `UPDATE episode`，派生表重建必须先锁 `drama` 再删/插 `emby_item`。新增按剧写入的入口必须遵守，并用「外部持锁 + `FOR UPDATE NOWAIT` 探针」的测试钉住（`internal/store/crud_test.go` 的 `TestBackfillLocksDramaBeforeEpisode`）。
 - 派生表重建（`rebuildEmbyItems`）同一部剧的「先删后插」必须串行：READ COMMITTED 下两个并发重建会各自按自己的快照删、再各自插入同一批行，撞唯一约束。串行化同样由 `lockDrama` 提供，不另设锁。
 
 ## 配置
@@ -101,6 +101,8 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
   「下次计划」，实际触发最多晚 60 秒。
 - **≤5 分钟**：缓存淘汰循环固定 5 分钟一轮，`cache_max_mb` / `cache_lru_days` 在下一轮
   淘汰才生效。
+- **下次重建**：`merge_chunk_size` 只在 `RebuildEmbyItems` 里现读（同步完成、首播回填
+  两个调用点），改完要等下一次重建才重排对外集号；不重启、不新增全库重建端点。
 - **重启后**：`plugin.<源>.base_url` 与 `plugin.<源>.request_timeout_sec` 是构造期注入的
   不可变配置（`*http.Client` 的 Timeout 在这里定型，见 `docs/PLUGIN-CONTRACT.md` 硬性
   要求 2）。状态页对这两项同时给「settings 现值」（`base_url` / `request_timeout_sec`）
@@ -144,6 +146,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 |---|---|---|---|---|
 | `strm_prefix` | `""` | 带 host 的绝对 URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
+| `merge_chunk_size` | `10` | 1–500 | 下次重建（同步完成 / 首播回填） | 每 N 集并成 1 条对外剧集（ADR-0010）。分块只在 `RebuildEmbyItems` 里现读，改完下一次重建即生效、不用重启；改 N 会重排全库对外集号，旧合并 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
 | `seg_target_sec` | `10` | 4–30 | 即时（仅未建索引的 uid，见下） | 分片目标时长；**只对还没建索引的 uid 生效**——已建索引的 uid 不重算，改了要等它下一次重建（`segment` 表被整体替换时） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
 | `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；四个目录在启动时预先建出 |
@@ -218,17 +221,21 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 
 ```
 id  = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]
-uid ∈ { "e<episode.id>", "m<merge_group.id>" }
+uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 ```
 
 - 生产方是 vfs 的 `.strm` 渲染（`cmd` 注入 `stream.ID`），校验方是 `/video`
   （`stream.ParseID`）：两侧同一个实现，不各写一份 HMAC 拼接。
-- `uid` 只依赖 `episode.id` / `merge_group.id`，两者在库的整个生命周期里不变 →
-  URL 不随同步、重建派生表、重启、改目录而漂；换 `stream_secret` 后所有 URL 失效
-  （ADR-0003 的既定后果）。secret 每请求读一次，不缓存（硬约束 5）。
+- 单集 `uid` 只依赖 `episode.id`；合并集 `uid` 只依赖 `(dramaID, 块内集号区间)`，不含
+  自增主键。两者在「集集合与 N 不变」的前提下都不随同步、重建派生表、重启、改目录而漂 →
+  URL 不漂、分片缓存不废；换 `stream_secret` 后所有 URL 失效（ADR-0003 的既定后果）。
+  secret 每请求读一次，不缓存（硬约束 5）。
+- 分隔符是 `_` 不是 `-`：播放 id 是 `<uid>-<签名>`，`stream.ParseID` 按首个 `-` 切；
+  uid 里带 `-` 会把「uid 不存在」的 404 顶成「签名不对」的 401。
 - **播放单元的合法性由 `emby_item` 派生表判定**（`store.EmbyItemByUID`）：`e<id>` 只在
-  它是一条现存单集时有效；某集被并进合并组后，它的 `e<id>` 立即 404 —— 这是契约
-  「不飘移」第 3 条，也是 401（签名不对）与 404（播放单元不存在）的分界。
+  它是一条现存单集时有效；改 `merge_chunk_size` 后某集被并进块、或块的成员变了，它的
+  旧 uid 立即 404 —— 这是契约「不飘移」第 3 条，也是 401（签名不对）与 404
+  （播放单元不存在）的分界。
 - 状态码矩阵里没有 302、没有过期时间、没有 token 表。
 
 ### 关键帧索引（按需建立）
@@ -310,10 +317,11 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }
 
 ### 合并集
 
-`uid = m<group_id>`：`Timeline` 按 `merge_item.ord` 把成员分片拼成连续 seq 空间，
-playlist 在集边界插 `#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 用绝对起点保证
-跨集 DTS 连续（否则播放器在集边界因时间戳回退丢帧）。分片端点只解析它要切的那一集，
-不把整组都解析一遍。
+`uid = m<dramaID>_<epFrom>_<epTo>`：`unit` 用 `store.ParseMergedUID` 反解出剧与集号
+区间，再用 `ListEpisodesInRange` 取 `ep_no ∈ [a,b]` 的集（连续列表切片保证区间里没有
+别块的集），`Timeline` 把它们的分片拼成连续 seq 空间；playlist 在集边界插
+`#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 用绝对起点保证跨集 DTS 连续（否则
+播放器在集边界因时间戳回退丢帧）。分片端点只解析它要切的那一集，不把整块都解析一遍。
 
 ## 日志
 
@@ -514,15 +522,16 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 - 剧目录 `<剧名> (<年份>)`：年份来自 `drama.year`；`year=0` 显式写成 `(<0>)`，不省略。
 - 季目录恒为 `Season 01`（`emby_item.season` 恒为 1）。
 - 集号 `S%02dE%02d`：**对外集号取 `emby_item.ep_no`**（硬约束 6），不是 `episode.ep_no`。
-- `<标签>` = `embyLabel`：单集取源集标题、空则 `第<对外集号>集`；**合并集取
-  `第 A-B 集`**（A/B 是组内最小/最大源集号，A==B 时退化为 `第 A 集`）。
+- `<标签>` = `embyLabel`：单集取源集标题、空则 `第<源集号>集`（不是对外集号：
+  自动分块后第 3 块可能只装源第 21 集，标题应是「第21集」）；**合并集取
+  `第 A-B 集`**（A/B 是块内最小/最大源集号，A==B 时退化为 `第 A 集`）。
 - 目录名（含分类目录）与文件名里的 `/ \ : * ? " < > |` 一律替换为 `_`（Windows + WebDAV
   非法字符集）：分类名转义是 S8 / PL 2026-10-30 的裁决，见下「含路径分隔符的分类名」。
 - 路径以 `/` 分隔、相对 vfs 根、无前导 `/`；`""` 与 `短剧` 都表示根。
 
-**数据源是 `emby_item` 派生表**（`store.ListEmbyItems`），不是 `episode`：一个合并组
-在树里只产出 1 条文件对，Emby 因此显示为 1 集、对外集号连续（硬约束 6）。合并调整
-只重建派生表，`drama` / `episode` 原始数据不动。
+**数据源是 `emby_item` 派生表**（`store.ListEmbyItems`），不是 `episode`：一个合并块
+在树里只产出 1 条文件对，Emby 因此显示为 1 集、对外集号连续（硬约束 6）。改 N 只重建
+派生表，`drama` / `episode` 原始数据不动。
 
 ### 列举成本（一个目录一次查询）
 
@@ -584,7 +593,7 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 ```
 
 - `id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]`（`stream.ID`），
-  `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<merge_group.id>`。
+  `uid` 取 `emby_item.uid`：单集 `e<episode.id>`、合并集 `m<dramaID>_<epFrom>_<epTo>`。
   **单集与合并集没有区别**，对外统一是 HLS 播放列表（`docs/PLAYBACK-CONTRACT.md`）。
 - 签名算法在 `internal/stream`（rank 20）：vfs（rank 30）可以 import 它，但仍在装配根
   注入 `vfs.IDFunc`（`cmd` 传 `stream.ID`），让 vfs 只依赖「一个纯函数」这条缝。
@@ -742,7 +751,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 ## 管理界面（internal/web）
 
-挂载点 `/`（装配根注册）。三页界面与管理 API 是同一个 handler：完整路径原样传入
+挂载点 `/`（装配根注册）。两页界面与管理 API 是同一个 handler：完整路径原样传入
 本包（ServeMux 不剥前缀），未登记路径由本包 mux 返回 404 —— 「未知路径 → 404」
 的语义不变，只是兜底者从顶层 mux 换成 web 的 mux。`/webdav/`、`/s/` 的 pattern 比
 `/` 更具体，不受影响。
@@ -751,8 +760,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 | 路径 | 页面 | 能干的事 |
 |---|---|---|
-| `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、合并组、对外集号） |
-| `/merges` | 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即 `ord`）→ 删组 |
+| `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、对外集号） |
 | `/status` | 同步与缓存 | 同步计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / `strm_prefix` / 缓存上限与保留期 / 刷新间隔 → `PATCH /api/settings`，每项标签写着生效时机）、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、运行配置现状（密钥只报「是否已设置」，**每行带「生效时机」列**）。缓存面字段（`mode` / `max_size` / …）是 ADR-0004 遗留，已在 MKACG-616 删除 |
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
@@ -763,15 +771,12 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `playable_episodes` / `emby_items` / `merge_groups` 计数 |
+| `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `emby_items` 计数 |
 | `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回整份列表：**库里新建了行 → 201，这部剧已存在（这次只更新）→ 200** |
-| `/api/dramas/{id}` | DELETE | 删剧目（级联删集与合并组），204；不存在 404 |
+| `/api/dramas/{id}` | DELETE | 删剧目（级联删集与对外集号），204；不存在 404 |
 | `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |
-| `/api/dramas/{id}/merge-groups` | GET | 该剧合并组与成员（`ord` 即时间轴顺序） |
-| `/api/dramas/{id}/merge-groups` | POST | 建组：`{"label":"…","episode_ids":[…]}`，数组顺序即 `ord`，201 + 整份列表 |
-| `/api/merge-groups/{id}` | DELETE | 删组（同一事务内重建派生表），204 |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
-| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `seg_target_sec` / `cache_dir` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
+| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `seg_target_sec` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
 | `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
@@ -783,9 +788,9 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
   判断留在本包，不下沉到 store（那是要整体重写的层）。
 - **同步失败统一 502**（数据源在远端，失败几乎总是上游/页面结构问题），错误原因进响应体；
   provider 的错误文本不含直链与签名。
-- **业务规则不复制到本包**：合并编排的「至少 2 集、同剧、不重复、不与已有组重叠」全部由
-  `store.CreateMergeGroup` 校验，本包只做 `store.ErrInvalid` → 400、`store.ErrNotFound`
-  → 404 的映射。
+- **业务规则不复制到本包**：分块规则（连续切片、单集/合并集判定、uid 形态）全部在
+  `internal/store/merge.go`，本包只做 `store.ErrNotFound` → 404 的映射（settings
+  的非法值走 `store.ErrInvalidSetting`，由 `mapSettingErr` → 400）。
 - **计数不做 N+1**：`store.ListDramaStats` 一条聚合查询取全库（标量子查询，不用多表
   JOIN，避免行数相乘）。
 
@@ -802,7 +807,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | 未设令牌 | 所有写端点 **401（fail closed）**：没配 ≠ 不设防，否则新部署会悄悄裸奔。状态页显示「未设置 `DRAMA_HUB_ADMIN_TOKEN`，后台改配置不可用」并禁用保存；`/api/status` 的 `admin_token_set` 报有没有配（不报值） |
 | 令牌不符 / 缺失 | 401，`message` 说明缺哪个请求头 |
 | 范围 | 按「方法 + `/api/` 前缀」判定（`Server.ServeHTTP` 里的闸门）：新增写端点默认受保护，不需要逐个登记 |
-| 不受影响 | `GET /api/*`、三页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
+| 不受影响 | `GET /api/*`、两页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
 | 页面怎么带 | 顶栏「管理令牌」输入框 → `sessionStorage`（关掉标签页就没了）；`app.js` 对非 GET 请求自动加这个头。令牌不进任何页面响应、不进日志 |
 
 ### 缓存面（ADR-0007）

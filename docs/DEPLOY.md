@@ -92,7 +92,7 @@ SQL
 
 ```bash
 podman exec -i <pg容器> psql -U drama -d drama -c \
-  'TRUNCATE drama, episode, emby_item, merge_group, merge_item, segment RESTART IDENTITY CASCADE;'
+  'TRUNCATE drama, episode, emby_item, segment RESTART IDENTITY CASCADE;'
 ```
 
 跑起来之后（第二轮起）关调度就是普通的 PATCH，立即生效：
@@ -182,6 +182,15 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 - 任何 `FAIL` 让脚本退出码为 1；`FAIL` 就是判据不满足，不要改判据让它变绿。
 - F 段默认实播 60 秒（`PLAY_SECONDS`），并用 ffmpeg 的 `out_time` 证明**真的拉了 60 秒内容**
   ——只看退出码 0 不行：10 秒的 playlist 也会正常结束。
+
+## 升级须知（含 0005 的版本）
+
+- `0005` 删掉手工编排的 `merge_group` / `merge_item`，并清掉 `emby_item` 里新代码读不动
+  的旧合并行（uid 形如 `m<组 id>`）。**派生表不迁移数据**：升级后、下一次重建之前，
+  曾手工建过合并组的剧只显示单集（不会报错、扫不出来的是那些旧合并集）；等一轮同步
+  或首播回填按当前 `merge_chunk_size` 重建后恢复。
+- 从本版起合并是自动的：改 `merge_chunk_size`（默认 10）后，下一次重建生效，对外集号
+  重排、旧合并 id 立即 404。
 
 ## 常见失败
 

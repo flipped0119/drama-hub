@@ -2,8 +2,8 @@ package store
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -12,7 +12,7 @@ import (
 func seedMergeDrama(t *testing.T, st *Store, n int) (int64, []int64) {
 	t.Helper()
 	ctx := context.Background()
-	did, err := st.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "m1", Title: "合并测试剧"})
+	did, err := st.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "m1", Title: "分块测试剧"})
 	if err != nil {
 		t.Fatalf("UpsertDrama: %v", err)
 	}
@@ -29,87 +29,259 @@ func seedMergeDrama(t *testing.T, st *Store, n int) (int64, []int64) {
 	return did, ids
 }
 
-// AC：合并组占 1 个对外集号，其余每集各占 1 个，集号连续、顺序按源集号。
-func TestRebuildEmbyItems_MergedCollapsesRange(t *testing.T) {
+// setChunkSize 写入 merge_chunk_size（不写时取注册表默认 10）。
+func setChunkSize(t *testing.T, st *Store, n int) {
+	t.Helper()
+	if err := NewSettings(st.root).Set(context.Background(), KeyMergeChunkSize, strconv.Itoa(n)); err != nil {
+		t.Fatalf("Set merge_chunk_size=%d: %v", n, err)
+	}
+}
+
+// AC-1：分块纯函数的边界（0 集、1 集、余数、整倍、N=1、N 大于集数）。
+func TestChunkEpisodes(t *testing.T) {
+	eps := func(n int) []Episode {
+		out := make([]Episode, n)
+		for i := range out {
+			out[i] = Episode{ID: int64(i + 1), EpNo: i + 1}
+		}
+		return out
+	}
+	sizes := func(blocks [][]Episode) []int {
+		out := make([]int, 0, len(blocks))
+		for _, b := range blocks {
+			out = append(out, len(b))
+		}
+		return out
+	}
+	cases := []struct {
+		name   string
+		count  int
+		n      int
+		want   []int
+		blocks int
+	}{
+		{"0 集", 0, 10, nil, 0},
+		{"1 集", 1, 10, []int{1}, 1},
+		{"3 集 N=10", 3, 10, []int{3}, 1},
+		{"22 集 N=10（余数 2）", 22, 10, []int{10, 10, 2}, 3},
+		{"22 集 N=5", 22, 5, []int{5, 5, 5, 5, 2}, 5},
+		{"20 集 N=10（整倍，不多空组）", 20, 10, []int{10, 10}, 2},
+		{"3 集 N=1（全部单集）", 3, 1, []int{1, 1, 1}, 3},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			blocks := chunkEpisodes(eps(c.count), c.n)
+			if len(blocks) != c.blocks {
+				t.Fatalf("块数 = %d, 期望 %d（sizes=%v）", len(blocks), c.blocks, sizes(blocks))
+			}
+			for i, want := range c.want {
+				if len(blocks[i]) != want {
+					t.Errorf("第 %d 块 = %d 集, 期望 %d", i+1, len(blocks[i]), want)
+				}
+			}
+			// 块是连续切片、且按顺序覆盖全部集：块首尾相接、不丢不重。
+			seen := 0
+			for _, b := range blocks {
+				for _, ep := range b {
+					seen++
+					if ep.EpNo != seen {
+						t.Fatalf("块内集号顺序断了：第 %d 个是 %d", seen, ep.EpNo)
+					}
+				}
+			}
+			if seen != c.count {
+				t.Errorf("覆盖了 %d 集, 期望 %d", seen, c.count)
+			}
+		})
+	}
+}
+
+// AC-2：22 集、默认 N=10 → 3 条对外剧集（10 + 10 + 2），uid 与时长都按块派生。
+func TestRebuildEmbyItems_DefaultChunkTen(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)
-	did, eps := seedMergeDrama(t, st, 12)
+	did, _ := seedMergeDrama(t, st, 22)
 
-	gid, err := st.CreateMergeGroup(ctx, did, "第1-10集", eps[:10])
+	items, err := st.RebuildEmbyItems(ctx, did)
 	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
+		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
-
-	items, err := st.ListEmbyItems(ctx, did)
-	if err != nil {
-		t.Fatalf("ListEmbyItems: %v", err)
-	}
-	// 12 集、前 10 集并成 1 → 3 条对外剧集。
 	if len(items) != 3 {
 		t.Fatalf("对外剧集数 = %d, 期望 3：%+v", len(items), items)
 	}
 
-	merged := items[0]
-	if merged.Kind != "merged" {
-		t.Errorf("items[0].Kind = %q, 期望 merged", merged.Kind)
+	want := []struct {
+		epNo     int
+		uid      string
+		from, to int
+		runtime  int
+	}{
+		{1, mergedUID(did, 1, 10), 1, 10, sumDurations(1, 10)},
+		{2, mergedUID(did, 11, 20), 11, 20, sumDurations(11, 20)},
+		{3, mergedUID(did, 21, 22), 21, 22, sumDurations(21, 22)},
 	}
-	if merged.EpNo != 1 {
-		t.Errorf("合并集对外集号 = %d, 期望 1", merged.EpNo)
-	}
-	if want := mergedUID(gid); merged.UID != want {
-		t.Errorf("合并集 uid = %q, 期望 %q（m<group_id>）", merged.UID, want)
-	}
-	if merged.EpFrom != 1 || merged.EpTo != 10 {
-		t.Errorf("合并集源集号范围 = (%d,%d), 期望 (1,10)", merged.EpFrom, merged.EpTo)
-	}
-	// runtime = 组内各集时长之和（101..110）。
-	if want := 101 + 102 + 103 + 104 + 105 + 106 + 107 + 108 + 109 + 110; merged.RuntimeSec != want {
-		t.Errorf("合并集 runtime = %d, 期望 %d", merged.RuntimeSec, want)
-	}
-
-	// 剩下两集按源集号接在后面，对外集号连续（2、3 ⇒ S01E02/S01E03）。
-	for i, wantEp := range []int{11, 12} {
-		got := items[i+1]
-		if got.Kind != "single" {
-			t.Errorf("items[%d].Kind = %q, 期望 single", i+1, got.Kind)
+	for i, w := range want {
+		it := items[i]
+		if it.Kind != "merged" || it.EpNo != w.epNo || it.UID != w.uid {
+			t.Errorf("items[%d] = {%s ep_no=%d uid=%s}, 期望 {merged ep_no=%d uid=%s}",
+				i, it.Kind, it.EpNo, it.UID, w.epNo, w.uid)
 		}
-		if got.EpNo != i+2 {
-			t.Errorf("items[%d].EpNo = %d, 期望 %d（对外集号连续）", i+1, got.EpNo, i+2)
+		if it.EpFrom != w.from || it.EpTo != w.to {
+			t.Errorf("items[%d] 源集号范围 = (%d,%d), 期望 (%d,%d)", i, it.EpFrom, it.EpTo, w.from, w.to)
 		}
-		if got.EpFrom != wantEp || got.EpTo != wantEp {
-			t.Errorf("items[%d] 源集号 = (%d,%d), 期望 (%d,%d)", i+1, got.EpFrom, got.EpTo, wantEp, wantEp)
-		}
-		if got.UID != singleUID(eps[wantEp-1]) {
-			t.Errorf("items[%d].UID = %q, 期望 %q（e<episode_id>）", i+1, got.UID, singleUID(eps[wantEp-1]))
+		if it.RuntimeSec != w.runtime {
+			t.Errorf("items[%d] runtime = %d, 期望 %d（块内时长之和）", i, it.RuntimeSec, w.runtime)
 		}
 	}
 }
 
-// AC：重建幂等——同一份编排重建两次，行内容（含 uid 与集号）完全一致。
+// sumDurations 是 seedMergeDrama 里第 from..to 集的时长之和（每集 100+ep_no 秒）。
+func sumDurations(from, to int) int {
+	sum := 0
+	for ep := from; ep <= to; ep++ {
+		sum += 100 + ep
+	}
+	return sum
+}
+
+// AC-3：同一个 Store 实例上把 N 从 10 改成 5，重建后变 5 条（5+5+5+5+2），
+// 旧 uid 行消失 —— 这是「改 N 无需重启」的可测形式。
+func TestRebuildEmbyItems_ChangeChunkSize(t *testing.T) {
+	ctx := context.Background()
+	st := NewStore(newCRUDTestDB(t).DB)
+	did, _ := seedMergeDrama(t, st, 22)
+
+	before, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
+		t.Fatalf("RebuildEmbyItems(N=10): %v", err)
+	}
+	if len(before) != 3 {
+		t.Fatalf("N=10 时对外剧集数 = %d, 期望 3", len(before))
+	}
+	oldUID := before[0].UID
+
+	setChunkSize(t, st, 5)
+	after, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
+		t.Fatalf("RebuildEmbyItems(N=5): %v", err)
+	}
+	if len(after) != 5 {
+		t.Fatalf("N=5 时对外剧集数 = %d, 期望 5：%+v", len(after), after)
+	}
+	wantSizes := []int{5, 5, 5, 5, 2}
+	for i, it := range after {
+		if got := it.EpTo - it.EpFrom + 1; got != wantSizes[i] {
+			t.Errorf("第 %d 块覆盖 %d 集, 期望 %d", i+1, got, wantSizes[i])
+		}
+		if it.UID == oldUID {
+			t.Errorf("改 N 后仍出现旧 uid %q", oldUID)
+		}
+	}
+	if _, err := st.EmbyItemByUID(ctx, oldUID); err == nil {
+		t.Errorf("改 N 后旧 uid %q 仍在派生表里（旧 id 必须失效）", oldUID)
+	}
+}
+
+// AC-4：21 集、N=10 → 2 个合并块 + 1 个单集块（余数 1 集走单集规则）。
+func TestRebuildEmbyItems_RemainderSingle(t *testing.T) {
+	ctx := context.Background()
+	st := NewStore(newCRUDTestDB(t).DB)
+	did, ids := seedMergeDrama(t, st, 21)
+
+	items, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("对外剧集数 = %d, 期望 3", len(items))
+	}
+	if items[0].Kind != "merged" || items[1].Kind != "merged" {
+		t.Errorf("前两块应为 merged：%+v", items[:2])
+	}
+	last := items[2]
+	if last.Kind != "single" {
+		t.Errorf("余数 1 集的 kind = %q, 期望 single", last.Kind)
+	}
+	if want := singleUID(ids[20]); last.UID != want {
+		t.Errorf("余数 1 集的 uid = %q, 期望 %q（e<episode.id>）", last.UID, want)
+	}
+	if last.EpFrom != 21 || last.EpTo != 21 || last.RuntimeSec != sumDurations(21, 21) {
+		t.Errorf("余数块 = %+v, 期望覆盖第 21 集且 runtime 为该集时长", last)
+	}
+}
+
+// AC：集数是 N 的整倍数时不多出空组。
+func TestRebuildEmbyItems_ExactMultiple(t *testing.T) {
+	ctx := context.Background()
+	st := NewStore(newCRUDTestDB(t).DB)
+	did, _ := seedMergeDrama(t, st, 20)
+
+	items, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
+		t.Fatalf("RebuildEmbyItems(N=10): %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("20 集 / N=10 对外剧集数 = %d, 期望 2（不多空组）", len(items))
+	}
+	for i, it := range items {
+		if it.Kind != "merged" || it.EpFrom != i*10+1 || it.EpTo != (i+1)*10 {
+			t.Errorf("items[%d] = %+v, 期望 merged 覆盖第 %d-%d 集", i, it, i*10+1, (i+1)*10)
+		}
+	}
+}
+
+// AC：N=1 时每集各占一条，全部走单集规则（uid 是 e<episode.id>）。
+func TestRebuildEmbyItems_ChunkOneAllSingle(t *testing.T) {
+	ctx := context.Background()
+	st := NewStore(newCRUDTestDB(t).DB)
+	did, ids := seedMergeDrama(t, st, 3)
+	setChunkSize(t, st, 1)
+
+	items, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
+		t.Fatalf("RebuildEmbyItems(N=1): %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("3 集 / N=1 对外剧集数 = %d, 期望 3", len(items))
+	}
+	for i, it := range items {
+		if it.Kind != "single" || it.UID != singleUID(ids[i]) || it.EpNo != i+1 {
+			t.Errorf("items[%d] = {%s ep_no=%d %s}, 期望 {single ep_no=%d %s}",
+				i, it.Kind, it.EpNo, it.UID, i+1, singleUID(ids[i]))
+		}
+	}
+}
+
+// AC：0 集 → 0 行派生表，不留空组。
+func TestRebuildEmbyItems_ZeroEpisodes(t *testing.T) {
+	ctx := context.Background()
+	st := NewStore(newCRUDTestDB(t).DB)
+	did, _ := seedMergeDrama(t, st, 0)
+
+	items, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("0 集剧的对外剧集数 = %d, 期望 0：%+v", len(items), items)
+	}
+}
+
+// AC-6：集集合与 N 不变时连续两次重建，全部 uid 逐字符相同（不飘移）。
 func TestRebuildEmbyItems_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)
-	did, eps := seedMergeDrama(t, st, 5)
+	did, _ := seedMergeDrama(t, st, 22)
 
-	if _, err := st.RebuildEmbyItems(ctx, did); err != nil {
+	first, err := st.RebuildEmbyItems(ctx, did)
+	if err != nil {
 		t.Fatalf("第一次 Rebuild: %v", err)
 	}
-	first, err := st.ListEmbyItems(ctx, did)
+	second, err := st.RebuildEmbyItems(ctx, did)
 	if err != nil {
-		t.Fatalf("ListEmbyItems: %v", err)
-	}
-	if len(first) != 5 {
-		t.Fatalf("无合并组时对外剧集数 = %d, 期望 5", len(first))
-	}
-
-	if _, err := st.RebuildEmbyItems(ctx, did); err != nil {
 		t.Fatalf("第二次 Rebuild: %v", err)
 	}
-	second, err := st.ListEmbyItems(ctx, did)
-	if err != nil {
-		t.Fatalf("ListEmbyItems 第二次: %v", err)
-	}
-	if len(second) != len(first) {
+	if len(first) != len(second) {
 		t.Fatalf("两次重建行数不同：%d vs %d", len(first), len(second))
 	}
 	for i := range first {
@@ -118,174 +290,78 @@ func TestRebuildEmbyItems_Idempotent(t *testing.T) {
 			t.Errorf("行 %d 两次重建不一致：%+v vs %+v", i, a, b)
 		}
 	}
-	if _, err := st.CreateMergeGroup(ctx, did, "g", eps[:2]); err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
-	// 合并后重复重建仍幂等。
-	if _, err := st.RebuildEmbyItems(ctx, did); err != nil {
-		t.Fatalf("合并后 Rebuild: %v", err)
-	}
-	third, err := st.ListEmbyItems(ctx, did)
-	if err != nil {
-		t.Fatalf("ListEmbyItems 第三次: %v", err)
-	}
-	if len(third) != 4 {
-		t.Errorf("合并 2 集后对外剧集数 = %d, 期望 4", len(third))
-	}
 }
 
-// AC：删除合并组后派生表回到逐集视图（无残留行、无残留 uid）。
-func TestDeleteMergeGroup_RestoresSingles(t *testing.T) {
+// AC：区间查询按 ep_no 取集、升序；集号有缺号时区间内的集就是全部成员。
+func TestListEpisodesInRange(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)
-	did, eps := seedMergeDrama(t, st, 4)
-
-	gid, err := st.CreateMergeGroup(ctx, did, "g", eps[:3])
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
-	items, _ := st.ListEmbyItems(ctx, did)
-	if len(items) != 2 {
-		t.Fatalf("合并 3 集后对外剧集数 = %d, 期望 2", len(items))
+	did, ids := seedMergeDrama(t, st, 4)
+	// 制造缺号：把第 2 集的 ep_no 改成 7（模拟源侧缺号，库里仍有 4 行）。
+	if _, err := st.UpsertEpisode(ctx, Episode{ID: ids[1], DramaID: did, EpNo: 7, Source: "web", Vid: "v"}); err != nil {
+		t.Fatalf("UpsertEpisode ep_no=7: %v", err)
 	}
 
-	if err := st.DeleteMergeGroup(ctx, gid); err != nil {
-		t.Fatalf("DeleteMergeGroup: %v", err)
-	}
-	items, err = st.ListEmbyItems(ctx, did)
+	eps, err := st.ListEpisodesInRange(ctx, did, 5, 7)
 	if err != nil {
-		t.Fatalf("ListEmbyItems: %v", err)
+		t.Fatalf("ListEpisodesInRange: %v", err)
 	}
-	if len(items) != 4 {
-		t.Fatalf("删除合并组后对外剧集数 = %d, 期望 4", len(items))
-	}
-	for i, it := range items {
-		if it.Kind != "single" {
-			t.Errorf("items[%d].Kind = %q, 期望 single", i, it.Kind)
+	if len(eps) != 1 || eps[0].EpNo != 7 {
+		got := make([]int, 0, len(eps))
+		for _, ep := range eps {
+			got = append(got, ep.EpNo)
 		}
-		if it.EpNo != i+1 {
-			t.Errorf("items[%d].EpNo = %d, 期望 %d", i, it.EpNo, i+1)
+		t.Fatalf("区间 5..7 的集 = %v, 期望只有 ep_no 7（缺号不补空位）", got)
+	}
+}
+
+// AC：uid 形态的真值只有一处 —— 解析失败的几种形态都返回 ok=false。
+func TestParseMergedUID(t *testing.T) {
+	cases := []struct {
+		uid  string
+		ok   bool
+		want string
+	}{
+		{"m12_1_10", true, "12:1:10"},
+		{"m1_21_22", true, "1:21:22"},
+		{"m1_1", false, ""},
+		{"m1_1_10_2", false, ""},
+		{"m0_1_10", false, ""},
+		{"m1_0_10", false, ""},
+		{"m1_10_1", false, ""},
+		{"e1", false, ""},
+		{"mabc_1_10", false, ""},
+	}
+	for _, c := range cases {
+		dramaID, from, to, ok := ParseMergedUID(c.uid)
+		if ok != c.ok {
+			t.Errorf("ParseMergedUID(%q) ok = %v, 期望 %v", c.uid, ok, c.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if got := fmt.Sprintf("%d:%d:%d", dramaID, from, to); got != c.want {
+			t.Errorf("ParseMergedUID(%q) = %s, 期望 %s", c.uid, got, c.want)
 		}
 	}
-	// 已删除的组再删一次 → ErrNotFound。
-	if err := st.DeleteMergeGroup(ctx, gid); !errors.Is(err, ErrNotFound) {
-		t.Errorf("重复删除 err = %v, 期望 ErrNotFound", err)
-	}
 }
 
-// AC：编排越界一律 ErrInvalid 且不落库（集数不足、重复、跨剧、跨组重叠、空 label）。
-func TestCreateMergeGroup_Validation(t *testing.T) {
-	ctx := context.Background()
-	st := NewStore(newCRUDTestDB(t).DB)
-	did, eps := seedMergeDrama(t, st, 4)
-	_, otherEp := seedOtherDrama(t, st)
-
-	if _, err := st.CreateMergeGroup(ctx, did, "g", eps[:1]); !errors.Is(err, ErrInvalid) {
-		t.Errorf("单集合并组 err = %v, 期望 ErrInvalid", err)
-	}
-	if _, err := st.CreateMergeGroup(ctx, did, "g", []int64{eps[0], eps[0]}); !errors.Is(err, ErrInvalid) {
-		t.Errorf("重复集 err = %v, 期望 ErrInvalid", err)
-	}
-	if _, err := st.CreateMergeGroup(ctx, did, "g", []int64{eps[0], 999999}); !errors.Is(err, ErrInvalid) {
-		t.Errorf("不存在的集 err = %v, 期望 ErrInvalid", err)
-	}
-	if _, err := st.CreateMergeGroup(ctx, did, "g", []int64{eps[0], otherEp}); !errors.Is(err, ErrInvalid) {
-		t.Errorf("跨剧的集 err = %v, 期望 ErrInvalid", err)
-	}
-	if _, err := st.CreateMergeGroup(ctx, did, "", []int64{eps[0], eps[1]}); !errors.Is(err, ErrInvalid) {
-		t.Errorf("空 label err = %v, 期望 ErrInvalid", err)
-	}
-
-	if _, err := st.CreateMergeGroup(ctx, did, "g1", eps[:2]); err != nil {
-		t.Fatalf("CreateMergeGroup g1: %v", err)
-	}
-	// 与已有组合并同一集 → ErrInvalid（重叠会重复播放）。
-	if _, err := st.CreateMergeGroup(ctx, did, "g2", []int64{eps[1], eps[2]}); !errors.Is(err, ErrInvalid) {
-		t.Errorf("跨组重叠 err = %v, 期望 ErrInvalid", err)
-	}
-
-	// 失败路径不落库：只有 g1 一个组，成员 2 个。
-	groups, err := st.ListMergeGroups(ctx, did)
-	if err != nil {
-		t.Fatalf("ListMergeGroups: %v", err)
-	}
-	if len(groups) != 1 || groups[0].Label != "g1" {
-		t.Errorf("合并组 = %+v, 期望只有 g1", groups)
-	}
-	members, err := st.ListMergeMembers(ctx, groups[0].ID)
-	if err != nil {
-		t.Fatalf("ListMergeMembers: %v", err)
-	}
-	if len(members) != 2 {
-		t.Errorf("g1 成员数 = %d, 期望 2", len(members))
-	}
-	if members[0].Ord != 1 || members[1].Ord != 2 {
-		t.Errorf("成员 ord = %d/%d, 期望 1/2", members[0].Ord, members[1].Ord)
-	}
-	if members[0].EpisodeID != eps[0] || members[1].EpisodeID != eps[1] {
-		t.Errorf("成员顺序 = %d/%d, 期望 %d/%d", members[0].EpisodeID, members[1].EpisodeID, eps[0], eps[1])
-	}
-}
-
-// seedOtherDrama 建另一部只有 1 集的剧，返回 (剧 id, 集 id)。
-func seedOtherDrama(t *testing.T, st *Store) (int64, int64) {
-	t.Helper()
-	ctx := context.Background()
-	did, err := st.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "m2", Title: "另一部"})
-	if err != nil {
-		t.Fatalf("UpsertDrama other: %v", err)
-	}
-	ep, err := st.UpsertEpisode(ctx, Episode{DramaID: did, EpNo: 1, Source: "web", Vid: "v"})
-	if err != nil {
-		t.Fatalf("UpsertEpisode other: %v", err)
-	}
-	return did, ep
-}
-
-// AC：合并组的成员顺序就是时间轴顺序（按 ord，而非源集号）。
-func TestListMergeMembers_OrderedByOrd(t *testing.T) {
-	ctx := context.Background()
-	st := NewStore(newCRUDTestDB(t).DB)
-	did, eps := seedMergeDrama(t, st, 4)
-
-	// 逆序编排：先第 3 集、后第 1 集。
-	gid, err := st.CreateMergeGroup(ctx, did, "逆序", []int64{eps[2], eps[0]})
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
-	members, err := st.ListMergeMembers(ctx, gid)
-	if err != nil {
-		t.Fatalf("ListMergeMembers: %v", err)
-	}
-	if len(members) != 2 {
-		t.Fatalf("成员数 = %d, 期望 2", len(members))
-	}
-	if members[0].EpisodeID != eps[2] || members[1].EpisodeID != eps[0] {
-		t.Errorf("成员顺序 = [%d,%d], 期望 [%d,%d]（ord 决定时间轴）",
-			members[0].EpisodeID, members[1].EpisodeID, eps[2], eps[0])
-	}
-	if members[0].EpNo != 3 || members[1].EpNo != 1 {
-		t.Errorf("成员源集号 = [%d,%d], 期望 [3,1]", members[0].EpNo, members[1].EpNo)
-	}
-}
-
-// AC：删剧级联清掉合并组与派生表（外键 ON DELETE CASCADE）。
-func TestDeleteDrama_CascadesMergeTables(t *testing.T) {
+// AC：删剧级联清掉派生表（外键 ON DELETE CASCADE）。
+func TestDeleteDrama_CascadesEmbyItems(t *testing.T) {
 	ctx := context.Background()
 	db := newCRUDTestDB(t)
 	st := NewStore(db.DB)
-	did, eps := seedMergeDrama(t, st, 3)
+	did, _ := seedMergeDrama(t, st, 3)
 
-	if _, err := st.CreateMergeGroup(ctx, did, "g", eps[:2]); err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
+	if _, err := st.RebuildEmbyItems(ctx, did); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 	if err := st.DeleteDrama(ctx, did); err != nil {
 		t.Fatalf("DeleteDrama: %v", err)
 	}
-	for _, table := range []string{"merge_group", "merge_item", "emby_item"} {
-		if n := countRows(t, db.DB, table); n != 0 {
-			t.Errorf("删剧后 %s 残留 %d 行, 期望 0", table, n)
-		}
+	if n := countRows(t, db.DB, "emby_item"); n != 0 {
+		t.Errorf("删剧后 emby_item 残留 %d 行, 期望 0", n)
 	}
 }
 
@@ -300,6 +376,7 @@ func TestConcurrentUpsertAndRebuild(t *testing.T) {
 	ctx := context.Background()
 	const episodes = 6
 	dramaID, ids := seedMergeDrama(t, st, episodes)
+	setChunkSize(t, st, 1) // N=1 让每条对外剧集对应一集，重复行才看得见
 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()

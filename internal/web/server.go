@@ -44,7 +44,7 @@ type Source struct {
 	BootRequestTimeoutSec int    // 启动时注入插件的出站超时（秒）
 }
 
-// Server 汇总管理 API 与三页管理界面。它实现 http.Handler，由 cmd 挂到 `/` 上；
+// Server 汇总管理 API 与两页管理界面。它实现 http.Handler，由 cmd 挂到 `/` 上；
 // 完整路径（含 `/api` 前缀）原样传到本包，ServeMux 不剥前缀。
 type Server struct {
 	st       *store.Store
@@ -71,8 +71,8 @@ type Schedule interface {
 // 状态页要列的播放源（装配根按注册表给，空表示没有源）；adminToken 是写操作的令牌
 // （`DRAMA_HUB_ADMIN_TOKEN`，空 = 没配 = 写操作一律 401）；logger 用于请求与同步日志。
 //
-// 路由分两类：三页界面（`/`、`/merges`、`/status` 与内嵌的 `/static/`）与
-// 管理 API（`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
+// 路由分两类：两页界面（`/`、`/status` 与内嵌的 `/static/`）与管理 API
+// （`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
 // 这是「未知路径 → 404」的前提（cmd 的装配注释同此约定）。
 //
 // 写操作（非 GET/HEAD/OPTIONS）在 ServeHTTP 里先过令牌，路由表本身不重复这件事：
@@ -91,7 +91,6 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 
 	// 页面与静态资源：模板与 CSS/JS 随二进制嵌入（ADR-0002，无构建步骤）。
 	s.mux.HandleFunc("GET /{$}", s.handleDramasPage)
-	s.mux.HandleFunc("GET /merges", s.handleMergesPage)
 	s.mux.HandleFunc("GET /status", s.handleStatusPage)
 	s.mux.HandleFunc("GET /static/{file}", s.handleStatic)
 
@@ -100,9 +99,6 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	s.mux.HandleFunc("POST /api/dramas", s.handleCreateDrama)
 	s.mux.HandleFunc("DELETE /api/dramas/{id}", s.handleDeleteDrama)
 	s.mux.HandleFunc("GET /api/dramas/{id}/episodes", s.handleListEpisodes)
-	s.mux.HandleFunc("GET /api/dramas/{id}/merge-groups", s.handleListMergeGroups)
-	s.mux.HandleFunc("POST /api/dramas/{id}/merge-groups", s.handleCreateMergeGroup)
-	s.mux.HandleFunc("DELETE /api/merge-groups/{id}", s.handleDeleteMergeGroup)
 	s.mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
 	s.mux.HandleFunc("PATCH /api/settings", s.handlePatchSettings)
@@ -201,15 +197,14 @@ func pathID(r *http.Request, name string) (int64, error) {
 	return id, nil
 }
 
-// mapStoreErr 把 store 的哨兵接到 httpx 的传输层类别：ErrNotFound → 404、
-// ErrInvalid → 400，其余原样返回（StatusCode 兜底 500）。
+// mapStoreErr 把 store 的哨兵接到 httpx 的传输层类别：ErrNotFound → 404，
+// 其余原样返回（StatusCode 兜底 500）。
+//
+// store 的入参校验哨兵是 ErrInvalidSetting（settings 自己的那一套），由
+// mapSettingErr 处理，不经过这里。
 func mapStoreErr(err error) error {
-	switch {
-	case errors.Is(err, store.ErrNotFound):
+	if errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("%w: %v", httpx.ErrNotFound, err)
-	case errors.Is(err, store.ErrInvalid):
-		return fmt.Errorf("%w: %v", httpx.ErrInvalid, err)
-	default:
-		return err
 	}
+	return err
 }

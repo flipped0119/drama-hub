@@ -45,6 +45,9 @@ const (
 	// docs/DEV-STANDARDS.md「配置」表：海报是三方 CDN 上的百 KB 级图片，比页面请求
 	// 该更早放弃，因此单独一项，不跟插件超时走（MKACG-620）。
 	KeyCoverTimeoutSec SettingKey = "cover_timeout_sec"
+	// KeyMergeChunkSize 是「几集并成一条对外剧集」（默认 10，范围 1–500）。分块是
+	// 纯派生：重建 emby_item 时现读本值，改完下一次重建即生效（docs/adr/0010）。
+	KeyMergeChunkSize SettingKey = "merge_chunk_size"
 	// 刷新调度的三项（范围与语义见 docs/SCHEDULER-MODEL.md「配置」）。
 	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
 	KeyRefreshBatch       SettingKey = "refresh_batch"
@@ -276,7 +279,7 @@ func (s *Settings) OptionalInt(ctx context.Context, key SettingKey) (value int, 
 	if spec.kind != kindInt {
 		return 0, false, fmt.Errorf("%w: %s 不是整型配置", ErrInvalidSetting, key)
 	}
-	encoded, found, err := s.load(ctx, key)
+	encoded, found, err := loadSetting(ctx, s.db, key)
 	if err != nil || !found {
 		return 0, false, err
 	}
@@ -286,13 +289,21 @@ func (s *Settings) OptionalInt(ctx context.Context, key SettingKey) (value int, 
 	return value, true, nil
 }
 
-// value 读取 key 的类型化值：库中有行则 JSON 解码，无行则取默认值或报缺。
+// value 读取 key 的类型化值。读取路径与 settingValue 共用一份（事务内的 Store 也要读）。
 func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
+	return settingValue(ctx, s.db, key)
+}
+
+// settingValue 读取 key 的类型化值：库中有行则 JSON 解码，无行则取默认值或报缺。
+//
+// 接受 dbtx 而不是 *sql.DB：派生表重建在事务里跑，它也要现读 merge_chunk_size，
+// 而事务内的 Store 只有一个 dbtx。校验与默认值仍然只有 specFor + parseSetting 一份。
+func settingValue(ctx context.Context, db dbtx, key SettingKey) (any, error) {
 	spec, ok := specFor(key)
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownSetting, key)
 	}
-	encoded, found, err := s.load(ctx, key)
+	encoded, found, err := loadSetting(ctx, db, key)
 	if err != nil {
 		return nil, err
 	}
@@ -325,9 +336,9 @@ func (s *Settings) value(ctx context.Context, key SettingKey) (any, error) {
 	}
 }
 
-// load 读 key 的已编码值。found 为 false 表示库中无该行。
-func (s *Settings) load(ctx context.Context, key SettingKey) (encoded string, found bool, err error) {
-	err = s.db.QueryRowContext(ctx,
+// loadSetting 读 key 的已编码值。found 为 false 表示库中无该行。
+func loadSetting(ctx context.Context, db dbtx, key SettingKey) (encoded string, found bool, err error) {
+	err = db.QueryRowContext(ctx,
 		`SELECT value_json FROM settings WHERE key = $1`, string(key)).Scan(&encoded)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
@@ -389,6 +400,9 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyCoverTimeoutSec:
 		// 海报下载的单次出站超时：百 KB 级图片，离线时不该按插件超时（30 s）等。
 		return settingSpec{kind: kindInt, def: "5", min: 1, max: 60}, true
+	case KeyMergeChunkSize:
+		// 一集只有 53–67 秒，默认 10 集合 1 集；上限 500 只是防手误写出一部一集的剧。
+		return settingSpec{kind: kindInt, def: "10", min: 1, max: 500}, true
 	case KeyRefreshIntervalSec:
 		// 全局刷新间隔：所有源共用的默认值（docs/SCHEDULER-MODEL.md「配置」）。
 		return settingSpec{kind: kindInt, def: "3600", min: 300, max: 86400}, true

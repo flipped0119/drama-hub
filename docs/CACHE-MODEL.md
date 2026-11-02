@@ -80,6 +80,7 @@ playlist 是 `segment` 表的**纯函数**（`segment.BuildPlaylist`）：一次
 |---|---|
 | 键变了 | 自然产生新文件，旧文件由 LRU 淘汰（不需要主动删） |
 | `stream_secret` 变了 | `uid` 没变 → 缓存仍命中；只有 URL 失效，缓存不受影响 |
+| `merge_chunk_size` 变了 | 合并块的 `uid` 变 → 旧分片键不再被任何 URL 命中，旧文件由 LRU 淘汰（不主动清） |
 | 通道变了（web ↔ app） | `codec_sig` 带通道段 → 分片键自然变，旧片由 LRU 淘汰；`segment` 索引的通道段与本次请求不一致即**重建**（不沿用另一个通道的片数与时长；加通道段之前写下的老索引一律算失效） |
 | 上游同 `vid` 换了内容 | 无法自动感知（`vid` 不变、`codec_sig` 不变）。由 `cache_lru_days` 兜底过期 |
 

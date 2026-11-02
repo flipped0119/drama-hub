@@ -165,11 +165,11 @@ func TestHandler_RetiredPlaybackPaths(t *testing.T) {
 	}
 }
 
-// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理面的三页与 `/api/` 都挂在
+// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理面的两页与 `/api/` 都挂在
 // 装配根的 `/` 上（不是 404、不是 501），未登记路径仍由 web 的 mux 兜底 404。
 func TestHandler_ManagementSurface(t *testing.T) {
 	h := newTestHandler(t)
-	for _, path := range []string{"/", "/merges", "/status"} {
+	for _, path := range []string{"/", "/status"} {
 		rec := serve(t, h, http.MethodGet, path)
 		if rec.Code != http.StatusOK {
 			t.Errorf("GET %s 状态码 = %d, 期望 200（管理面没挂上）", path, rec.Code)
@@ -495,8 +495,9 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 	st := store.NewStore(db.DB)
 	settings := store.NewSettings(db.DB)
 	for k, v := range map[store.SettingKey]string{
-		store.KeyStreamSecret: secret,
-		store.KeyCacheDir:     filepath.Join(t.TempDir(), "cache"),
+		store.KeyStreamSecret:   secret,
+		store.KeyCacheDir:       filepath.Join(t.TempDir(), "cache"),
+		store.KeyMergeChunkSize: "2",
 	} {
 		if err := settings.Set(ctx, k, v); err != nil {
 			t.Fatalf("Set %s: %v", k, err)
@@ -524,13 +525,9 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 			t.Fatalf("ReplaceSegments: %v", err)
 		}
 	}
-	// 播放单元只认派生表；CreateMergeGroup 会重建它，这里先把单集形态建出来。
+	// 播放单元只认派生表：N=2 把第 1-2 集并成一块，第 3 集自成一集。
 	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
 		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
-	gid, err := st.CreateMergeGroup(ctx, dramaID, "第2-3集", []int64{ids[1], ids[2]})
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
 	}
 
 	buf := &bytes.Buffer{}
@@ -538,8 +535,8 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 	h := newAssembly(logger, st, settings, testSyncer(), fakeSchedule{}, testSources(),
 		stubRegistry(t, "web", "http://127.0.0.1:1/direct.mp4"))
 
-	singleUID := "e" + strconv.FormatInt(ids[0], 10)
-	mergedUID := "m" + strconv.FormatInt(gid, 10)
+	singleUID := "e" + strconv.FormatInt(ids[2], 10)
+	mergedUID := fmt.Sprintf("m%d_1_2", dramaID)
 
 	// 单集：合法 VOD playlist，分片 URI 指回 /video/{id}/{seq}.ts，没有 DISCONTINUITY。
 	singleID := stream.ID(secret, singleUID)
@@ -607,7 +604,7 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 
 // TestIDStability 覆盖契约的「{id} 不飘移」四条：
 // 1. 重复取一致；2. 全量刷新（UpsertEpisode + RebuildEmbyItems）后一致；
-// 3. 建/删合并组只让受影响那一集的 id 变化（旧 id 404、其它集 id 一个都不变）；
+// 3. 改 merge_chunk_size 只让受影响那一集的 id 变化（旧 id 404、其它集 id 不变）；
 // 4. 重启进程（settings 不变）后一致。
 func TestIDStability(t *testing.T) {
 	ctx := context.Background()
@@ -620,8 +617,9 @@ func TestIDStability(t *testing.T) {
 	st := store.NewStore(db.DB)
 	settings := store.NewSettings(db.DB)
 	for k, v := range map[store.SettingKey]string{
-		store.KeyStreamSecret: secret,
-		store.KeyCacheDir:     filepath.Join(t.TempDir(), "cache"),
+		store.KeyStreamSecret:   secret,
+		store.KeyCacheDir:       filepath.Join(t.TempDir(), "cache"),
+		store.KeyMergeChunkSize: "1", // 先逐集一条，改 N 的那一步才有可观测的旧 id 失效
 	} {
 		if err := settings.Set(ctx, k, v); err != nil {
 			t.Fatalf("Set %s: %v", k, err)
@@ -694,34 +692,39 @@ func TestIDStability(t *testing.T) {
 	t.Cleanup(func() { _ = db2.Close() })
 	assertSame("重启后", idsOf(store.NewStore(db2.DB)), before)
 
-	// 3. 建合并组：只让被合并的两集从单集 uid 空间消失，第 1 集的 id 不变。
-	gid, err := st.CreateMergeGroup(ctx, dramaID, "第2-3集", []int64{ids[1], ids[2]})
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
+	// 3. 改 N=2：第 1-2 集并成一块、第 3 集不动 —— 只让被并的两集从单集 uid 空间消失。
+	if err := settings.Set(ctx, store.KeyMergeChunkSize, "2"); err != nil {
+		t.Fatalf("Set merge_chunk_size=2: %v", err)
+	}
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems(N=2): %v", err)
 	}
 	merged := idsOf(st)
-	firstUID := "e" + strconv.FormatInt(ids[0], 10)
-	mergedUID := "m" + strconv.FormatInt(gid, 10)
-	if merged[firstUID] != before[firstUID] {
-		t.Errorf("未受影响的第 1 集 id 变了：%q → %q", before[firstUID], merged[firstUID])
+	lastUID := "e" + strconv.FormatInt(ids[2], 10)
+	mergedUID := fmt.Sprintf("m%d_1_2", dramaID)
+	if merged[lastUID] != before[lastUID] {
+		t.Errorf("未受影响的第 3 集 id 变了：%q → %q", before[lastUID], merged[lastUID])
 	}
 	if len(merged) != 2 {
-		t.Fatalf("建组后对外剧集数 = %d, 期望 2（单集 + 合并集）：%v", len(merged), merged)
+		t.Fatalf("改 N 后对外剧集数 = %d, 期望 2（合并块 + 单集）：%v", len(merged), merged)
 	}
 	if _, ok := merged[mergedUID]; !ok {
-		t.Fatalf("合并集 uid %s 不在派生表里：%v", mergedUID, merged)
+		t.Fatalf("合并块 uid %s 不在派生表里：%v", mergedUID, merged)
 	}
 	// 旧 id 仍合法签名，但对应 uid 已不在库里 → 404（与 401 区分开）。
 	h := newAssembly(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources(), nil)
 	if rec := serve(t, h, http.MethodGet, "/video/"+before["e"+strconv.FormatInt(ids[1], 10)]+".m3u8"); rec.Code != http.StatusNotFound {
-		t.Errorf("被合并集的旧 id 状态码 = %d, 期望 404", rec.Code)
+		t.Errorf("被并进合并块的旧 id 状态码 = %d, 期望 404", rec.Code)
 	}
 
-	// 删组后回到 3 条单集，id 与建组前逐个相同（旧 id 复活而不是换新值）。
-	if err := st.DeleteMergeGroup(ctx, gid); err != nil {
-		t.Fatalf("DeleteMergeGroup: %v", err)
+	// 改回 N=1 后回到 3 条单集，id 与改 N 前逐个相同（旧 id 复活而不是换新值）。
+	if err := settings.Set(ctx, store.KeyMergeChunkSize, "1"); err != nil {
+		t.Fatalf("Set merge_chunk_size=1: %v", err)
 	}
-	assertSame("删组后", idsOf(st), before)
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems(N=1): %v", err)
+	}
+	assertSame("改回 N=1 后", idsOf(st), before)
 }
 
 // 装配根显式注册插件（不用 init()），并且 plugin.<源>.* 配置真的进到插件：
@@ -913,6 +916,8 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 		store.KeySegTargetSec: "10",
 		// 缓存目录必须在临时目录里：默认的 ./data/cache 会写进源码树。
 		store.KeyCacheDir: filepath.Join(t.TempDir(), "cache"),
+		// 本测试用 e<episode.id> 直接取某一集，并对 .nfo 断言「第N集」标签。
+		store.KeyMergeChunkSize: "1",
 	} {
 		if err := settings.Set(ctx, k, v); err != nil {
 			t.Fatalf("Set %s: %v", k, err)

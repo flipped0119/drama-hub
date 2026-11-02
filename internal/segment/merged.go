@@ -9,10 +9,6 @@ import (
 // playVersion 是自造 playlist 的 HLS 版本（docs/PLAYBACK-CONTRACT.md 的示例同款）。
 const playVersion = 3
 
-// mergedUIDPrefix 是合并集句柄前缀：`m` + merge_group 主键（DESIGN D3）。
-// 与单集 `e` 前缀互斥，因此合并集 uid 永不匹配 `^e[0-9]+$`。
-const mergedUIDPrefix = "m"
-
 // BuildPlaylist 把时间轴渲染成 VOD playlist 字节（纯函数）。
 //
 // 每片一行 `#EXTINF:<真实时长>,` + 分片 URI `/video/{id}/{seq}.ts`；集边界
@@ -46,16 +42,4 @@ func BuildPlaylist(id string, slices []Slice) []byte {
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")
 	return []byte(b.String())
-}
-
-// parseMergedUID 解析合并集句柄 `m<group_id>`；不匹配或超出 int64 返回 false。
-func parseMergedUID(uid string) (int64, bool) {
-	if !strings.HasPrefix(uid, mergedUIDPrefix) {
-		return 0, false
-	}
-	id, err := strconv.ParseInt(uid[len(mergedUIDPrefix):], 10, 64)
-	if err != nil || id <= 0 {
-		return 0, false
-	}
-	return id, true
 }

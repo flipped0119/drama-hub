@@ -24,7 +24,6 @@ type dramaView struct {
 	EpisodeTotal int    `json:"episode_total"`
 	Episodes     int    `json:"episodes"`
 	EmbyItems    int    `json:"emby_items"`
-	MergeGroups  int    `json:"merge_groups"`
 	SyncAt       string `json:"sync_at"`
 }
 
@@ -75,7 +74,6 @@ func (s *Server) dramaViews(ctx context.Context) ([]dramaView, error) {
 			EpisodeTotal: d.EpisodeTotal,
 			Episodes:     st.Episodes,
 			EmbyItems:    st.EmbyItems,
-			MergeGroups:  st.MergeGroups,
 			SyncAt:       d.SyncAt,
 		})
 	}
@@ -140,7 +138,7 @@ func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, dramaList{Dramas: views})
 }
 
-// handleDeleteDrama 处理 DELETE /api/dramas/{id}：删剧连带删集、合并组与派生表
+// handleDeleteDrama 处理 DELETE /api/dramas/{id}：删剧连带删集与派生表
 // （schema 的 ON DELETE CASCADE）。不存在返回 404。
 func (s *Server) handleDeleteDrama(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
@@ -155,8 +153,8 @@ func (s *Server) handleDeleteDrama(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// handleListEpisodes 处理 GET /api/dramas/{id}/episodes：合并编排页要按源集挑选
-// 成员，因此返回该剧的全部集（按 ep_no 升序）。剧不存在返回 404。
+// handleListEpisodes 处理 GET /api/dramas/{id}/episodes：返回该剧的全部集
+// （按 ep_no 升序）。剧不存在返回 404。
 func (s *Server) handleListEpisodes(w http.ResponseWriter, r *http.Request) {
 	id, err := pathID(r, "id")
 	if err != nil {

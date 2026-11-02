@@ -11,7 +11,7 @@ import (
 	"github.com/justforlxz/drama-hub/internal/httpx"
 )
 
-// assets 是三页界面所需的模板与静态资源，随二进制嵌入（ADR-0002：单二进制、
+// assets 是两页界面所需的模板与静态资源，随二进制嵌入（ADR-0002：单二进制、
 // 无前端构建步骤、没有 package.json）。
 //
 //go:embed templates/*.html static/*
@@ -28,8 +28,6 @@ func pageMetaOf(page string) (pageMeta, bool) {
 	switch page {
 	case "dramas":
 		return pageMeta{file: "templates/dramas.html", title: "剧目"}, true
-	case "merges":
-		return pageMeta{file: "templates/merges.html", title: "合并编排"}, true
 	case "status":
 		return pageMeta{file: "templates/status.html", title: "同步与缓存"}, true
 	default:
@@ -49,17 +47,12 @@ func (s *Server) handleDramasPage(w http.ResponseWriter, r *http.Request) {
 	s.servePage(w, r, "dramas")
 }
 
-// handleMergesPage 处理 GET /merges（合并编排）。
-func (s *Server) handleMergesPage(w http.ResponseWriter, r *http.Request) {
-	s.servePage(w, r, "merges")
-}
-
 // handleStatusPage 处理 GET /status（同步与缓存看板）。
 func (s *Server) handleStatusPage(w http.ResponseWriter, r *http.Request) {
 	s.servePage(w, r, "status")
 }
 
-// servePage 渲染一个页面。模板每次请求解析：三页总共几 KB，单用户管理面下这点
+// servePage 渲染一个页面。模板每次请求解析：两页总共几 KB，单用户管理面下这点
 // 开销可以忽略，换来的是不持有包级模板对象。
 func (s *Server) servePage(w http.ResponseWriter, r *http.Request, page string) {
 	meta, ok := pageMetaOf(page)

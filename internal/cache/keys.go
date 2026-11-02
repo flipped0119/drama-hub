@@ -11,7 +11,7 @@ import (
 // 缓存键的三种规则（真值见 docs/CACHE-MODEL.md「落盘布局与键」）。
 //
 // 键只用不含 secret 的稳定标识：分片与索引用 uid（`e<episode.id>` /
-// `m<merge_group.id>`），海报用 `<provider>/<provider_id>`。所以换 stream_secret
+// `m<dramaID>_<epFrom>_<epTo>`），海报用 `<provider>/<provider_id>`。所以换 stream_secret
 // 只会让已发出的 URL 失效，不会让缓存失效（ADR-0007「后果」）。
 
 // keySeparator 是分片键的分段符（\x1f 不会出现在 uid / 数字 / codec 签名里）。
@@ -32,7 +32,7 @@ func SegmentKey(uid string, seq int, codecSig string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// IndexKey 是关键帧索引的 artifact 键：uid（一集或一个合并组一份索引）。
+// IndexKey 是关键帧索引的 artifact 键：uid（一集或一个合并块一份索引）。
 func IndexKey(uid string) string { return uid }
 
 // CoverKey 是海报的 artifact 键：`<provider>/<provider_id>`。

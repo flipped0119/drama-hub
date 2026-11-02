@@ -467,8 +467,13 @@ func twoDigit(n int) string {
 
 // embyLabel 是对外剧集的标签：
 //
-//   - 合并集：`第 A-B 集`（A/B 是组内最小/最大源集号；A==B 时退化为 `第 A 集`）
-//   - 单集：源集标题；空则回退 `第 N 集`（N 是对外集号）
+//   - 合并集：`第 A-B 集`（A/B 是块内最小/最大源集号；A==B 时退化为 `第 A 集`）
+//   - 单集：源集标题；空则回退 `第 N 集`（N 是**源集号** EpFrom，不是对外集号）
+//
+// 单集块的回退必须取源集号：自动分块后「第 i 块」的对外集号是 i，而它可能只包含
+// 源第 21 集（21 集 / N=10 的第 3 块）——取 EpNo 会把标题写成「第3集」，与内容不符
+// （MKACG-649 AC-4）。集号文本 `S01E03` 仍取 EpNo，那是 Emby 的季内集号，两者是
+// 两件事。
 //
 // 文件名主干与 NFO <title> 共用本函数，避免两处漂移。
 func embyLabel(item store.EmbyItem) string {
@@ -480,7 +485,7 @@ func embyLabel(item store.EmbyItem) string {
 	}
 	label := sanitizeName(item.Title)
 	if label == "" {
-		label = "第" + strconv.Itoa(item.EpNo) + "集"
+		label = "第" + strconv.Itoa(item.EpFrom) + "集"
 	}
 	return label
 }

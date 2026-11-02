@@ -144,7 +144,7 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
 }
 
-// playbackUnit 是一个播放单元：单集或合并组，eps 按播放顺序排列。
+// playbackUnit 是一个播放单元：单集或合并块，eps 按播放顺序排列。
 type playbackUnit struct {
 	eps []store.Episode
 }
@@ -152,9 +152,10 @@ type playbackUnit struct {
 // unit 把 uid 展开成播放单元。
 //
 // 「合法 uid」由 emby_item 派生表决定（硬约束 6 + 契约「不飘移」第 3 条）：某集被并进
-// 合并组后它的 `e<id>` 立刻不是播放单元，旧 URL 必须 404 —— 所以先查派生表再取集。
-// 单集一项；合并集按 merge_item.ord 顺序取成员剧集。
-// uid 语法不认识、派生表没有、组合没有成员 → httpx.ErrNotFound（404）。
+// 合并块后它的 `e<id>` 立刻不是播放单元，旧 URL 必须 404 —— 所以先查派生表再取集。
+// 单集一项；合并集由 uid 里的 `(dramaID, epFrom, epTo)` 反解成员区间，再取
+// `ep_no ∈ [a,b]` 的集（自动分块切的是连续列表切片，区间内没有别块的集）。
+// uid 语法不认识、派生表没有、区间里没有集 → httpx.ErrNotFound（404）。
 func (c *Cutter) unit(ctx context.Context, uid string) (playbackUnit, error) {
 	if _, err := c.st.EmbyItemByUID(ctx, uid); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -162,24 +163,13 @@ func (c *Cutter) unit(ctx context.Context, uid string) (playbackUnit, error) {
 		}
 		return playbackUnit{}, fmt.Errorf("查播放单元 %s: %w", uid, err)
 	}
-	if groupID, ok := parseMergedUID(uid); ok {
-		members, err := c.st.ListMergeMembers(ctx, groupID)
+	if dramaID, from, to, ok := store.ParseMergedUID(uid); ok {
+		eps, err := c.st.ListEpisodesInRange(ctx, dramaID, from, to)
 		if err != nil {
-			return playbackUnit{}, fmt.Errorf("读合并组成员 %d: %w", groupID, err)
+			return playbackUnit{}, fmt.Errorf("读合并集成员 drama_id=%d ep_no=%d..%d: %w", dramaID, from, to, err)
 		}
-		if len(members) == 0 {
-			return playbackUnit{}, fmt.Errorf("%w: 合并组 %s 不存在或没有成员", httpx.ErrNotFound, uid)
-		}
-		eps := make([]store.Episode, 0, len(members))
-		for _, m := range members {
-			ep, err := c.st.EpisodeByID(ctx, m.EpisodeID)
-			if errors.Is(err, store.ErrNotFound) {
-				return playbackUnit{}, fmt.Errorf("%w: 合并组成员剧集 %d", httpx.ErrNotFound, m.EpisodeID)
-			}
-			if err != nil {
-				return playbackUnit{}, fmt.Errorf("查合并组成员剧集 %d: %w", m.EpisodeID, err)
-			}
-			eps = append(eps, ep)
+		if len(eps) == 0 {
+			return playbackUnit{}, fmt.Errorf("%w: 合并集 %s 没有成员", httpx.ErrNotFound, uid)
 		}
 		return playbackUnit{eps: eps}, nil
 	}

@@ -85,6 +85,11 @@ func seedTree(t *testing.T, strmPrefix string, withSecret bool) fixture {
 
 	st := store.NewStore(db.DB)
 	settings := store.NewSettings(db.DB)
+	// 本文件钉的是目录/文件名/strm 形状，夹具按「每集一条对外剧集」布置（N=1）；
+	// 自动分块本身在 internal/store 的 merge_test 里验。
+	if err := settings.Set(ctx, store.KeyMergeChunkSize, "1"); err != nil {
+		t.Fatalf("Set merge_chunk_size: %v", err)
+	}
 
 	aID, err := st.UpsertDrama(ctx, store.Drama{
 		Provider: "web", ProviderID: "a1", Title: titleA, Year: 2024,
@@ -662,11 +667,16 @@ func TestNames(t *testing.T) {
 		{"集号/超两位展开", embyNumber(single(100, "")), "S01E100"},
 		{"标签/有标题", embyLabel(single(1, "开局")), "开局"},
 		{"标签/空标题回退", embyLabel(single(7, "")), "第7集"},
+		// 自动分块后单集块的对外集号与源集号可以不同：标签取源集号（MKACG-649 AC-4）。
+		{"标签/单集块回退取源集号", embyLabel(store.EmbyItem{Kind: "single", Season: 1, EpNo: 3, EpFrom: 21, EpTo: 21}), "第21集"},
 		{"标签/标题里的非法字符也替换", embyLabel(single(1, "a/b")), "a_b"},
 		{"标签/合并集范围", embyLabel(merged(1, 1, 10)), "第1-10集"},
 		{"标签/合并集单集退化为第N集", embyLabel(merged(1, 3, 3)), "第3集"},
 		{"文件名主干/有标签", embyBase(drama("测试剧", 2024), single(1, "开局")), "测试剧 - S01E01 - 开局"},
 		{"文件名主干/无标签", embyBase(drama("测试剧", 2024), single(2, "")), "测试剧 - S01E02 - 第2集"},
+		{"文件名主干/单集块回退取源集号",
+			embyBase(drama("测试剧", 2024), store.EmbyItem{Kind: "single", Season: 1, EpNo: 3, EpFrom: 21, EpTo: 21}),
+			"测试剧 - S01E03 - 第21集"},
 		{"文件名主干/合并集", embyBase(drama("测试剧", 2024), merged(1, 1, 10)), "测试剧 - S01E01 - 第1-10集"},
 	}
 	for _, tt := range tests {
@@ -759,17 +769,19 @@ func TestRenderNotFound(t *testing.T) {
 	}
 }
 
-// AC（硬约束 6）：合并组在树里只产出 1 条文件对，标签是「第 A-B 集」，且 strm
-// 的 id 里 uid 是合并集句柄 m<group_id>（不是任一单集 uid）。
+// AC（硬约束 6）：自动分块后的合并集在树里只产出 1 条文件对，标签是「第 A-B 集」，
+// 且 strm 的 id 里 uid 是合并集句柄 m<dramaID>_<from>_<to>（不是任一单集 uid）。
 func TestListMergedGroupCollapsesToOne(t *testing.T) {
 	ctx := context.Background()
 	f := seed(t, "")
 	st := store.NewStore(f.db.DB)
 
-	// 把 fixture 的两集并成 1 集。
-	gid, err := st.CreateMergeGroup(ctx, 1, "第1-2集", []int64{f.epA1.ID, f.epA2.ID})
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
+	// 把 fixture 的两集并成 1 集：N=2 后重建派生表（等价于下一次同步）。
+	if err := store.NewSettings(f.db.DB).Set(ctx, store.KeyMergeChunkSize, "2"); err != nil {
+		t.Fatalf("Set merge_chunk_size: %v", err)
+	}
+	if _, err := st.RebuildEmbyItems(ctx, 1); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 	items, err := st.ListEmbyItems(ctx, 1)
 	if err != nil {
@@ -799,8 +811,11 @@ func TestListMergedGroupCollapsesToOne(t *testing.T) {
 		t.Fatalf("合并后季目录文件 = %v, 期望 %q 与 %q", got, wantStrm, wantNFO)
 	}
 
-	// strm 的 uid 是 m<group_id>，id 由注入的 IDFunc 计算。
-	uid := "m" + strconv.FormatInt(gid, 10)
+	// strm 的 uid 是 m<dramaID>_<from>_<to>，id 由注入的 IDFunc 计算。
+	uid := items[0].UID
+	if uid != "m1_1_2" {
+		t.Fatalf("合并集 uid = %q, 期望 m1_1_2（剧 id_起始集_结束集）", uid)
+	}
 	body, err := f.tree.Render(ctx, wantStrm)
 	if err != nil {
 		t.Fatalf("Render(%s): %v", wantStrm, err)
@@ -823,6 +838,79 @@ func TestListMergedGroupCollapsesToOne(t *testing.T) {
 	}
 	if parsed.Episode != 1 {
 		t.Errorf("合并集 NFO episode = %d, 期望 1（对外集号）", parsed.Episode)
+	}
+}
+
+// AC（MKACG-649 AC-4，运行态口径）：21 集 / N=10 的第 3 块是单集，对外集号 3、源集号 21
+// —— 文件名与 NFO 标题必须是「第21集」，不是「第3集」。
+//
+// 这条走真实 store.ListEmbyItems + 真实渲染（不只测 embyLabel 纯函数）：自动分块后
+// 「第 i 块」的对外集号与它装着的源集号第一次可以不一致，链路上任何一处取错空间都该红。
+func TestListRemainderSingleRendersSourceEpisodeNumber(t *testing.T) {
+	ctx := context.Background()
+	f := seed(t, "")
+	st := f.store()
+	if err := store.NewSettings(f.db.DB).Set(ctx, store.KeyMergeChunkSize, "10"); err != nil {
+		t.Fatalf("Set merge_chunk_size: %v", err)
+	}
+
+	dramaID := f.addDrama(t, store.Drama{
+		Provider: "web", ProviderID: "z21", Title: "余数剧", Year: 2026, Genre: genreA,
+	})
+	for i := 1; i <= 21; i++ {
+		if _, err := st.UpsertEpisode(ctx, store.Episode{
+			DramaID: dramaID, EpNo: i, DurationSec: 60, Source: "web", Vid: fmt.Sprintf("v%d", i),
+		}); err != nil {
+			t.Fatalf("UpsertEpisode %d: %v", i, err)
+		}
+	}
+	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
+		t.Fatalf("RebuildEmbyItems: %v", err)
+	}
+
+	items, err := st.ListEmbyItems(ctx, dramaID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("对外集数 = %d, 期望 3（10 + 10 + 1）", len(items))
+	}
+	last := items[2]
+	if last.Kind != "single" || last.EpNo != 3 || last.EpFrom != 21 {
+		t.Fatalf("第 3 块 = %+v, 期望 single / ep_no=3 / 源集号=21", last)
+	}
+
+	dir := dramaDirPath(genreA, "z21", "余数剧 (2026)")
+	base := "余数剧 - S01E03 - 第21集"
+	nodes, err := f.tree.List(ctx, dir+"/"+seasonDir)
+	if err != nil {
+		t.Fatalf("List(季目录): %v", err)
+	}
+	got := map[string]bool{}
+	for _, n := range nodes {
+		if !n.IsDir {
+			got[n.Path] = true
+		}
+	}
+	for _, want := range []string{dir + "/" + seasonDir + "/" + base + ".strm", dir + "/" + seasonDir + "/" + base + ".nfo"} {
+		if !got[want] {
+			t.Fatalf("季目录文件 = %v, 缺 %q（单集块标题必须取源集号）", got, want)
+		}
+	}
+
+	nfo, err := f.tree.Render(ctx, dir+"/"+seasonDir+"/"+base+".nfo")
+	if err != nil {
+		t.Fatalf("Render(NFO): %v", err)
+	}
+	var parsed episodeNFO
+	if err := xml.Unmarshal(nfo, &parsed); err != nil {
+		t.Fatalf("解析 NFO: %v\n%s", err, nfo)
+	}
+	if parsed.Title != "第21集" {
+		t.Errorf("NFO title = %q, 期望 第21集（源集号，不是对外集号 3）", parsed.Title)
+	}
+	if parsed.Episode != 3 {
+		t.Errorf("NFO episode = %d, 期望 3（Emby 的季内集号仍是对外集号）", parsed.Episode)
 	}
 }
 

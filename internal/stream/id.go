@@ -16,7 +16,7 @@ const IDLen = 12
 //
 //	id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid))[:12]
 //
-// uid 取 emby_item.uid（单集 `e<episode.id>`、合并集 `m<merge_group.id>`）。
+// uid 取 emby_item.uid（单集 `e<episode.id>`、合并集 `m<dramaID>_<epFrom>_<epTo>`）。
 // 纯函数：只由 uid 与 secret 决定，因此同步、重建派生表、改目录、重启都不改变
 // 它，缓存键不会漂（ADR-0003 的不变量）。换 stream_secret 后所有 id 失效。
 //

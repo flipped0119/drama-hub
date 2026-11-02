@@ -376,9 +376,28 @@ func (s *Store) EpisodeByID(ctx context.Context, id int64) (Episode, error) {
 //
 // (drama_id, ep_no) 唯一，因此顺序确定。
 func (s *Store) ListEpisodes(ctx context.Context, dramaID int64) ([]Episode, error) {
-	rows, err := s.db.QueryContext(ctx, episodeColumns+` WHERE drama_id = $1 ORDER BY ep_no`, dramaID)
+	return s.listEpisodes(ctx,
+		fmt.Sprintf("列集 drama_id=%d", dramaID),
+		episodeColumns+` WHERE drama_id = $1 ORDER BY ep_no`, dramaID)
+}
+
+// ListEpisodesInRange 返回某部剧 ep_no ∈ [from, to] 的集，按 ep_no 升序。
+//
+// 播放面展开合并集时用它：合并集 uid 只带剧 id 与集号区间，成员就是区间内的集。
+// 自动分块切的是**连续列表切片**，所以一个区间里的集恰好全属于同一个块 —— 不会取到
+// 别的块的集（docs/adr/0010）。
+func (s *Store) ListEpisodesInRange(ctx context.Context, dramaID int64, from, to int) ([]Episode, error) {
+	return s.listEpisodes(ctx,
+		fmt.Sprintf("列集 drama_id=%d ep_no=%d..%d", dramaID, from, to),
+		episodeColumns+` WHERE drama_id = $1 AND ep_no BETWEEN $2 AND $3 ORDER BY ep_no`,
+		dramaID, from, to)
+}
+
+// listEpisodes 是上面两个入口的共用实现：what 只用于错误文本。
+func (s *Store) listEpisodes(ctx context.Context, what, query string, args ...any) ([]Episode, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("列集 drama_id=%d: %w", dramaID, err)
+		return nil, fmt.Errorf("%s: %w", what, err)
 	}
 	defer rows.Close()
 
@@ -391,7 +410,7 @@ func (s *Store) ListEpisodes(ctx context.Context, dramaID int64) ([]Episode, err
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("遍历集 drama_id=%d: %w", dramaID, err)
+		return nil, fmt.Errorf("遍历%s: %w", what, err)
 	}
 	return out, nil
 }
