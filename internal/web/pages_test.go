@@ -64,14 +64,13 @@ func isElement(n *html.Node, tag string) bool {
 	return n.Type == html.ElementNode && n.Data == tag
 }
 
-// TestPages 覆盖三页界面的契约：200 + text/html + 精确 Content-Length，
-// body[data-page] 与页面一致（JS 靠它分派），导航三个链接齐全且只有当前页带
+// TestPages 覆盖两页界面的契约：200 + text/html + 精确 Content-Length，
+// body[data-page] 与页面一致（JS 靠它分派），导航两个链接齐全且只有当前页带
 // aria-current。
 func TestPages(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	cases := []struct{ path, page string }{
 		{"/", "dramas"},
-		{"/merges", "merges"},
 		{"/status", "status"},
 	}
 	for _, c := range cases {
@@ -112,7 +111,7 @@ func TestPages(t *testing.T) {
 					current = href
 				}
 			}
-			want := []string{"/", "/merges", "/status"}
+			want := []string{"/", "/status"}
 			if len(hrefs) != len(want) {
 				t.Fatalf("导航链接 = %v, 期望 %v", hrefs, want)
 			}
@@ -159,14 +158,14 @@ func TestStaticAssets(t *testing.T) {
 // TestUnknownPaths 锁定管理面之外的路径：未登记路径仍是 404（不是 501、不是 200）。
 func TestUnknownPaths(t *testing.T) {
 	srv, _, _ := newTestServer(t)
-	for _, path := range []string{"/nope", "/merges/x", "/status/", "/static"} {
+	for _, path := range []string{"/nope", "/merges", "/merges/x", "/status/", "/static"} {
 		if rec := do(t, srv, http.MethodGet, path, ""); rec.Code != http.StatusNotFound {
 			t.Errorf("GET %s 状态码 = %d, 期望 404", path, rec.Code)
 		}
 	}
 	// 页面只接受 GET（HEAD 由 GET 模式隐式覆盖）；写方法一律 405。
-	if rec := do(t, srv, http.MethodPost, "/merges", ""); rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("POST /merges 状态码 = %d, 期望 405", rec.Code)
+	if rec := do(t, srv, http.MethodPost, "/status", ""); rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /status 状态码 = %d, 期望 405", rec.Code)
 	}
 }
 
@@ -176,8 +175,8 @@ func TestUnknownPaths(t *testing.T) {
 func TestStatusPageSettingsForm(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
-	// 顶栏令牌框在三页都有（写操作不止发生在 /status）。
-	for _, path := range []string{"/", "/merges", "/status"} {
+	// 顶栏令牌框在两页都有（写操作不止发生在 /status）。
+	for _, path := range []string{"/", "/status"} {
 		doc := parseDoc(t, do(t, srv, http.MethodGet, path, "").Body.Bytes())
 		if findNode(doc, func(n *html.Node) bool {
 			return isElement(n, "input") && attrOf(n, "id") == "admin-token"
@@ -201,6 +200,7 @@ func TestStatusPageSettingsForm(t *testing.T) {
 		"set-strm-prefix":      "即时",
 		"set-cache-max-mb":     "5 分钟",
 		"set-cache-lru-days":   "5 分钟",
+		"set-merge-chunk-size": "下次重建",
 		"set-refresh-interval": "60 秒",
 	}
 	labels := map[string]string{}

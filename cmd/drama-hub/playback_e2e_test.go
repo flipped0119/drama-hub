@@ -517,6 +517,8 @@ func TestPlaybackFullEpisode(t *testing.T) {
 		store.KeyStreamSecret: e2eSecret,
 		store.KeySegTargetSec: "10",
 		store.KeyCacheDir:     filepath.Join(t.TempDir(), "cache"),
+		// 每个 subtest 都用 e<episode.id> 直接取某集的播放单元：夹具按 N=1 布置。
+		store.KeyMergeChunkSize: "1",
 	} {
 		if err := settings.Set(ctx, k, v); err != nil {
 			t.Fatalf("Set %s: %v", k, err)

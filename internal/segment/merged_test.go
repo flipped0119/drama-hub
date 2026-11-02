@@ -15,7 +15,8 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// mergedRig 在基础测试台上再加一个合并组：两集各 indexTarget 秒，成员按 1→2 顺序。
+// mergedRig 在基础测试台上放两集，每集 indexTarget 秒。默认 N=10 会把这两集并成
+// 一个合并块（addEpisode 每次都会重建派生表，等价于生产里同步完成后的重建）。
 //
 // 返回 (rig, 合并集 uid, 两集源时长之和)。
 func mergedRig(t *testing.T, segTarget string) (*rig, string, float64) {
@@ -28,19 +29,8 @@ func mergedRig(t *testing.T, segTarget string) (*rig, string, float64) {
 		sum += probeDuration(t, path)
 		r.addEpisode(t, i, 6)
 	}
-	ids := make([]int64, 0, 2)
-	eps, err := r.st.ListEpisodes(context.Background(), r.dramaID)
-	if err != nil {
-		t.Fatalf("ListEpisodes: %v", err)
-	}
-	for _, ep := range eps {
-		ids = append(ids, ep.ID)
-	}
-	gid, err := r.st.CreateMergeGroup(context.Background(), r.dramaID, "第1-2集", ids)
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
-	return r, "m" + strconv.FormatInt(gid, 10), sum
+	// uid 形态的真值在 store（m<dramaID>_<epFrom>_<epTo>）。
+	return r, fmt.Sprintf("m%d_1_2", r.dramaID), sum
 }
 
 // TestBuildPlaylist_TimelineAndDiscontinuity 覆盖 playlist 的纯函数形态：
@@ -148,22 +138,22 @@ func TestPlaylist_MergedEndToEnd(t *testing.T) {
 func TestMergedSlice_CrossEpisode(t *testing.T) {
 	r, uid, _ := mergedRig(t, "4")
 	ctx := context.Background()
-	// 先请求 playlist：合并组的分片索引由这次请求按需建立。
+	// 先请求 playlist：合并块的分片索引由这次请求按需建立。
 	if rec := r.do(t, http.MethodGet, "/video/"+r.id(uid)+".m3u8"); rec.Code != http.StatusOK {
 		t.Fatalf("playlist 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
 	}
 
-	members, err := r.st.ListMergeMembers(ctx, 1)
+	members, err := r.st.ListEpisodesInRange(ctx, r.dramaID, 1, 2)
 	if err != nil {
-		t.Fatalf("ListMergeMembers: %v", err)
+		t.Fatalf("ListEpisodesInRange: %v", err)
 	}
 	var eps []EpisodeSegments
 	for _, m := range members {
-		segs, err := r.st.ListSegments(ctx, m.EpisodeID)
+		segs, err := r.st.ListSegments(ctx, m.ID)
 		if err != nil {
-			t.Fatalf("ListSegments(%d): %v", m.EpisodeID, err)
+			t.Fatalf("ListSegments(%d): %v", m.ID, err)
 		}
-		eps = append(eps, EpisodeSegments{EpisodeID: m.EpisodeID, EpNo: m.EpNo, Segments: segs})
+		eps = append(eps, EpisodeSegments{EpisodeID: m.ID, EpNo: m.EpNo, Segments: segs})
 	}
 	tl := NewTimeline(eps)
 
@@ -191,16 +181,17 @@ func TestMergedSlice_CrossEpisode(t *testing.T) {
 			t.Errorf("越界 seq %s 状态码 = %d, 期望 404", bad, rec.Code)
 		}
 	}
-	// `m-1` 不在这里：id 形态是 `<uid>-<签名>`，uid 里带 `-` 时拆出的 uid 就不是 `m-1`，
-	// 按契约落 401（签名不对）而不是 404。真实 uid 永远不含 `-`（`e<id>` / `m<id>`）。
-	for _, badUID := range []string{"m0", "m99999"} {
+	// uid 里带 `-` 的场景不在这里：id 形态是 `<uid>-<签名>`，拆出的 uid 就不是原值，
+	// 按契约落 401（签名不对）而不是 404。真实 uid 永远不含 `-`
+	// （`e<id>` / `m<dramaID>_<from>_<to>`）。
+	for _, badUID := range []string{"m0_1_2", "m99999_1_2", "m1_1"} {
 		if rec := r.do(t, http.MethodGet, "/video/"+r.id(badUID)+".m3u8"); rec.Code != http.StatusNotFound {
 			t.Errorf("非法/未知合并 uid %q 状态码 = %d, 期望 404", badUID, rec.Code)
 		}
 	}
 }
 
-// TestMerged_IndexOnDemand 覆盖「索引按需建立」对合并组同样成立：清掉某成员的索引后
+// TestMerged_IndexOnDemand 覆盖「索引按需建立」对合并块同样成立：清掉某成员的索引后
 // 再请求，索引被重建而不是 503（禁止批量预建，但不等于不给播）。
 func TestMerged_IndexOnDemand(t *testing.T) {
 	r, uid, _ := mergedRig(t, "4")
@@ -209,11 +200,11 @@ func TestMerged_IndexOnDemand(t *testing.T) {
 		t.Fatalf("首次 playlist 状态码 = %d, 期望 200", rec.Code)
 	}
 
-	members, err := r.st.ListMergeMembers(ctx, 1)
+	members, err := r.st.ListEpisodesInRange(ctx, r.dramaID, 1, 2)
 	if err != nil {
-		t.Fatalf("ListMergeMembers: %v", err)
+		t.Fatalf("ListEpisodesInRange: %v", err)
 	}
-	cleared := members[1].EpisodeID
+	cleared := members[1].ID
 	if err := r.st.ReplaceSegments(ctx, cleared, nil); err != nil {
 		t.Fatalf("清空成员索引: %v", err)
 	}

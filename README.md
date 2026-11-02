@@ -59,19 +59,17 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.ts` | GET / HEAD | 200/206/401/404/502/503 | MPEG-TS 分片：本地缓存命中即回，未命中现切并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
-| `/`、`/merges`、`/status` | GET | 200 | 管理界面三页：剧目 / 合并编排 / 同步与缓存看板 |
+| `/`、`/status` | GET | 200 | 管理界面两页：剧目 / 同步与缓存看板 |
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
 | `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
-| `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集、合并组、对外集号） |
-| `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集，供合并编排挑选 |
-| `/api/dramas/{id}/merge-groups` | GET / POST | 200 / 201 | 合并组列表 / 建组（`episode_ids` 顺序即时间轴顺序） |
-| `/api/merge-groups/{id}` | DELETE | 204 | 删组并重建对外集号 |
+| `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集与对外集号） |
+| `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集（按 `ep_no` 升序） |
 | `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`admin_token_set`（写操作能不能用） |
 | `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |
 | 其它未登记路径 | 任意 | 404 | 由 web 的 mux 兜底 |
 
 对外 id 是 HMAC 常量签名（ADR-0003）：`id = uid + "-" + hex(HMAC-SHA256(secret,
-uid))[:12]`，`uid` 是 `e<episode.id>`（单集）或 `m<merge_group.id>`（合并集），secret 取
+uid))[:12]`，`uid` 是 `e<episode.id>`（单集）或 `m<dramaID>_<epFrom>_<epTo>`（合并集），secret 取
 `settings.stream_secret`。一个 id 同时给 playlist 与分片用，无过期、无 token 表、不落库；
 签名错 → 401，`uid` 不在派生表里 → 404，解析不到直链或上游失败 → 502。
 
@@ -89,23 +87,25 @@ ffmpeg 失败 → 502 且不写缓存。
 `<cache_dir>/seg/`，命中零外呼、并发同一片只生成一次（single-flight），按
 `cache_max_mb` / `cache_lru_days` 淘汰（`docs/CACHE-MODEL.md`）。
 
-合并集（`uid = m<group_id>`）是虚拟 HLS 分片聚合：playlist 在集边界插
+合并集（`uid = m<dramaID>_<epFrom>_<epTo>`）是虚拟 HLS 分片聚合：playlist 在集边界插
 `#EXT-X-DISCONTINUITY`，分片 URL 是 `/video/{id}/{seq}.ts`，seq 是跨集连续时间轴；切片
-按 `seq → (集号, 集内秒)` 解析，`-output_ts_offset` 保证跨集时间戳连续。合并编排
-（N 集并 1）在管理界面 `/merges` 里做，重建 `emby_item` 派生表。
+按 `seq → (集号, 集内秒)` 解析，`-output_ts_offset` 保证跨集时间戳连续。
+
+**合并是自动的**（ADR-0010）：每部剧的集按 `settings.merge_chunk_size`（默认 10）切连续
+块，第 i 块占对外集号 i，块内 1 集走单集规则、≥2 集是合并集。改这个值后，下一次重建
+`emby_item`（同步完成 / 首播回填）即生效，旧 id 随即 404；不需要人工编排。
 
 ## 管理界面
 
-三页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
+两页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
 
 | 页面 | 能干的事 |
 |---|---|
-| `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、合并组、对外集号） |
-| `/merges` 合并编排 | 选剧 → 按想要的播放顺序点集 → 建组（点击顺序即时间轴顺序）→ 删组；已入组的集不可重复选 |
-| `/status` 同步与缓存 | 剧目/集/对外集/合并组计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / strm 前缀 / 缓存上限与保留期 / 刷新间隔，直接写 `PATCH /api/settings`）、运行配置现状（密钥只显示是否已设置，每行标「生效时机」）、各源调度状态 |
+| `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、对外集号） |
+| `/status` 同步与缓存 | 剧目/集/对外集计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / strm 前缀 / 缓存上限与保留期 / 合并分块集数 / 刷新间隔，直接写 `PATCH /api/settings`）、运行配置现状（密钥只显示是否已设置，每行标「生效时机」）、各源调度状态 |
 
 页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。写操作（同步 /
-删除 / 建组 / 改配置）要先用顶栏的「管理令牌」填上 `DRAMA_HUB_ADMIN_TOKEN`，令牌只存在
+删除 / 改配置）要先用顶栏的「管理令牌」填上 `DRAMA_HUB_ADMIN_TOKEN`，令牌只存在
 本标签页（`sessionStorage`）。
 
 缓存由本服务自己负责（ADR-0007）：海报、分片、关键帧索引落 `<cache_dir>`，按
@@ -227,10 +227,11 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
   - `docs/L1-CORPUS-SCOPE.md` — 「获取全部的剧集」口径与红果实测数字
   - `docs/adr/0006-framework-plugin-boundary.md` — 框架 / 插件边界决策
   - `docs/adr/0007-own-hls-and-local-cache.md` — 播放统一走自造 HLS、缓存收回本服务
+  - `docs/adr/0010-auto-merge-chunking.md` — 合并集自动分块、手工编排移除
   - `docs/adr/0008-image-publish.md` — 镜像发布口径：ghcr、双架构、ci 绿才发、`latest` 跟 main
 
 ## 状态
 
-实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、合并编排与派生表重建齐备。R1（管理界面三页）已实现：剧目增删、合并编排、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
+实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、按 `merge_chunk_size` 自动分块与派生表重建齐备。R1（管理界面两页）已实现：剧目增删、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
 
 设计基线见 MKACG-580 附件 `DESIGN-drama-hub.md`。

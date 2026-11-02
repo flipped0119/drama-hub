@@ -772,6 +772,8 @@ func TestBackfillLocksDramaBeforeEpisode(t *testing.T) {
 func TestConcurrentBackfillAndSync(t *testing.T) {
 	db := newCRUDTestDB(t)
 	st := NewStore(db.DB)
+	// 本测试验的是锁序与不重复行，N=1 让「每集一条对外剧集」成为可数的期望值。
+	setChunkSize(t, st, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 

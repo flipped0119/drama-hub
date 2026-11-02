@@ -162,7 +162,7 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // `/webdav/` 是只读元数据面。1.0 的 `/dav/` 与 `/s/{token}/*` 已退役，不留兼容层
 // （`.strm` 是按请求渲染的，下一次读取就是新内容）。
 //
-// 管理面挂在 `/` 上：`internal/web` 自己按完整路径分派三页界面与 `/api/` 子树，
+// 管理面挂在 `/` 上：`internal/web` 自己按完整路径分派两页界面与 `/api/` 子树，
 // 未登记路径由它返回 404。/webdav/ 与 /video/ 的 pattern 比 `/` 更具体，不受影响。
 //
 // 请求日志中间件只在装配根挂一次：/healthz、/webdav/、/video/、/ 与未知路径都经它，

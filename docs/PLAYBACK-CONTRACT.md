@@ -34,13 +34,16 @@
 
 ```
 id = uid + "-" + hex(HMAC-SHA256(stream_secret, uid)[:12])
-uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid 的两个空间）
+uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自动分块的块句柄）
 ```
 
 - 形如 `e1234-9f3a1c02b7d4`（约 17 字符），对外是一个不透明 id。
-- **稳定**：`uid` 只依赖 `episode.id` / `merge_group.id`，而这两者不随
-  `emby_item` 重建而变（重建只换 `emby_item.id`）。→ 同一集/同一合并组的 URL 永久不变，
-  缓存键不会漂（ADR-0003 立的不变量在这里继续成立）。
+- **稳定**：单集 `uid` 只依赖 `episode.id`；合并集 `uid` 只依赖
+  `(dramaID, 块内集号区间)`，不含 `emby_item` 的自增主键。→ 集集合与 `merge_chunk_size`
+  不变时，同一集/同一块在 `emby_item` 整体重建后 URL 逐字符不变，缓存键不会漂
+  （ADR-0003 与 ADR-0010 的不变量在这里继续成立）。
+- **分隔符**：合并集 uid 用 `_` 分段，**不含 `-`**。id 是 `<uid>-<签名>`，
+  `stream.ParseID` 按首个 `-` 切；uid 里带 `-` 会把 404 顶成 401。
 - **无状态**：不查表、不落库、不过期。校验 = 拆出 `uid`、重算 HMAC、常数时间比较。
 - **不可猜**：没有 `stream_secret` 造不出合法 id。
 - 换 `stream_secret` 后所有 URL 失效（与现状一致，`docs/DEV-STANDARDS.md`「鉴权」已这么定）。
@@ -48,18 +51,18 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 **D1 已定（lxz 2026-10-30）**：「可以不用 UUID，只要保证不飘移即可」。因此就是上面这个方案。
 
 **为什么不是 RFC-4122 UUID**：真 UUID 要么落库（`emby_item` 整体重建会换值 → URL 飘 →
-缓存全废），要么挂到 `episode` / `merge_group`（两张表各加一列 + 一次迁移），
-换来的只是「看起来像 UUID」。而「不飘移」这个真正的要求，签名 id 用一条恒等式就满足了：
-`id` 只由 `uid` 与 `stream_secret` 决定，`uid` 只由 `episode.id` / `merge_group.id` 决定，
-这两样在库的整个生命周期里都不变。
+缓存全废），要么挂到 `episode` / 新建一张块表（各加一列 + 一次迁移），换来的只是
+「看起来像 UUID」。而「不飘移」这个真正的要求，签名 id 用一条恒等式就满足了：
+`id` 只由 `uid` 与 `stream_secret` 决定，`uid` 只由 `episode.id` / `(dramaID, 集号区间)`
+决定，这两样在「集集合与 N 不变」时都不变。
 
 **「不飘移」的可验证形式**（必须有一条测试钉住）：
 
 ```
 1. 同一集连续 GET /video/{id}.m3u8 两次 → 两次的 {id} 逐字符相同
 2. 触发一次全量刷新（UpsertEpisode + RebuildEmbyItems）后再取 → {id} 仍然相同
-3. 建/删一个合并组，使某集在 single 与 merged 之间转换 → 该集 old id 返回 **404**
-   （`e<id>` 已不在 `emby_item` 里，签名仍然有效所以要区分 401 与 404）、
+3. 改 `merge_chunk_size` 并重建，使某集在 single 与 merged 之间转换 → 该集 old id 返回
+   **404**（`e<id>` 已不在 `emby_item` 里，签名仍然有效所以要区分 401 与 404）、
    new id 稳定；**未受影响的其它集 id 一个都不变**
 4. 重启进程（settings 不变）→ 所有 {id} 不变
 ```
@@ -89,8 +92,8 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
   改成 `/video/{id}/{seq}.ts`。
 - playlist 是 `segment` 表的**纯函数视图**，不落盘、不缓存（理由见 `docs/CACHE-MODEL.md`
   「为什么 m3u8 文本不缓存」）。
-- `uid` 是单集时切片空间 = 本集片内序；是合并组时 = 跨集连续时间轴（现有 `Timeline`）。
-  **两条路径现在都走 HLS**，单集不再是特例。
+- `uid` 是单集时切片空间 = 本集片内序；是合并块时 = 块内成员集的跨集连续时间轴
+  （现有 `Timeline`）。**两条路径现在都走 HLS**，单集不再是特例。
 
 | 情形 | 状态码 |
 |---|---|
@@ -169,7 +172,7 @@ uid ∈ { "e<episode.id>", "m<merge_group.id>" }   （沿用现网 emby_item.uid
 | `/webdav/…` | PROPFIND / GET | 只读虚拟文件系统 |
 | `/video/{id}.m3u8` | GET / HEAD | 播放列表 |
 | `/video/{id}/{seq}.ts` | GET / HEAD | 分片 |
-| `/api/dramas` / `/api/dramas/{id}/…` / `/api/merge-groups` | — | 管理 API（不变） |
+| `/api/dramas` / `/api/dramas/{id}/…` | — | 管理 API |
 | `/api/refresh` | POST | 手动触发一轮刷新（`docs/SCHEDULER-MODEL.md`） |
 | `/api/status` | GET | 含各源调度状态（同上） |
 | `/healthz` | GET | 存活探测（不变） |

@@ -25,7 +25,7 @@
 #   FFMPEG/FFPROBE  ffmpeg / ffprobe 可执行文件，默认 PATH 里的
 #   RCLONE          rclone 可执行文件，默认 PATH 里的
 #   PLAY_SECONDS    F 段实播秒数，默认 60（预览只有 10.07 秒，播过 60 秒即证明不是预览）
-#   MERGE_EPISODES  G 段合并组成员集号，默认 "1,2,3"
+#   MERGE_CHUNK_ALT G 段「改 N」用的目标值，默认 5（验完自动改回原值）
 # ------------------------------------------------------------------ 输出约定
 # 所有外部命令都带 timeout，脚本不会挂死。
 set -uo pipefail
@@ -46,7 +46,7 @@ FFMPEG=${FFMPEG:-ffmpeg}
 FFPROBE=${FFPROBE:-ffprobe}
 RCLONE=${RCLONE:-rclone}
 PLAY_SECONDS=${PLAY_SECONDS:-60}
-MERGE_EPISODES=${MERGE_EPISODES:-1,2,3}
+MERGE_CHUNK_ALT=${MERGE_CHUNK_ALT:-5}
 
 WORK=${WORK:-$(mktemp -d)}
 trap 'rm -rf "$WORK"' EXIT
@@ -107,7 +107,18 @@ rclone_setup() {
     user "$WEBDAV_USER" pass "$WEBDAV_PASS" --non-interactive >/dev/null 2>&1
 }
 
-# refresh_list 重列一遍虚拟目录树（建/删合并组会改派生表，清单必须重取）
+# strm_id_for_uid 从已刷新的清单里找某个 uid 的 .strm id（没有则空）。
+strm_id_for_uid() { # strm_id_for_uid <uid>
+  local want=$1 line id
+  for line in $(season_files "$(find_show_dir)" strm | sed 's/ /%20/g'); do
+    line=${line//%20/ }
+    id=$(strm_id "$line")
+    [ -n "$id" ] && [ "${id%%-*}" = "$want" ] && { echo "$id"; return 0; }
+  done
+  return 1
+}
+
+# refresh_list 重列一遍虚拟目录树（改 N 并重建会改派生表，清单必须重取）
 refresh_list() {
   rclone_setup
   timeout 300 "$RCLONE" lsf --files-only -R dramahub:/ >"$WORK/list.txt" 2>/dev/null
@@ -377,7 +388,7 @@ PY
       bad_strm=$((bad_strm + 1))
       continue
     fi
-    if ! printf '%s\n' "$ep" | grep -qE '^[em][0-9]+-[0-9a-f]{12}$'; then
+    if ! printf '%s\n' "$ep" | grep -qE '^(e[0-9]+|m[0-9]+_[0-9]+_[0-9]+)-[0-9a-f]{12}$'; then
       bad_strm=$((bad_strm + 1))
     fi
     local code
@@ -687,117 +698,185 @@ stage_F() {
 }
 
 # ------------------------------------------------------------------ G 合并集
+# 判据（ADR-0010）：分块是自动的，不需要也不允许人工建组。
+#   G1 对外集数 = ceil(集数 / N)
+#   G2 每块 ep_no 连续、uid 形态正确（single e<id> / merged m<drama>_<a>_<b>）
+#   G3 合并块的 playlist 集边界有 DISCONTINUITY、seq 从 0 连续
+#   G4 合并块 playlist 的总时长 ≈ 块内成员 duration_sec 之和（误差 ≤2s）
+#   G5 改 N 后重建：对外集数变 ceil(集数 / 新 N)（无需重启）
+#   G6 旧合并 id 的 .m3u8 变 404（签名仍合法，不返回别人的内容）
 stage_G() {
-  section "G 合并集（虚拟 HLS 聚合）"
+  section "G 合并集（自动分块 + 虚拟 HLS 聚合）"
   if [ -z "$DRAMA_ID" ] || ! db_ready; then
     skip G1 "合并集：需要 C 段同步成功与 PG_CONTAINER"
     return
   fi
-  # 清掉上次验收留下的合并组：否则同一批集会因为「已在合并组里」建组 400
-  api GET "/api/dramas/$DRAMA_ID/merge-groups" >/dev/null
-  python3 -c 'import json,sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for g in d.get("groups", []):
-    if g["label"].startswith("验收"):
-        print(g["id"])' <"$WORK/api.body" | while read -r gid; do
-    [ -n "$gid" ] && timeout 60 curl -sS -o /dev/null -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/api/merge-groups/$gid"
-  done
-  local ids=()
-  local e
-  for e in ${MERGE_EPISODES//,/ }; do
-    local eid
-    eid=$(dbq "SELECT id FROM episode WHERE drama_id=$DRAMA_ID AND ep_no=$e")
-    [ -z "$eid" ] && { fail G1 "取第 $e 集的 episode.id 失败"; return; }
-    ids+=("$eid")
-  done
-  local json
-  json=$(python3 -c 'import sys,json
-ids=[int(x) for x in sys.argv[1:]]
-print(json.dumps({"label":"验收合并组","episode_ids":ids}))' "${ids[@]}")
-  local out code
-  code=$(api POST "/api/dramas/$DRAMA_ID/merge-groups" "$json")
-  out=$(cat "$WORK/api.body")
-  if [ "$code" != "201" ] && [ "$code" != "200" ]; then
-    fail G1 "建合并组期望 201，实得 $code — $(echo "$out" | head -c 200)"
+
+  local eps chunk
+  if [ -z "$SERIES_ID" ]; then
+    info "" "未给 SERIES_ID：改 N 的 G5/G6 会 SKIP（重建只能由同步或首播触发）"
+  fi
+  eps=$(dbq "SELECT count(*) FROM episode WHERE drama_id=$DRAMA_ID")
+  chunk=$(dbq "SELECT value_json FROM settings WHERE key='merge_chunk_size'" | tr -d '"')
+  [ -z "$chunk" ] && chunk=10
+  if ! printf '%s' "$eps" | grep -qE '^[0-9]+$' || ! printf '%s' "$chunk" | grep -qE '^[0-9]+$'; then
+    skip G1 "取不到集数或 merge_chunk_size（DRAMA_ID=$DRAMA_ID）"
     return
   fi
-  pass G1 "建 3 集合并组 → $code"
+  if [ "$eps" -eq 0 ]; then
+    skip G1 "这部剧 0 集：分块没有可判定的对象"
+    return
+  fi
+  info "" "剧 id=$DRAMA_ID 集数=$eps N=$chunk"
 
-  local mgid mid
-  mgid=$(echo "$out" | python3 -c 'import json,sys
-print(json.load(sys.stdin)["groups"][-1]["id"])' 2>/dev/null)
-  mid=$(dbq "SELECT uid FROM emby_item WHERE kind='merged' AND drama_id=$DRAMA_ID LIMIT 1")
-  if [ -z "$mid" ]; then
-    fail G2 "派生表里没有合并集行"
+  # G1 对外集数 = ceil(集数 / N)
+  local want_items got_items
+  want_items=$(( (eps + chunk - 1) / chunk ))
+  got_items=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
+  if [ "$got_items" = "$want_items" ]; then
+    pass G1 "对外集数 = ceil($eps/$chunk) = $want_items（emby_item 行数一致）"
   else
-    local id
-    id=$(echo "$mid" | sed 's/^m//')
-    # 合并组一建，派生表与虚拟目录都变了：先刷新清单，再按 uid 找合并集的 .strm
-    info "" "合并组 id=$mgid uid=$mid"
-    rclone_setup
-    timeout 300 "$RCLONE" lsf --files-only -R dramahub:/ >"$WORK/list.txt" 2>/dev/null
-    id=$(season_files "$(find_show_dir)" strm | sed 's/ /%20/g' | while read -r l; do
-      l=${l//%20/ }
-      local sid
-      sid=$(strm_id "$l")
-      [ "${sid%%-*}" = "$mid" ] && echo "$sid"
-    done | head -1)
-    if [ -z "$id" ]; then
-      fail G2 "找不到合并集的 .strm（派生表可能有行但目录没渲染出来）"
+    fail G1 "对外集数 = $got_items, 期望 ceil($eps/$chunk) = $want_items"
+  fi
+
+  # G2 块号连续、kind 与 uid 形态一致
+  local bad_no=0 bad_uid=0 expected_no=0 ep_no kind uid
+  while IFS='|' read -r ep_no kind uid; do
+    [ -z "$ep_no" ] && continue
+    expected_no=$((expected_no + 1))
+    [ "$ep_no" = "$expected_no" ] || bad_no=$((bad_no + 1))
+    case "$kind" in
+      single) printf '%s' "$uid" | grep -qE '^e[0-9]+$' || bad_uid=$((bad_uid + 1)) ;;
+      merged) printf '%s' "$uid" | grep -qE "^m${DRAMA_ID}_[0-9]+_[0-9]+$" || bad_uid=$((bad_uid + 1)) ;;
+      *) bad_uid=$((bad_uid + 1)) ;;
+    esac
+  done <<EOF
+$(dbq "SELECT ep_no || '|' || kind || '|' || uid FROM emby_item WHERE drama_id=$DRAMA_ID ORDER BY ep_no")
+EOF
+  if [ "$bad_no" -eq 0 ] && [ "$bad_uid" -eq 0 ]; then
+    pass G2 "$got_items 块：对外集号 1..$got_items 连续，uid 形态全部正确"
+  else
+    fail G2 "块号不连续 $bad_no 条、uid 形态错误 $bad_uid 条"
+  fi
+
+  # 找一个合并块（块内 ≥2 集）：G3/G4 只对它有意义。N=1 或集数不足时跳过。
+  local muid=""
+  muid=$(dbq "SELECT uid FROM emby_item WHERE drama_id=$DRAMA_ID AND kind='merged' ORDER BY ep_no LIMIT 1")
+  if [ -z "$muid" ]; then
+    skip G3 "没有合并块（N=1 或集数 ≤1），无法验 DISCONTINUITY"
+    skip G4 "没有合并块，无法验总时长"
+  else
+    local mid from to wantdur m_ep_no
+    m_ep_no=$(dbq "SELECT ep_no FROM emby_item WHERE uid='$muid'")
+    refresh_list
+    mid=$(item_uid_for_ep "$(find_show_dir)" "$m_ep_no")
+    from=$(dbq "SELECT split_part(substr(uid, 2), '_', 2) FROM emby_item WHERE uid='$muid'")
+    to=$(dbq "SELECT split_part(substr(uid, 2), '_', 3) FROM emby_item WHERE uid='$muid'")
+    if [ -z "$mid" ]; then
+      fail G3 "清单里找不到合并块 $muid 的 .strm（派生表有行但目录没渲染出来？）"
+      fail G4 "合并块 $muid 的 playlist 取不到 id"
     else
-      local code2
-      code2=$(http_code "$BASE/video/$id.m3u8")
-      if [ "$code2" = "200" ]; then
-        timeout 60 curl -sS "$BASE/video/$id.m3u8" >"$WORK/merge.m3u8"
-        if grep -q '#EXT-X-DISCONTINUITY' "$WORK/merge.m3u8"; then
-          pass G2 "合并集 playlist 含 #EXT-X-DISCONTINUITY — $(grep -c '#EXT-X-DISCONTINUITY' "$WORK/merge.m3u8") 处"
-        else
-          fail G2 "合并集 playlist 缺 #EXT-X-DISCONTINUITY"
-        fi
-        # seq 连续：从 0 开始逐个递增
-        local seqs
-        seqs=$(grep -oE '/video/[^/]+/[0-9]+\.ts' "$WORK/merge.m3u8" | grep -oE '[0-9]+\.ts$' | tr -d 't.s' | tr '\n' ' ')
-        if [ -n "$seqs" ] && [ "$(printf '%s' "$seqs" | awk '{for(i=1;i<=NF;i++) if($i!=i-1){bad=1}} END{print bad+0}')" = "0" ]; then
-          pass G3 "合并集分片 seq 从 0 连续 — $(echo $seqs | awk '{print $1".."$NF}')"
-        else
-          fail G3 "合并集分片 seq 不连续 — $seqs"
-        fi
-        # seek 到中段取一个分片
-        local mid_seq
-        mid_seq=$(echo $seqs | awk '{print int(NF/2)}')
-        local scode
-        scode=$(http_code "$BASE/video/$id/$mid_seq.ts")
-        if [ "$scode" = "200" ]; then
-          pass G4 "seek 到中段 seq=$mid_seq → 200"
-        else
-          fail G4 "seek 到中段 seq=$mid_seq 期望 200，实得 $scode"
-        fi
-        # 总时长 ≈ Σ各集
-        local wantdur
-        wantdur=$(dbq "SELECT coalesce(sum(e.duration_sec),0) FROM merge_item mi JOIN episode e ON e.id=mi.episode_id WHERE mi.group_id=$mgid")
-        local gotdur
-        gotdur=$(timeout 180 "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$BASE/video/$id.m3u8" 2>/dev/null | head -1)
-        if [ -n "$gotdur" ] && [ -n "$wantdur" ]; then
-          if python3 -c "import sys;sys.exit(0 if abs(float('$gotdur')-float('$wantdur'))<=2 else 1)" 2>/dev/null; then
-            pass G5 "合并集总时长 ${gotdur}s ≈ Σ各集 ${wantdur}s（误差 ≤2s）"
-          else
-            fail G5 "合并集总时长 ${gotdur}s ≠ Σ各集 ${wantdur}s"
-          fi
-        else
-          fail G5 "合并集总时长取不到（got=${gotdur:-?} want=${wantdur:-?}）"
-        fi
+      local code body
+      code=$(http_code "$BASE/video/$mid.m3u8")
+      if [ "$code" != "200" ]; then
+        fail G3 "合并块 playlist 期望 200，实得 $code"
+        fail G4 "合并块 playlist 不可用"
       else
-        fail G2 "合并集 playlist 期望 200，实得 $code2 — $(timeout 60 curl -sS "$BASE/video/$id.m3u8" | head -c 200)"
-        fail G3 "合并集 seq — playlist 不可用"
-        fail G4 "合并集 seek — playlist 不可用"
-        fail G5 "合并集总时长 — playlist 不可用"
+        body=$(timeout 60 curl -sS "$BASE/video/$mid.m3u8" 2>/dev/null)
+        local want_disc got_disc
+        # 成员数 - 1（集号可能缺号，不能用 to - from 当边界数）
+        want_disc=$(dbq "SELECT count(*) - 1 FROM episode WHERE drama_id=$DRAMA_ID AND ep_no BETWEEN $from AND $to")
+        got_disc=$(printf '%s\n' "$body" | grep -c '#EXT-X-DISCONTINUITY')
+        if [ "$got_disc" = "$want_disc" ]; then
+          pass G3 "合并块 第${from}-${to}集：DISCONTINUITY $got_disc 处（= 成员集数 - 1）"
+        else
+          fail G3 "合并块 第${from}-${to}集：DISCONTINUITY $got_disc 处，期望 $want_disc"
+        fi
+        local seqs
+        seqs=$(printf '%s\n' "$body" | grep -oE '/video/[^/]+/[0-9]+\.ts' | grep -oE '[0-9]+\.ts$' | tr -d 't.s' | tr '\n' ' ')
+        if [ -n "$seqs" ] && [ "$(printf '%s' "$seqs" | awk '{for(i=1;i<=NF;i++) if($i!=i-1) bad=1; END{print bad+0}')" = "0" ]; then
+          info "" "分片 seq 从 0 连续：$(echo $seqs | awk '{print $1".."$NF}')"
+        else
+          fail G3 "分片 seq 不连续 — $seqs"
+        fi
+
+        wantdur=$(dbq "SELECT coalesce(sum(duration_sec),0) FROM episode WHERE drama_id=$DRAMA_ID AND ep_no BETWEEN $from AND $to")
+        local gotdur
+        gotdur=$(timeout 180 "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$BASE/video/$mid.m3u8" 2>/dev/null | head -1)
+        if [ -n "$gotdur" ] && [ -n "$wantdur" ] && python3 -c "import sys;sys.exit(0 if abs(float('$gotdur')-float('$wantdur'))<=2 else 1)" 2>/dev/null; then
+          pass G4 "合并块总时长 ${gotdur}s ≈ Σ成员 ${wantdur}s（误差 ≤2s）"
+        else
+          # 成员集从未播放过时 duration_sec 仍为 0（首播回填），这种情况不能判失败。
+          if [ "$wantdur" = "0" ]; then
+            skip G4 "成员集 duration_sec 全为 0（还没首播回填），无法比对总时长"
+          else
+            fail G4 "合并块总时长 ${gotdur:-?}s ≠ Σ成员 ${wantdur}s"
+          fi
+        fi
       fi
     fi
-    # 清理：删掉验收用的合并组，避免影响后续重跑
-    timeout 60 curl -sS -o /dev/null -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/api/merge-groups/$mgid" 2>/dev/null
+  fi
+
+  # G5/G6 改 N 生效：N 只在「下一次重建」生效，验收用一次重新同步触发重建。
+  if [ -z "$SERIES_ID" ]; then
+    skip G5 "改 N：未给 SERIES_ID，无法触发重建"
+    skip G6 "改 N：同 G5"
+    return
+  fi
+  if [ "$MERGE_CHUNK_ALT" = "$chunk" ]; then
+    skip G5 "MERGE_CHUNK_ALT=$MERGE_CHUNK_ALT 与原 N 相同，改 N 不可判定"
+    skip G6 "同 G5"
+    return
+  fi
+  local old_uid want_alt got_alt old_code old_id=""
+  old_uid="$muid"
+  if [ -n "$old_uid" ]; then
+    old_id=$(strm_id_for_uid "$old_uid")
+  fi
+  local set_code
+  set_code=$(api PATCH "/api/settings" "{\"settings\":{\"merge_chunk_size\":\"$MERGE_CHUNK_ALT\"}}")
+  if [ "$set_code" != "200" ]; then
+    fail G5 "PATCH merge_chunk_size=$MERGE_CHUNK_ALT 期望 200，实得 $set_code — $(head -c 200 "$WORK/api.body")"
+    fail G6 "改 N 失败，G6 无法判定"
+    return
+  fi
+  local sync_code
+  sync_code=$(api POST "/api/dramas" "{\"series_id\":\"$SERIES_ID\"}")
+  if [ "$sync_code" != "200" ] && [ "$sync_code" != "201" ]; then
+    fail G5 "重新同步（触发重建）期望 200/201，实得 $sync_code — $(head -c 200 "$WORK/api.body")"
+    fail G6 "重建失败，G6 无法判定"
+    return
+  fi
+  refresh_list
+  want_alt=$(( (eps + MERGE_CHUNK_ALT - 1) / MERGE_CHUNK_ALT ))
+  got_alt=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
+  if [ "$got_alt" = "$want_alt" ]; then
+    pass G5 "N=$MERGE_CHUNK_ALT 重建后对外集数 = ceil($eps/$MERGE_CHUNK_ALT) = $want_alt（无需重启）"
+  else
+    fail G5 "N=$MERGE_CHUNK_ALT 重建后对外集数 = $got_alt, 期望 $want_alt"
+  fi
+  # 旧 uid 已不在派生表里 → 旧 id 走 404（签名仍合法，不能变 401、不能返回别人的内容）
+  if [ -n "${old_id:-}" ]; then
+    old_code=$(http_code "$BASE/video/$old_id.m3u8")
+    if [ "$old_code" = "404" ]; then
+      pass G6 "改 N 后旧合并 id 的 playlist → 404"
+    else
+      fail G6 "改 N 后旧合并 id 期望 404，实得 $old_code"
+    fi
+  else
+    skip G6 "没有可复用的旧合并 id（原 N 下没有合并块）"
+  fi
+
+  # 改回原 N 并重建一次，避免影响后续段与重跑。
+  api PATCH "/api/settings" "{\"merge_chunk_size\":\"$chunk\"}" >/dev/null
+  api POST "/api/dramas" "{\"series_id\":\"$SERIES_ID\"}" >/dev/null
+  refresh_list
+  local restored
+  restored=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
+  if [ "$restored" = "$want_items" ]; then
+    info "" "已把 merge_chunk_size 改回 $chunk（对外集数 $restored）"
+  else
+    info "" "警告：改回 N=$chunk 后对外集数 = $restored，期望 $want_items（看板与后续段可能受影响）"
   fi
 }
 

@@ -202,14 +202,20 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 - `episode.source` = 插件名（`"web"`）。
 - `drama.episode_total` = `episode_cnt`；`drama.sync_at` = 本次刷新时间（UTC RFC3339）。
 
-### 合并数据
+### 合并数据（自动分块，ADR-0010）
 
-- `merge_group` / `merge_item` **完全不新增、不修改**。
-- **刷新不冲掉编排**：这是结构保证——刷新只做 `UpsertDrama` / `UpsertEpisode` /
-  `RebuildEmbyItems`，而 `RebuildEmbyItems` 是**读** `merge_group` + `merge_item`
-  再重算派生表（`internal/store/merge.go:232` 起），不写这两张表。
-- 需要 Review 的一条：任何新的刷新代码 **MUST NOT** 写 `merge_*`，也 MUST NOT
-  `DELETE FROM emby_item`（那是 `RebuildEmbyItems` 的职责，它整体替换但保留合并语义）。
+- 合并集**没有自己的表**：分块是纯派生，结果只活在 `emby_item` 里。原手工编排的
+  `merge_group` / `merge_item` 已由迁移 `0005` 删除。
+- 分块规则：取该剧 `episode`（`ORDER BY ep_no`）按 `settings.merge_chunk_size`
+  （默认 10）切**连续列表切片**（不是 `ep_no` 数值区间，缺号不产生空位），第 i 块 →
+  `emby_item.ep_no = i`；对外集数 = `ceil(集数 / N)`，0 集 → 0 行、不留空组。
+- 块内 1 集 → `kind=single`、`uid=e<episode.id>`；≥2 集 → `kind=merged`、
+  `uid=m<dramaID>_<epFrom>_<epTo>`、`runtime_sec = Σ成员时长`。
+- 改 N 后**下一次重建**生效：旧 uid 从派生表消失，`/video/{oldid}` 走既有 404 分支。
+- **刷新不冲掉分块语义**：刷新只做 `UpsertDrama` / `UpsertEpisode` / `RebuildEmbyItems`，
+  重建读的是 `episode` + 现读的 N，所以集集合与 N 不变时 uid 逐字符不变。
+- 需要 Review 的一条：任何新的刷新代码 MUST NOT `DELETE FROM emby_item`（那是
+  `RebuildEmbyItems` 的职责，它整体替换但按当前 N 重算）。
 
 ### 播放入口（直链不落库）
 
@@ -241,9 +247,9 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 | 源里新增剧目 | 插入 | L1 的正向情形 |
 | 源里新增集（连载中） | 追加 `ep_no` 更大的行，`episode_total` 更新 | 现有 `UpsertEpisode` 已支持 |
 | 源里剧目标题/简介/封面/标签变化 | 覆盖 | 上游是真值 |
-| 源里集数变少 | **不删任何 `episode` 行**，只更新 `episode_total` | 删除会连带删 `merge_item`（`ON DELETE CASCADE`），静默破坏人工编排；少集的剧在 Emby 里多出几集，比丢掉编排轻 |
+| 源里集数变少 | **不删任何 `episode` 行**，只更新 `episode_total` | 删集会让分块边界前移、把已看过的集重新编号（旧 id 全失效）；少集的剧在 Emby 里多出几集，比整部重排轻 |
 | 源里剧目消失（下架） | **不删 `drama` 行**，只在 `source_state.last_error` / 日志里留痕 | 同上；且 sitemap 会滞后（实测最新 53 部缺失），把「枚举不到」当「下架」会误删正在上架的剧 |
-| 用户显式删剧 | `DELETE FROM drama`（现有 `DeleteDrama`，级联删集与编排） | 唯一删除入口 |
+| 用户显式删剧 | `DELETE FROM drama`（现有 `DeleteDrama`，级联删集与对外集号） | 唯一删除入口 |
 
 一句话：**自动流程只增改，删除只能由人发起。**
 

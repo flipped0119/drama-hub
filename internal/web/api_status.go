@@ -20,11 +20,10 @@ import (
 
 // totalsView 是看板顶部要的全局计数。
 type totalsView struct {
-	Dramas      int    `json:"dramas"`
-	Episodes    int    `json:"episodes"`
-	EmbyItems   int    `json:"emby_items"`
-	MergeGroups int    `json:"merge_groups"`
-	LastSyncAt  string `json:"last_sync_at"`
+	Dramas     int    `json:"dramas"`
+	Episodes   int    `json:"episodes"`
+	EmbyItems  int    `json:"emby_items"`
+	LastSyncAt string `json:"last_sync_at"`
 }
 
 // configView 是运行配置的现状快照：全部字段都是真在跑的现读值。密钥类配置只报
@@ -33,14 +32,17 @@ type totalsView struct {
 // 2.0 明确不做缓存预热（MKACG-603 范围表），1.0 预留的 seg_prefetch / pin_days 两个
 // 死键已删除（MKACG-616）：看板不再展示没有任何消费者的配置项。
 type configView struct {
-	StrmPrefix      string `json:"strm_prefix"`
-	SegTargetSec    int    `json:"seg_target_sec"`
-	CacheDir        string `json:"cache_dir"`
-	CacheMaxMB      int    `json:"cache_max_mb"`
-	CacheLRUDays    int    `json:"cache_lru_days"`
-	StreamSecretSet bool   `json:"stream_secret_set"`
-	WebDAVUserSet   bool   `json:"webdav_user_set"`
-	WebDAVPassSet   bool   `json:"webdav_pass_set"`
+	StrmPrefix   string `json:"strm_prefix"`
+	SegTargetSec int    `json:"seg_target_sec"`
+	CacheDir     string `json:"cache_dir"`
+	CacheMaxMB   int    `json:"cache_max_mb"`
+	CacheLRUDays int    `json:"cache_lru_days"`
+	// MergeChunkSize 是「几集并一条对外剧集」（docs/adr/0010）；改完下一次重建
+	// （同步完成 / 首播回填）生效。
+	MergeChunkSize  int  `json:"merge_chunk_size"`
+	StreamSecretSet bool `json:"stream_secret_set"`
+	WebDAVUserSet   bool `json:"webdav_user_set"`
+	WebDAVPassSet   bool `json:"webdav_pass_set"`
 	// 刷新调度的三项：状态页要逐键标「生效时机」，其中 interval 是页面可直接改的
 	// 那一项（≤60 秒后调度器按新值算下一轮）。
 	RefreshIntervalSec int `json:"refresh_interval_sec"`
@@ -106,7 +108,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, st := range stats {
 		totals.Episodes += st.Episodes
 		totals.EmbyItems += st.EmbyItems
-		totals.MergeGroups += st.MergeGroups
 	}
 	for _, d := range dramas {
 		// sync_at 是 UTC RFC3339 文本，字典序即时间序，不需要解析。
@@ -158,6 +159,10 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 	if err != nil {
 		return configView{}, fmt.Errorf("读 cache_lru_days: %w", err)
 	}
+	mergeChunk, err := s.settings.Int(ctx, store.KeyMergeChunkSize)
+	if err != nil {
+		return configView{}, fmt.Errorf("读 merge_chunk_size: %w", err)
+	}
 	refreshSec, err := s.settings.Int(ctx, store.KeyRefreshIntervalSec)
 	if err != nil {
 		return configView{}, fmt.Errorf("读 refresh_interval_sec: %w", err)
@@ -176,6 +181,7 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 		CacheDir:           cacheDir,
 		CacheMaxMB:         cacheMaxMB,
 		CacheLRUDays:       cacheLRUDays,
+		MergeChunkSize:     mergeChunk,
 		RefreshIntervalSec: refreshSec,
 		RefreshBatch:       refreshBatch,
 		RefreshTimeoutSec:  refreshTimeout,

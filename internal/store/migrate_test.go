@@ -102,10 +102,68 @@ func TestMigrateToLatest(t *testing.T) {
 
 	want := []string{
 		"artifact", "drama", "emby_item", "episode",
-		"merge_group", "merge_item", "schema_migrations", "segment", "settings", "source_state",
+		"schema_migrations", "segment", "settings", "source_state",
 	}
 	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
 		t.Fatalf("表集合 = %v, 期望 %v", got, want)
+	}
+}
+
+// AC（升级路径，MKACG-649）：0005 删表时顺手清掉新代码读不动的旧合并派生行。
+//
+// 旧版本把合并集 uid 写成 `m<merge_group.id>`，新的形态真值（store.ParseMergedUID）
+// 解不了它 —— 留着会让该剧 Season 01 的列举直接报错（vfs → webdav PROPFIND 失败），
+// 而自愈点只有下一次重建。派生表本来就是重建的产物：迁移清掉这些行，单集行保留。
+func TestMigrate0005DropsLegacyMergedRows(t *testing.T) {
+	db := openRaw(t)
+	ctx := context.Background()
+	files, err := migrations()
+	if err != nil {
+		t.Fatalf("读取迁移清单: %v", err)
+	}
+	// 停在 0004：merge_group / merge_item 还在，emby_item 允许旧形态 uid。
+	if _, err := migrateFiles(ctx, db, files[:4]); err != nil {
+		t.Fatalf("迁移到 0004: %v", err)
+	}
+	var dramaID int64
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO drama(provider, provider_id, title) VALUES('web','m1','旧库') RETURNING id`,
+	).Scan(&dramaID); err != nil {
+		t.Fatalf("插入 drama: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO emby_item(drama_id, season, ep_no, kind, uid, runtime_sec) VALUES
+		 ($1, 1, 1, 'merged', 'm7', 120),
+		 ($1, 1, 2, 'single', 'e1', 60),
+		 ($1, 1, 3, 'merged', 'm1_1_2', 60)`, dramaID); err != nil {
+		t.Fatalf("插入 emby_item: %v", err)
+	}
+
+	if _, err := migrateFiles(ctx, db, files); err != nil {
+		t.Fatalf("迁移到最新: %v", err)
+	}
+
+	rows, err := db.QueryContext(ctx,
+		`SELECT uid FROM emby_item WHERE drama_id = $1 ORDER BY uid`, dramaID)
+	if err != nil {
+		t.Fatalf("查 emby_item: %v", err)
+	}
+	defer rows.Close()
+	var uids []string
+	for rows.Next() {
+		var uid string
+		if err := rows.Scan(&uid); err != nil {
+			t.Fatalf("扫描 uid: %v", err)
+		}
+		uids = append(uids, uid)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("遍历 emby_item: %v", err)
+	}
+	// 旧形态 m7 被删；单集 e1 与新形态 m1_1_2 保留（后者证明规则不误删）。
+	want := []string{"e1", "m1_1_2"}
+	if !reflect.DeepEqual(uids, want) {
+		t.Fatalf("迁移后 uid = %v, 期望 %v（旧合并行必须清掉）", uids, want)
 	}
 }
 

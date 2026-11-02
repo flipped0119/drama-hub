@@ -11,7 +11,6 @@
   <span class="wordmark">drama-hub</span>
   <nav class="tabs" aria-label="管理页">
     <a href="/"{{if eq .Page "dramas"}} aria-current="page"{{end}}>剧目</a>
-    <a href="/merges"{{if eq .Page "merges"}} aria-current="page"{{end}}>合并编排</a>
     <a href="/status"{{if eq .Page "status"}} aria-current="page"{{end}}>同步与缓存</a>
   </nav>
   <!-- 写操作（同步/删除/改配置）要带 X-Admin-Token；令牌只存在本标签页的 sessionStorage。 -->

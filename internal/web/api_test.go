@@ -154,16 +154,10 @@ func decode[T any](t *testing.T, rec *httptest.ResponseRecorder) T {
 	return out
 }
 
-// TestAPI_ListDramas 覆盖剧目列表的形状与计数：episodes / emby_items /
-// merge_groups 都来自库内真实数据。
+// TestAPI_ListDramas 覆盖剧目列表的形状与计数：episodes / emby_items 都来自库内真实数据。
 func TestAPI_ListDramas(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	id := seedDrama(t, st, "1001", "宴律", []string{"a", "b", "c"})
-	if _, err := st.CreateMergeGroup(context.Background(), id, "第 2-3 集", []int64{
-		mustEpisodeID(t, st, id, 2), mustEpisodeID(t, st, id, 3),
-	}); err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
+	seedDrama(t, st, "1001", "宴律", []string{"a", "b", "c"})
 
 	rec := do(t, srv, http.MethodGet, "/api/dramas", "")
 	if rec.Code != http.StatusOK {
@@ -180,12 +174,9 @@ func TestAPI_ListDramas(t *testing.T) {
 	if d.EpisodeTotal != 3 || d.Episodes != 3 {
 		t.Errorf("集数 = %d/%d, 期望 3/3", d.Episodes, d.EpisodeTotal)
 	}
-	// 3 集里两集并成 1 条对外剧集 + 剩下 1 集 = 2。
-	if d.EmbyItems != 2 {
-		t.Errorf("对外集 = %d, 期望 2", d.EmbyItems)
-	}
-	if d.MergeGroups != 1 {
-		t.Errorf("合并组 = %d, 期望 1", d.MergeGroups)
+	// 3 集、默认 N=10 → 1 条对外剧集（整部并成一块）。
+	if d.EmbyItems != 1 {
+		t.Errorf("对外集 = %d, 期望 1", d.EmbyItems)
 	}
 	if d.SyncAt != "2026-10-30T08:00:00Z" {
 		t.Errorf("sync_at = %q", d.SyncAt)
@@ -319,7 +310,7 @@ func TestAPI_DeleteDrama(t *testing.T) {
 	}
 }
 
-// TestAPI_Episodes 覆盖合并编排页的集列表：按 ep_no 升序、只回库里的字段。
+// TestAPI_Episodes 覆盖集列表：按 ep_no 升序、只回库里的字段。
 func TestAPI_Episodes(t *testing.T) {
 	srv, st, _ := newTestServer(t)
 	id := seedDrama(t, st, "3003", "选集的剧", []string{"a", "b", "c"})
@@ -341,65 +332,34 @@ func TestAPI_Episodes(t *testing.T) {
 	}
 }
 
-// TestAPI_MergeGroups 覆盖合并编排：成员顺序 = 提交顺序、POST 响应与 GET 一致、
-// 校验失败 400 且不落库、删除后列表清空。
-func TestAPI_MergeGroups(t *testing.T) {
+// TestAPI_MergesRemoved 覆盖「手工编排整体移除」：页面与三个 merge 端点都回到
+// 未登记路径（404），自动分组是唯一来源（docs/adr/0010）。
+func TestAPI_MergesRemoved(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	dramaID := seedDrama(t, st, "4004", "编排的剧", []string{"a", "b", "c", "d"})
-	path := "/api/dramas/" + strconv.Itoa(int(dramaID)) + "/merge-groups"
-	e1, e2, e3, e4 := mustEpisodeID(t, st, dramaID, 1), mustEpisodeID(t, st, dramaID, 2),
-		mustEpisodeID(t, st, dramaID, 3), mustEpisodeID(t, st, dramaID, 4)
+	dramaID := seedDrama(t, st, "4004", "分块的剧", []string{"a", "b", "c", "d"})
+	base := "/api/dramas/" + strconv.Itoa(int(dramaID))
 
-	// 故意倒序提交：ord 必须按提交顺序，不是按 ep_no。
-	body := `{"label":"第 3-1 集","episode_ids":[` + strconv.Itoa(int(e3)) + `,` + strconv.Itoa(int(e1)) + `]}`
-	rec := do(t, srv, http.MethodPost, path, body)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("状态码 = %d, 期望 201（body=%s）", rec.Code, rec.Body.String())
+	if rec := do(t, srv, http.MethodGet, "/merges", ""); rec.Code != http.StatusNotFound {
+		t.Errorf("GET /merges 状态码 = %d, 期望 404（页面已移除）", rec.Code)
 	}
-	created := decode[mergeGroupList](t, rec)
-	if len(created.Groups) != 1 {
-		t.Fatalf("合并组数 = %d, 期望 1", len(created.Groups))
+	for _, c := range []struct {
+		method, path, body string
+	}{
+		{http.MethodGet, base + "/merge-groups", ""},
+		{http.MethodPost, base + "/merge-groups", `{"label":"x","episode_ids":[1,2]}`},
+		{http.MethodDelete, "/api/merge-groups/1", ""},
+	} {
+		if rec := do(t, srv, c.method, c.path, c.body); rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s 状态码 = %d, 期望 404", c.method, c.path, rec.Code)
+		}
 	}
-	members := created.Groups[0].Members
-	if len(members) != 2 || members[0].EpisodeID != e3 || members[1].EpisodeID != e1 {
-		t.Fatalf("成员顺序 = %+v, 期望 [E3, E1]", members)
+	// 分块仍在：4 集、默认 N=10 → 1 条对外剧集。
+	items, err := st.ListEmbyItems(context.Background(), dramaID)
+	if err != nil {
+		t.Fatalf("ListEmbyItems: %v", err)
 	}
-	if members[0].Ord != 1 || members[1].Ord != 2 {
-		t.Errorf("ord = %d/%d, 期望 1/2", members[0].Ord, members[1].Ord)
-	}
-
-	listed := decode[mergeGroupList](t, do(t, srv, http.MethodGet, path, ""))
-	if len(listed.Groups) != 1 || listed.Groups[0].ID != created.Groups[0].ID ||
-		len(listed.Groups[0].Members) != 2 || listed.Groups[0].Members[0] != members[0] {
-		t.Errorf("POST 响应与 GET 不一致：\nPOST=%+v\nGET =%+v", created.Groups, listed.Groups)
-	}
-
-	// 只有 1 集 → store.ErrInvalid → 400，且不落库。
-	if rec := do(t, srv, http.MethodPost, path,
-		`{"label":"单集","episode_ids":[`+strconv.Itoa(int(e4))+`]}`); rec.Code != http.StatusBadRequest {
-		t.Errorf("单集建组状态码 = %d, 期望 400", rec.Code)
-	}
-	// 与新组重叠 → 400。
-	if rec := do(t, srv, http.MethodPost, path,
-		`{"label":"重叠","episode_ids":[`+strconv.Itoa(int(e3))+`,`+strconv.Itoa(int(e2))+`]}`); rec.Code != http.StatusBadRequest {
-		t.Errorf("重叠建组状态码 = %d, 期望 400", rec.Code)
-	}
-	if got := decode[mergeGroupList](t, do(t, srv, http.MethodGet, path, "")); len(got.Groups) != 1 {
-		t.Errorf("校验失败后合并组数 = %d, 期望 1（不能落库）", len(got.Groups))
-	}
-
-	// 删组：204，列表清空；再删同一个组 / 不存在的组都是 404。
-	if rec := do(t, srv, http.MethodDelete, "/api/merge-groups/"+strconv.Itoa(int(created.Groups[0].ID)), ""); rec.Code != http.StatusNoContent {
-		t.Fatalf("删组状态码 = %d, 期望 204", rec.Code)
-	}
-	if got := decode[mergeGroupList](t, do(t, srv, http.MethodGet, path, "")); len(got.Groups) != 0 {
-		t.Errorf("删组后仍有 %d 个合并组", len(got.Groups))
-	}
-	if rec := do(t, srv, http.MethodDelete, "/api/merge-groups/99999", ""); rec.Code != http.StatusNotFound {
-		t.Errorf("删不存在的组状态码 = %d, 期望 404", rec.Code)
-	}
-	if rec := do(t, srv, http.MethodGet, "/api/dramas/99999/merge-groups", ""); rec.Code != http.StatusNotFound {
-		t.Errorf("不存在的剧查合并组状态码 = %d, 期望 404", rec.Code)
+	if len(items) != 1 || items[0].Kind != "merged" {
+		t.Fatalf("派生表 = %+v, 期望 1 条 merged", items)
 	}
 }
 
@@ -421,12 +381,15 @@ func TestAPI_Status(t *testing.T) {
 	}
 	got := decode[statusView](t, rec)
 	if got.Totals.Dramas != 1 || got.Totals.Episodes != 2 ||
-		got.Totals.EmbyItems != 2 || got.Totals.LastSyncAt != "2026-10-30T08:00:00Z" {
+		got.Totals.EmbyItems != 1 || got.Totals.LastSyncAt != "2026-10-30T08:00:00Z" {
 		t.Errorf("totals = %+v", got.Totals)
 	}
 	if got.Config.SegTargetSec != 10 || got.Config.CacheDir != "./data/cache" ||
 		got.Config.CacheMaxMB != 8192 || got.Config.CacheLRUDays != 30 {
 		t.Errorf("配置默认值 = %+v, 期望 10 / ./data/cache / 8192 / 30", got.Config)
+	}
+	if got.Config.MergeChunkSize != 10 {
+		t.Errorf("merge_chunk_size 默认值 = %d, 期望 10", got.Config.MergeChunkSize)
 	}
 	if !got.Config.StreamSecretSet {
 		t.Error("stream_secret_set = false, 期望 true")
@@ -531,22 +494,6 @@ func TestNormalizeSeriesID(t *testing.T) {
 type errorBodyShape struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
-}
-
-// mustEpisodeID 取某剧第 no 集的 id。
-func mustEpisodeID(t *testing.T, st *store.Store, dramaID int64, no int) int64 {
-	t.Helper()
-	eps, err := st.ListEpisodes(context.Background(), dramaID)
-	if err != nil {
-		t.Fatalf("ListEpisodes: %v", err)
-	}
-	for _, ep := range eps {
-		if ep.EpNo == no {
-			return ep.ID
-		}
-	}
-	t.Fatalf("剧 %d 没有第 %d 集", dramaID, no)
-	return 0
 }
 
 // 插件被停用时看板给出原因：停用不是故障，但必须看得见（AC：插件未启用/配置缺失

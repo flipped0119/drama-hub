@@ -1,7 +1,7 @@
 'use strict';
 /* drama-hub 管理面脚本。
  *
- * 一套通用请求/渲染小工具 + 三个页面的 init，靠 body[data-page] 分派。
+ * 一套通用请求/渲染小工具 + 两个页面的 init，靠 body[data-page] 分派。
  * 只用原生 DOM API、不引框架、没有构建步骤（ADR-0002）；页面数据一律来自
  * /api/ 下的 JSON 端点，渲染结果与 API 返回一一对应。 */
 
@@ -121,7 +121,6 @@ function initDramas() {
         el('td', { class: 'num', text: drama.year === 0 ? '—' : String(drama.year) }),
         el('td', { class: 'num', text: drama.episodes + ' / ' + drama.episode_total }),
         el('td', { class: 'num', text: String(drama.emby_items) }),
-        el('td', { class: 'num', text: String(drama.merge_groups) }),
         el('td', { class: 'mono', text: fmtTime(drama.sync_at) }),
         el('td', { class: 'num' }, deleteBtn)));
     }
@@ -135,7 +134,7 @@ function initDramas() {
 
   async function removeDrama(drama) {
     const ok = window.confirm('删除《' + drama.title + '》？它的 ' + drama.episodes +
-      ' 集与 ' + drama.merge_groups + ' 个合并组会一并删除。');
+      ' 集会一并删除。');
     if (!ok) return;
     try {
       await api('DELETE', '/api/dramas/' + drama.id);
@@ -167,192 +166,6 @@ function initDramas() {
   reload().catch(fail);
 }
 
-// ---- 合并编排页 ----
-
-function initMerges() {
-  const select = document.getElementById('drama-select');
-  const groupBody = document.getElementById('groups');
-  const groupsEmpty = document.getElementById('groups-empty');
-  const episodeBox = document.getElementById('episodes');
-  const editorHint = document.getElementById('editor-hint');
-  const selectionHint = document.getElementById('selection-hint');
-  const labelInput = document.getElementById('group-label');
-  const createBtn = document.getElementById('create-group');
-
-  let episodes = [];
-  let groups = [];
-  let selected = []; // 按点击顺序排列的 episode id，下标 + 1 就是合并集时间轴上的 ord
-  let episodeButtons = new Map(); // episode id → 按钮节点，换剧时重建
-
-  function takenEpisodeIds() {
-    const taken = new Map();
-    for (const group of groups) {
-      for (const member of group.members) taken.set(member.episode_id, group.label);
-    }
-    return taken;
-  }
-
-  function renderGroups() {
-    groupBody.replaceChildren();
-    for (const group of groups) {
-      const order = group.members
-        .map((member) => el('span', { class: 'tag', text: 'E' + member.ep_no }))
-        .reduce((acc, chip) => acc.concat([chip, el('span', { class: 'mono', text: '→' })]), [])
-        .slice(0, -1);
-      groupBody.append(el('tr', {},
-        el('td', { text: group.label }),
-        el('td', {}, el('div', { class: 'members' }, order)),
-        el('td', { class: 'num' }, el('button', {
-          type: 'button', class: 'btn ghost', text: '删除',
-          onclick: () => removeGroup(group),
-        }))));
-    }
-    groupsEmpty.hidden = groups.length !== 0;
-  }
-
-  // buildEpisodeButtons 只在换剧时调用：按钮节点建一次，之后的选中/禁用状态靠
-  // paintEpisodeState 就地改写。每次点选都重建节点会把 .episodes 的滚动位置弹回顶部
-  // —— 一部剧有 76 集时，点了第 50 集还看得见它，靠的就是不重建。
-  function buildEpisodeButtons() {
-    episodeBox.replaceChildren();
-    episodeButtons = new Map();
-    for (const episode of episodes) {
-      const button = el('button', {
-        type: 'button',
-        class: 'ep',
-        text: 'E' + episode.ep_no,
-        title: episode.title || episode.vid,
-        'aria-label': '第 ' + episode.ep_no + ' 集',
-      });
-      button.addEventListener('click', () => toggle(episode.id));
-      episodeButtons.set(episode.id, button);
-      episodeBox.append(button);
-    }
-    paintEpisodeState(takenEpisodeIds());
-  }
-
-  // paintEpisodeState 就地刷新「是否已在合并组」与「选中顺序」两个状态。
-  function paintEpisodeState(taken) {
-    for (const episode of episodes) {
-      const button = episodeButtons.get(episode.id);
-      const ord = selected.indexOf(episode.id) + 1;
-      const inGroup = taken.has(episode.id);
-      button.disabled = inGroup;
-      button.setAttribute('aria-pressed', ord > 0 ? 'true' : 'false');
-      if (ord > 0) button.setAttribute('data-ord', String(ord));
-      else button.removeAttribute('data-ord');
-    }
-    syncSelectionHint();
-  }
-
-  function syncSelectionHint() {
-    createBtn.disabled = selected.length < 2;
-    if (selected.length === 0) {
-      selectionHint.textContent = '已选 0 集：按播放顺序点集，至少 2 集。';
-      return;
-    }
-    const order = selected.map((id) => {
-      const episode = episodes.find((item) => item.id === id);
-      return 'E' + episode.ep_no;
-    });
-    selectionHint.textContent = '已选 ' + selected.length + ' 集：' + order.join(' → ');
-  }
-
-  function toggle(episodeId) {
-    const index = selected.indexOf(episodeId);
-    if (index >= 0) selected.splice(index, 1);
-    else selected.push(episodeId);
-    paintEpisodeState(takenEpisodeIds());
-  }
-
-  function autoLabel() {
-    const numbers = selected
-      .map((id) => episodes.find((item) => item.id === id).ep_no)
-      .sort((a, b) => a - b);
-    if (numbers.length === 0) return '';
-    const from = numbers[0];
-    const to = numbers[numbers.length - 1];
-    return from === to ? '第 ' + from + ' 集' : '第 ' + from + '-' + to + ' 集';
-  }
-
-  async function reloadGroups() {
-    const data = await api('GET', '/api/dramas/' + select.value + '/merge-groups');
-    groups = data.groups;
-    selected = selected.filter((id) => !takenEpisodeIds().has(id));
-    renderGroups();
-    paintEpisodeState(takenEpisodeIds());
-  }
-
-  async function removeGroup(group) {
-    try {
-      await api('DELETE', '/api/merge-groups/' + group.id);
-      await reloadGroups();
-      say('已删除合并组「' + group.label + '」（对外集号已重建）', 'ok');
-    } catch (err) {
-      fail(err);
-    }
-  }
-
-  async function loadDrama() {
-    const id = select.value;
-    selected = [];
-    labelInput.value = '';
-    if (!id) {
-      episodes = [];
-      groups = [];
-      renderGroups();
-      buildEpisodeButtons();
-      editorHint.textContent = '还没有剧目：先去剧目页同步一部。';
-      return;
-    }
-    const [episodeData, groupData] = await Promise.all([
-      api('GET', '/api/dramas/' + id + '/episodes'),
-      api('GET', '/api/dramas/' + id + '/merge-groups'),
-    ]);
-    episodes = episodeData.episodes;
-    groups = groupData.groups;
-    editorHint.textContent = '已在合并组里的集不可再选（合并组之间不重叠）。';
-    renderGroups();
-    buildEpisodeButtons();
-  }
-
-  select.addEventListener('change', () => {
-    loadDrama().catch(fail);
-  });
-
-  createBtn.addEventListener('click', async () => {
-    const label = labelInput.value.trim() || autoLabel();
-    createBtn.disabled = true;
-    try {
-      const data = await api('POST', '/api/dramas/' + select.value + '/merge-groups', {
-        label,
-        episode_ids: selected,
-      });
-      groups = data.groups;
-      selected = [];
-      labelInput.value = '';
-      renderGroups();
-      paintEpisodeState(takenEpisodeIds());
-      say('已建合并组「' + label + '」（对外集号已重建）', 'ok');
-    } catch (err) {
-      createBtn.disabled = false;
-      fail(err);
-    }
-  });
-
-  (async () => {
-    const data = await api('GET', '/api/dramas');
-    select.replaceChildren();
-    for (const drama of data.dramas) {
-      select.append(el('option', {
-        value: String(drama.id),
-        text: drama.title + ' (' + drama.year + ') · ' + drama.episodes + ' 集',
-      }));
-    }
-    await loadDrama();
-  })().catch(fail);
-}
-
 // ---- 同步与缓存看板 ----
 
 function initStatus() {
@@ -369,6 +182,7 @@ function initStatus() {
     strm_prefix: 'set-strm-prefix',
     cache_max_mb: 'set-cache-max-mb',
     cache_lru_days: 'set-cache-lru-days',
+    merge_chunk_size: 'set-merge-chunk-size',
     refresh_interval_sec: 'set-refresh-interval',
   };
 
@@ -466,6 +280,8 @@ function initStatus() {
         'cache_max_mb，0 = 不按大小淘汰；下一轮淘汰生效'),
       row('缓存保留', c.cache_lru_days + ' 天', '≤5 分钟',
         'cache_lru_days，超过 N 天未命中的条目删除'),
+      row('合并分块集数', c.merge_chunk_size + ' 集 / 对外集', '下次重建',
+        'merge_chunk_size，每 N 集并成 1 条对外剧集；改完下一次同步或首播回填重建派生表时生效，旧 id 随即 404'),
       row('刷新间隔', c.refresh_interval_sec + ' 秒', '≤60 秒',
         'refresh_interval_sec，一轮到期 = 上次运行 + 本值'),
       row('每轮存量部数', String(c.refresh_batch), '即时', 'refresh_batch，0 = 关闭存量轮转'),
@@ -519,7 +335,6 @@ function initStatus() {
       stat('剧目', String(t.dramas)),
       stat('集', String(t.episodes)),
       stat('对外集', String(t.emby_items)),
-      stat('合并组', String(t.merge_groups)),
       stat('最近同步', fmtTime(t.last_sync_at), true));
     renderConfig(status.config);
     sourcesBody.replaceChildren(...status.sources.map(sourceRow));
@@ -582,5 +397,4 @@ function initStatus() {
 initAdminToken();
 const page = document.body.dataset.page;
 if (page === 'dramas') initDramas();
-else if (page === 'merges') initMerges();
 else if (page === 'status') initStatus();

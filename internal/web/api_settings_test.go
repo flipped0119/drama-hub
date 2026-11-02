@@ -86,7 +86,7 @@ func TestAPI_PatchSettings(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
 	rec := do(t, srv, http.MethodPatch, "/api/settings",
-		`{"settings":{"webdav_user":"alice","webdav_pass":"s3cret","strm_prefix":"http://media.example:9000/","cache_max_mb":"4096","refresh_interval_sec":"900"}}`)
+		`{"settings":{"webdav_user":"alice","webdav_pass":"s3cret","strm_prefix":"http://media.example:9000/","cache_max_mb":"4096","merge_chunk_size":"5","refresh_interval_sec":"900"}}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PATCH 状态码 = %d, 期望 200（body=%s）", rec.Code, rec.Body.String())
 	}
@@ -100,6 +100,9 @@ func TestAPI_PatchSettings(t *testing.T) {
 	if got := body.Settings["cache_max_mb"]; got != float64(4096) {
 		t.Errorf("cache_max_mb 返回值 = %v, 期望 4096（数字）", got)
 	}
+	if got := body.Settings["merge_chunk_size"]; got != float64(5) {
+		t.Errorf("merge_chunk_size 返回值 = %v, 期望 5（数字）", got)
+	}
 	if got, ok := body.Settings["webdav_pass"]; !ok || got != nil {
 		t.Errorf("webdav_pass 应回 null（不回显），实际 = %v（存在=%v）", got, ok)
 	}
@@ -110,7 +113,7 @@ func TestAPI_PatchSettings(t *testing.T) {
 	// 写进去的值立刻是现读值：/api/status 与页面显示的就是它。
 	got := decode[statusView](t, do(t, srv, http.MethodGet, "/api/status", ""))
 	if got.Config.StrmPrefix != "http://media.example:9000" || got.Config.CacheMaxMB != 4096 ||
-		got.Config.RefreshIntervalSec != 900 {
+		got.Config.MergeChunkSize != 5 || got.Config.RefreshIntervalSec != 900 {
 		t.Errorf("config = %+v, 期望刚写入的值", got.Config)
 	}
 	if !got.Config.WebDAVUserSet || !got.Config.WebDAVPassSet {
@@ -148,6 +151,8 @@ func TestAPI_PatchSettingsRejectsBatch(t *testing.T) {
 	}{
 		{"未知键", `{"settings":{"webdav_user":"alice","nope":"1"}}`},
 		{"越界值", `{"settings":{"webdav_user":"alice","cache_max_mb":"1048577"}}`},
+		{"分块超过上限", `{"settings":{"merge_chunk_size":"501"}}`},
+		{"分块下界为 1（0 非法）", `{"settings":{"merge_chunk_size":"0"}}`},
 		{"负数", `{"settings":{"cache_max_mb":"-1"}}`},
 		{"非数字", `{"settings":{"cache_max_mb":"abc"}}`},
 		{"空请求", `{"settings":{}}`},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,7 +13,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -632,9 +632,9 @@ func TestSyncSeriesCoverUnavailableIsNotFailure(t *testing.T) {
 	t.Logf("warn 日志：%s", strings.TrimSpace(got))
 }
 
-// AC：先编排合并组，再触发一次同步 → merge_group / merge_item 一行不变，派生表
-// 仍保留合并语义（刷新只增改 drama/episode，绝不写 merge_*）。
-func TestSyncKeepsMergeGroups(t *testing.T) {
+// AC：自动分块按 merge_chunk_size 在派生表里重算；刷新（UpsertEpisode + 重建派生表）
+// 不得冲掉分块语义，且集集合不变时 uid 逐字符不变。
+func TestSyncRechunksByChunkSize(t *testing.T) {
 	ctx := context.Background()
 	_, srv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series.html"))
 	st := newTestStore(t)
@@ -652,22 +652,30 @@ func TestSyncKeepsMergeGroups(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListEpisodes: %v", err)
 	}
-	groupID, err := st.CreateMergeGroup(ctx, d.ID, "第 1-2 集", []int64{eps[0].ID, eps[1].ID})
-	if err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
-
-	groupsBefore, err := st.ListMergeGroups(ctx, d.ID)
-	if err != nil {
-		t.Fatalf("ListMergeGroups: %v", err)
-	}
-	membersBefore, err := st.ListMergeMembers(ctx, groupID)
-	if err != nil {
-		t.Fatalf("ListMergeMembers: %v", err)
+	// fixture 有 76 集，默认 N=10 → 8 块（10×7 + 6）。
+	if len(eps) != 76 {
+		t.Fatalf("集数 = %d, 期望 fixture 的 76 集", len(eps))
 	}
 	embyBefore, err := st.ListEmbyItems(ctx, d.ID)
 	if err != nil {
 		t.Fatalf("ListEmbyItems: %v", err)
+	}
+	if len(embyBefore) != 8 {
+		t.Fatalf("对外集数 = %d, 期望 8（ceil(76/10)）", len(embyBefore))
+	}
+	if want := fmt.Sprintf("m%d_1_10", d.ID); embyBefore[0].UID != want {
+		t.Fatalf("第一块 uid = %q, 期望 %q", embyBefore[0].UID, want)
+	}
+	last := embyBefore[len(embyBefore)-1]
+	if last.EpFrom != 71 || last.EpTo != 76 {
+		t.Fatalf("最后一块覆盖 %d-%d, 期望 71-76", last.EpFrom, last.EpTo)
+	}
+	uidsBefore := make([]string, len(embyBefore))
+	for i, it := range embyBefore {
+		uidsBefore[i] = it.UID
+		if it.Kind != "merged" {
+			t.Fatalf("第 %d 条 kind = %q, 期望 merged", i+1, it.Kind)
+		}
 	}
 
 	clock.advance(time.Hour)
@@ -675,40 +683,15 @@ func TestSyncKeepsMergeGroups(t *testing.T) {
 		t.Fatalf("刷新同步: %v", err)
 	}
 
-	groupsAfter, err := st.ListMergeGroups(ctx, d.ID)
-	if err != nil {
-		t.Fatalf("ListMergeGroups(刷新后): %v", err)
-	}
-	membersAfter, err := st.ListMergeMembers(ctx, groupID)
-	if err != nil {
-		t.Fatalf("ListMergeMembers(刷新后): %v", err)
-	}
-	if !reflect.DeepEqual(groupsBefore, groupsAfter) {
-		t.Fatalf("刷新冲掉了 merge_group：%+v → %+v", groupsBefore, groupsAfter)
-	}
-	if !reflect.DeepEqual(membersBefore, membersAfter) {
-		t.Fatalf("刷新冲掉了 merge_item：%+v → %+v", membersBefore, membersAfter)
-	}
-
-	// 派生表整体重建（UID 稳定），合并语义保留：m<groupID> 仍是那条对外集。
 	embyAfter, err := st.ListEmbyItems(ctx, d.ID)
 	if err != nil {
 		t.Fatalf("ListEmbyItems(刷新后): %v", err)
 	}
-	if len(embyAfter) != len(embyBefore) {
-		t.Fatalf("刷新后对外集数 = %d, 期望 %d（合并组占 1 个）", len(embyAfter), len(embyBefore))
+	uidsAfter := make([]string, len(embyAfter))
+	for i, it := range embyAfter {
+		uidsAfter[i] = it.UID
 	}
-	mergedUID := "m" + strconv.FormatInt(groupID, 10)
-	found := false
-	for _, it := range embyAfter {
-		if it.UID == mergedUID {
-			found = true
-			if it.Kind != "merged" || it.EpFrom != eps[0].EpNo || it.EpTo != eps[1].EpNo {
-				t.Fatalf("重建后的合并集 = %+v, 期望 kind=merged 覆盖第 1-2 集", it)
-			}
-		}
-	}
-	if !found {
-		t.Fatalf("刷新后派生表里找不到合并集 %s", mergedUID)
+	if !reflect.DeepEqual(uidsBefore, uidsAfter) {
+		t.Fatalf("刷新后 uid 变了（分块不飘移的前提）：\n%v\n%v", uidsBefore, uidsAfter)
 	}
 }

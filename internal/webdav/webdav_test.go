@@ -86,6 +86,8 @@ func newFixture(t *testing.T) fixture {
 		store.KeyWebDAVPass:   pass,
 		store.KeyStrmPrefix:   prefix,
 		store.KeyStreamSecret: secret,
+		// 夹具是「每集一条对外剧集」：本文件验的是 WebDAV 协议，不是分块。
+		store.KeyMergeChunkSize: "1",
 	} {
 		if err := settings.Set(ctx, key, value); err != nil {
 			t.Fatalf("Set %s: %v", key, err)

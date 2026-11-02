@@ -4,8 +4,8 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// EpisodeSegments 是时间轴上的一集：分片索引（按 start_sec 升序）。供合并集
-// （M7）按 merge_item.ord 组装成连续 seq 空间时传入。
+// EpisodeSegments 是时间轴上的一集：分片索引（按 start_sec 升序）。合并集把块内
+// 成员集的索引按 ep_no 顺序拼成连续 seq 空间时传入。
 type EpisodeSegments struct {
 	EpisodeID int64
 	EpNo      int

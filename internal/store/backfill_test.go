@@ -126,15 +126,14 @@ func TestBackfillEpisodeDuration_KeepsNonZero(t *testing.T) {
 }
 
 // TestBackfillEpisodeDuration_MergedRuntimeSum 钉住「派生表必须整体重算」这条：
-// 合并集的 runtime_sec 是组内时长之和，回填其中一个成员后必须跟着变。
+// 合并块的 runtime_sec 是块内时长之和，回填其中一个成员后必须跟着变。
 func TestBackfillEpisodeDuration_MergedRuntimeSum(t *testing.T) {
 	ctx := context.Background()
 	st := NewStore(newCRUDTestDB(t).DB)
 	did, eps := seedZeroDurationDrama(t, st, 3)
 
-	if _, err := st.CreateMergeGroup(ctx, did, "第1-2集", eps[:2]); err != nil {
-		t.Fatalf("CreateMergeGroup: %v", err)
-	}
+	// N=2：第 1-2 集并成一条对外剧集，第 3 集自成一集。
+	setChunkSize(t, st, 2)
 	if _, err := st.BackfillEpisodeDuration(ctx, eps[0], 60); err != nil {
 		t.Fatalf("回填 eps[0]: %v", err)
 	}
