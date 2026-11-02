@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,6 +31,7 @@ type fakeCDN struct {
 	mu       sync.Mutex
 	status   int
 	body     []byte
+	delay    time.Duration // 回包前的等待，只用于「让并发请求真的重叠」
 	requests int
 }
 
@@ -51,8 +53,9 @@ func newFakeCDN(t *testing.T) (*fakeCDN, *httptest.Server) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		f.mu.Lock()
 		f.requests++
-		status, body := f.status, f.body
+		status, body, delay := f.status, f.body, f.delay
 		f.mu.Unlock()
+		time.Sleep(delay)
 		if status == http.StatusOK {
 			w.Header().Set("Content-Type", "image/jpeg")
 		}
@@ -78,7 +81,7 @@ func newTestCoverCache(t *testing.T, srv *httptest.Server, cacheDir string) (*Co
 	if err := settings.Set(ctx, store.KeyCacheDir, cacheDir); err != nil {
 		t.Fatalf("设置 cache_dir: %v", err)
 	}
-	c := NewCoverCache(st, settings, srv.Client())
+	c := NewCoverCache(st, settings, srv.Client(), slog.New(slog.DiscardHandler))
 	c.now = func() time.Time { return time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC) }
 	return c, st
 }
@@ -319,4 +322,205 @@ func listFiles(t *testing.T, root string) []string {
 		t.Fatalf("遍历缓存目录: %v", err)
 	}
 	return out
+}
+
+// MKACG-650：poster.jpg 的内容取自本地封面缓存——命中时一个字节都不回源。
+func TestPosterReadsLocalWithoutRefetch(t *testing.T) {
+	cdn, srv := newFakeCDN(t)
+	c, _ := newTestCoverCache(t, srv, filepath.Join(t.TempDir(), "cache"))
+	ctx := context.Background()
+	url := srv.URL + "/cover.jpg"
+
+	if err := c.LocalizeCover(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("LocalizeCover: %v", err)
+	}
+	before := cdn.count()
+
+	body, available, err := c.Poster(ctx, testProvider, testProviderID, url)
+	if err != nil {
+		t.Fatalf("Poster: %v", err)
+	}
+	if !available {
+		t.Fatal("本地已有封面，Poster 却报不可用")
+	}
+	if string(body) != string(coverBody) {
+		t.Fatalf("poster 字节 = %q, 期望上游字节 %q", body, coverBody)
+	}
+	if got := cdn.count(); got != before {
+		t.Fatalf("命中本地后仍回源：请求数 %d → %d", before, got)
+	}
+}
+
+// MKACG-650：封面文件被删（索引行还在）后请求 poster.jpg → 回源一次、返回完整字节，
+// 并把索引行更新到新落的文件上（下一次请求不再回源）。
+func TestPosterRefetchesWhenFileDeleted(t *testing.T) {
+	cdn, srv := newFakeCDN(t)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	c, st := newTestCoverCache(t, srv, cacheDir)
+	ctx := context.Background()
+	url := srv.URL + "/cover.jpg"
+	key := testProvider + "/" + testProviderID
+
+	if err := c.LocalizeCover(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("LocalizeCover: %v", err)
+	}
+	row, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, key)
+	if err != nil {
+		t.Fatalf("ArtifactByKey: %v", err)
+	}
+	if err := os.Remove(row.Path); err != nil {
+		t.Fatalf("删本地封面: %v", err)
+	}
+	before := cdn.count()
+
+	body, available, err := c.Poster(ctx, testProvider, testProviderID, url)
+	if err != nil || !available {
+		t.Fatalf("Poster = (%q…, available=%v, %v), 期望回源成功", body, available, err)
+	}
+	if string(body) != string(coverBody) {
+		t.Fatalf("回源字节 = %q, 期望 %q", body, coverBody)
+	}
+	if got := cdn.count(); got != before+1 {
+		t.Fatalf("请求数 %d → %d, 期望 +1（按需回源一次）", before, got)
+	}
+	after, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, key)
+	if err != nil {
+		t.Fatalf("回源后 ArtifactByKey: %v", err)
+	}
+	if after.Bytes != int64(len(coverBody)) {
+		t.Fatalf("回源后 artifact.Bytes = %d, 期望 %d", after.Bytes, len(coverBody))
+	}
+	onDisk, err := os.ReadFile(after.Path)
+	if err != nil {
+		t.Fatalf("回源后读本地文件 %s: %v", after.Path, err)
+	}
+	if string(onDisk) != string(coverBody) {
+		t.Fatalf("回源后落盘字节 = %q, 期望 %q", onDisk, coverBody)
+	}
+
+	// 再请求一次：这一次必须完全命中本地，证明索引行已经指回真实文件。
+	recount := cdn.count()
+	if _, _, err := c.Poster(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("第二次 Poster: %v", err)
+	}
+	if got := cdn.count(); got != recount {
+		t.Fatalf("回源成功后仍再回源：请求数 %d → %d", recount, got)
+	}
+}
+
+// MKACG-650：同一个已淘汰封面的并发请求只回源一次（single-flight）。
+func TestPosterConcurrentRequestsFetchOnce(t *testing.T) {
+	// 上游慢一点，让 3 个请求真的重叠：单飞失效时计数会是 3。
+	cdn, srv := newFakeCDN(t)
+	cdn.delay = 60 * time.Millisecond
+
+	c, _ := newTestCoverCache(t, srv, filepath.Join(t.TempDir(), "cache"))
+	ctx := context.Background()
+	url := srv.URL + "/cover.jpg"
+
+	const n = 3
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	bodies := make([][]byte, n)
+	availables := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			bodies[i], availables[i], errs[i] = c.Poster(ctx, testProvider, testProviderID, url)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if errs[i] != nil || !availables[i] {
+			t.Fatalf("第 %d 个请求 = (available=%v, %v), 期望拿到同一份封面", i, availables[i], errs[i])
+		}
+		if string(bodies[i]) != string(coverBody) {
+			t.Fatalf("第 %d 个请求的字节 = %q, 期望 %q", i, bodies[i], coverBody)
+		}
+	}
+	if got := cdn.count(); got != 1 {
+		t.Fatalf("并发 %d 个请求回源 %d 次, 期望 1（single-flight）", n, got)
+	}
+}
+
+// MKACG-650：回源失败 → 报「没有可用封面」（不是 0 字节、不是半截文件），
+// 也不把坏值写进缓存：索引行与文件都不留。
+func TestPosterFetchFailureReportsUnavailable(t *testing.T) {
+	cdn, srv := newFakeCDN(t)
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	c, st := newTestCoverCache(t, srv, cacheDir)
+	ctx := context.Background()
+	cdn.set(http.StatusNotFound, []byte("nope"))
+
+	body, available, err := c.Poster(ctx, testProvider, testProviderID, srv.URL+"/cover.jpg")
+	if err != nil {
+		t.Fatalf("Poster 基础设施错误 = %v, 期望 nil（回源失败按「没有封面」处理）", err)
+	}
+	if available {
+		t.Fatal("回源 404 却报「有封面」")
+	}
+	if body != nil {
+		t.Fatalf("回源失败返回了 %d 字节", len(body))
+	}
+	if _, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, testProvider+"/"+testProviderID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("失败后 artifact 行 = %v, 期望 ErrNotFound", err)
+	}
+	if entries := listFiles(t, cacheDir); len(entries) != 0 {
+		t.Fatalf("失败后在缓存目录留下文件: %v", entries)
+	}
+}
+
+// 源未声明封面（url 为空）时 Poster 直接报不可用：不发请求。
+func TestPosterEmptyURLUnavailable(t *testing.T) {
+	cdn, srv := newFakeCDN(t)
+	c, _ := newTestCoverCache(t, srv, filepath.Join(t.TempDir(), "cache"))
+
+	body, available, err := c.Poster(context.Background(), testProvider, testProviderID, "")
+	if err != nil || available || body != nil {
+		t.Fatalf("Poster(空 url) = (%q, %v, %v), 期望 (nil, false, nil)", body, available, err)
+	}
+	if got := cdn.count(); got != 0 {
+		t.Fatalf("空 url 仍发了 %d 次请求", got)
+	}
+}
+
+// MKACG-650：HasCover 的判据是索引行，不是文件——文件被删后 poster.jpg 仍要在树里，
+// 好让下一次 GET 触发按需回源；行没了才是「这部剧没有封面」。
+func TestHasCoverFollowsArtifactRow(t *testing.T) {
+	_, srv := newFakeCDN(t)
+	c, st := newTestCoverCache(t, srv, filepath.Join(t.TempDir(), "cache"))
+	ctx := context.Background()
+	url := srv.URL + "/cover.jpg"
+	key := testProvider + "/" + testProviderID
+
+	if has, err := c.HasCover(ctx, testProvider, testProviderID); err != nil || has {
+		t.Fatalf("本地化之前 HasCover = (%v, %v), 期望 (false, nil)", has, err)
+	}
+	if err := c.LocalizeCover(ctx, testProvider, testProviderID, url); err != nil {
+		t.Fatalf("LocalizeCover: %v", err)
+	}
+	if has, err := c.HasCover(ctx, testProvider, testProviderID); err != nil || !has {
+		t.Fatalf("本地化之后 HasCover = (%v, %v), 期望 (true, nil)", has, err)
+	}
+	row, err := st.ArtifactByKey(ctx, store.ArtifactKindCover, key)
+	if err != nil {
+		t.Fatalf("ArtifactByKey: %v", err)
+	}
+	if err := os.Remove(row.Path); err != nil {
+		t.Fatalf("删本地封面: %v", err)
+	}
+	if has, err := c.HasCover(ctx, testProvider, testProviderID); err != nil || !has {
+		t.Fatalf("文件删掉后 HasCover = (%v, %v), 期望仍 (true, nil)", has, err)
+	}
+	if err := st.DeleteArtifact(ctx, store.ArtifactKindCover, key); err != nil {
+		t.Fatalf("DeleteArtifact: %v", err)
+	}
+	if has, err := c.HasCover(ctx, testProvider, testProviderID); err != nil || has {
+		t.Fatalf("索引行删掉后 HasCover = (%v, %v), 期望 (false, nil)", has, err)
+	}
 }

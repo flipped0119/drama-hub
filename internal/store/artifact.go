@@ -116,6 +116,34 @@ func (s *Store) DeleteArtifact(ctx context.Context, kind, key string) error {
 	return nil
 }
 
+// ReleaseArtifact 把一份缓存资产降级为「只有登记、没有本地字节」：清空
+// path / bytes / sha256，并把 last_used_at 推到 at。行留着。
+//
+// 只有海报用它（docs/CACHE-MODEL.md「淘汰」第 3 步）：封面行同时是「这部剧有封面」
+// 的唯一真值（`vfs` 据此挂出 `poster.jpg`），连行一起删会让节点从树里消失，
+// 「淘汰后按需回源」就永远没有发生的入口。清空 path 表达「本地没有字节」，
+// 下一次请求按未命中处理并重新落盘（PutArtifact 覆盖回真实值）。
+//
+// last_used_at 必须推到 at：留着旧值会让过期查询下一轮又选中这一行，淘汰循环原地打转。
+// 无该行返回 ErrNotFound。
+func (s *Store) ReleaseArtifact(ctx context.Context, kind, key, at string) error {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE artifact
+		 SET path = '', bytes = 0, sha256 = '', last_used_at = $1
+		 WHERE kind = $2 AND key = $3`, at, kind, key)
+	if err != nil {
+		return fmt.Errorf("释放缓存资产 %s/%s: %w", kind, key, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("释放缓存资产 %s/%s: %w", kind, key, err)
+	}
+	if n == 0 {
+		return fmt.Errorf("释放缓存资产 %s/%s: %w", kind, key, ErrNotFound)
+	}
+	return nil
+}
+
 // SumArtifactBytes 返回某类缓存资产的 bytes 合计，按上限淘汰时用它算总量。
 //
 // 只按 kind 过滤（分片参与大小淘汰，海报与索引不参与），见

@@ -534,7 +534,7 @@ func TestSyncSeriesLocalizesCover(t *testing.T) {
 		},
 		Episodes: []plugin.Episode{{No: 1}, {No: 2}},
 	}}
-	s := New(p, cache.NewCoverCache(st, settings, srv.Client()), nil)
+	s := New(p, cache.NewCoverCache(st, settings, srv.Client(), slog.New(slog.DiscardHandler)), nil)
 
 	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
 		t.Fatalf("SyncSeries: %v", err)
@@ -600,7 +600,7 @@ func TestSyncSeriesCoverUnavailableIsNotFailure(t *testing.T) {
 	}}
 	var logs strings.Builder
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	s := New(p, cache.NewCoverCache(st, settings, &http.Client{}), logger)
+	s := New(p, cache.NewCoverCache(st, settings, &http.Client{}, slog.New(slog.DiscardHandler)), logger)
 
 	if err := s.SyncSeries(ctx, st, "w1"); err != nil {
 		t.Fatalf("封面不可达时 SyncSeries = %v, 期望 nil（海报是附带资产，不算同步失败）", err)

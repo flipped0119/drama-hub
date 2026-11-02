@@ -132,11 +132,27 @@ func (c *Cache) evictOverLimit(ctx context.Context, maxBytes int64) error {
 	}
 }
 
-// deleteOne 删一条缓存资产：先删文件、再删行。文件已不存在也算成功（自愈），
-// 行已不存在同样算成功（并发淘汰）。
+// deleteOne 淘汰一条缓存资产：删文件；行按 kind 两种处理。
+//
+//   - 分片与索引：行与文件一起删（行只是「文件在哪」的登记，没有字节就没有意义）。
+//   - 海报：**保留行**，只把 path / bytes / sha256 清空（ReleaseArtifact）。这一行同时是
+//     「这部剧有封面」的唯一真值（`vfs.HasCover` 只看行），连行删掉会让 `poster.jpg` 从
+//     目录里消失，请求到不了 `Render`，「淘汰后按需回源」就永远没有入口——这正是
+//     MKACG-650 功能检测抓到的失败项。
+//
+// 文件已不存在也算成功（自愈），行已不存在同样算成功（并发淘汰）。
 func (c *Cache) deleteOne(ctx context.Context, row store.Artifact) error {
 	if err := os.Remove(row.Path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("删除缓存文件 %s: %w", row.Path, err)
+	}
+	if row.Kind == store.ArtifactKindCover {
+		// 行里必须留一个「这就是这部剧的封面、但本地暂时没有字节」的记录；
+		// release 把 last_used_at 推到当下，下一轮过期查询不会再选中它。
+		if err := c.st.ReleaseArtifact(ctx, row.Kind, row.Key, stamp(c.now())); err != nil &&
+			!errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		return nil
 	}
 	if err := c.st.DeleteArtifact(ctx, row.Kind, row.Key); err != nil &&
 		!errors.Is(err, store.ErrNotFound) {

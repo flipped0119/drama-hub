@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/store"
@@ -96,8 +95,7 @@ type Cache struct {
 	logger   *slog.Logger
 	now      func() time.Time // 取当前时间；测试注入固定值（last_used_at 与淘汰要可断言）
 
-	mu      sync.Mutex // 只保护 flights；goroutine 之间不共享别的可变状态
-	flights map[string]*flight
+	flights *flightGroup // single-flight：同一 (kind, key) 的并发生成只做一次
 
 	hooks hooks // 测试注入的单飞观察点；生产为 nil，见 hooks 的注释
 }
@@ -109,7 +107,7 @@ func New(st *store.Store, settings *store.Settings, logger *slog.Logger) *Cache 
 		settings: settings,
 		logger:   logger,
 		now:      time.Now,
-		flights:  make(map[string]*flight),
+		flights:  newFlightGroup(),
 	}
 }
 
@@ -130,7 +128,7 @@ func (c *Cache) GetOrGenerate(ctx context.Context, spec Spec, gen GenerateFunc) 
 	if h := c.hooks.beforeEnter; h != nil {
 		h()
 	}
-	return c.singleflight(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
+	return c.flights.do(ctx, spec.Kind+keySeparator+spec.Key, func() ([]byte, error) {
 		// 当上 leader 后再查一次：从上面的 hit() 到这里之间，可能有另一个 leader
 		// 已经生成完并摘掉了 flight（发布先于摘除，所以那时 hit() 必然命中）。
 		// 不复查就会成为第二个 leader，同一片被切两遍 —— MKACG-640。
@@ -138,7 +136,7 @@ func (c *Cache) GetOrGenerate(ctx context.Context, spec Spec, gen GenerateFunc) 
 			return body, err
 		}
 		return c.generate(ctx, spec, gen)
-	})
+	}, c.hooks.published)
 }
 
 // hit 查索引行并读文件：都成功才算命中，并把 last_used_at 推到现在。
@@ -207,62 +205,17 @@ func (c *Cache) generate(ctx context.Context, spec Spec, gen GenerateFunc) ([]by
 	return body, nil
 }
 
-// flight 是一次进行中的生成：leader 写完 body / err 后 close(done)，等待者读同一份。
-type flight struct {
-	done chan struct{}
-	body []byte
-	err  error
-}
-
 // hooks 是单飞状态迁移的观察点，只给测试用：测试在 New 之后设 c.hooks 卡住某个瞬间，
 // 把本来要靠调度运气才撞上的窗口变成确定性的。两个字段为 nil（生产的唯一取值）时
-// GetOrGenerate / singleflight 里各只剩一次 nil 判断。
+// GetOrGenerate / flightGroup.do 里各只剩一次 nil 判断。
 type hooks struct {
 	// beforeEnter 在「初次命中选择失败、即将进入单飞」之间调用，调用时不持锁。
 	beforeEnter func()
 
 	// published 在 leader 的结果已发布（close(done) 已完成）、flight 尚未摘除时调用，
-	// 调用时持有 c.mu：钩子里只能做只读断言（或调 c.hit —— 它不碰 c.mu），
+	// 调用时持有 flightGroup 的锁：钩子里只能做只读断言（或调 c.hit —— 它不碰那把锁），
 	// 回调 GetOrGenerate 会重入同一把锁而死锁。
 	published func(id string)
-}
-
-// singleflight 把同一 id 的并发生成合成一次：先到的是 leader，其余等它的结果。
-//
-// mutex 只保护 map（与 channel 分工，不混用）。leader 的 ctx 决定生成是否继续：
-// 它被取消时等待者拿到同一个错误，各自的请求自己重试 —— 比在这里做生成的生命周期
-// 管理便宜，也不会留下无人接收的结果。
-func (c *Cache) singleflight(ctx context.Context, id string, gen func() ([]byte, error)) ([]byte, error) {
-	c.mu.Lock()
-	if f, ok := c.flights[id]; ok {
-		c.mu.Unlock()
-		select {
-		case <-f.done:
-			return f.body, f.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	f := &flight{done: make(chan struct{})}
-	c.flights[id] = f
-	c.mu.Unlock()
-
-	// 先赋值再 close：close 建立 happens-before，等待者看不到半写的 body/err。
-	f.body, f.err = gen()
-
-	// 发布与摘除在同一把锁内，且发布在前：晚到者要么还能在 map 里看到这个 flight、
-	// 等 done（结果已经可用，不重生成），要么看到它已消失 —— 而「已消失」意味着结果
-	// 已发布，那时 hit() 必然命中。反过来（先摘除、解锁后再 close）会留出一个
-	// 「map 里没有、结果又还没发布」的窗口，晚到者在窗口里当上第二个 leader，
-	// 同一个分片被切两遍 —— MKACG-640 的 10 并发用例就是这么红的。
-	c.mu.Lock()
-	close(f.done)
-	if h := c.hooks.published; h != nil {
-		h(id)
-	}
-	delete(c.flights, id)
-	c.mu.Unlock()
-	return f.body, f.err
 }
 
 // stamp 是 artifact.last_used_at 的统一格式：UTC RFC3339（定长、可按字符串排序）。

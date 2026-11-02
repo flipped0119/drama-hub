@@ -506,6 +506,7 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
     └── <分片>/                        ← fnv32a(provider_id) % 128 的两位十六进制（00–7f）
         └── <剧名> (<年份>)/
             ├── tvshow.nfo
+            ├── poster.jpg              ← 仅当这部剧有可用封面（MKACG-650）
             └── Season 01/
                 ├── <剧名> - S01E01 - <标签>.strm
                 └── <剧名> - S01E01 - <标签>.nfo
@@ -542,7 +543,7 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 | `""`（根） | 分类目录 | 1 次 `SELECT DISTINCT genre`（覆盖索引全扫，唯一 O(行数) 的一条） |
 | `<分类>` | 分片目录 `00`–`7f` | 1–2 次 genre 存在性点查（`GenreExists`），分片集合是代码常量、不查库 |
 | `<分类>/<分片>` | 剧目录 | 1–2 次 genre 存在性点查 + 1 次 `WHERE genre IN (…) AND shard = ? ORDER BY title` |
-| `<剧目录>` | `tvshow.nfo` + `Season 01` | 1 次剧目点查（目录名被 sanitize 时再加 1–2 次 genre 存在性点查） |
+| `<剧目录>` | `tvshow.nfo`（+ 有封面时的 `poster.jpg`）+ `Season 01` | 1 次剧目点查 + 1 次封面行点查（目录名被 sanitize 时再加 1–2 次 genre 存在性点查） |
 | `<剧目录>/Season 01` | 集文件对 | 同上 + 1 次 `ListEmbyItems` |
 
 两类查询都走索引（`idx_drama_genre_shard_title` / `idx_drama_title`），由
@@ -608,9 +609,33 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
 | 文件 | 根元素 | 字段 | 说明 |
 |---|---|---|---|
 | 集 `.nfo` | `episodedetails` | `title` / `season` / `episode` / `runtime` | 字段全部取自 `emby_item`：`episode` 是**对外集号**，`runtime` 单位是**分钟**（`runtime_sec / 60` 向下取整）；写秒会被 Emby 放大 60 倍 |
-| `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` | `plot` 来自 `drama.plot` |
+| `tvshow.nfo` | `tvshow` | `title` / `year` / `plot` / `thumb` | `plot` 来自 `drama.plot`；`thumb` 见下「poster.jpg」 |
 
 `aired` 不写：库里的时间只有采集时间，没有播出日期。
+
+### poster.jpg（封面，MKACG-650）
+
+剧目录下的 `poster.jpg` 是 Emby / Jellyfin 认的剧集封面名。它**仍然是虚拟文件**：字节取自
+该剧的本地封面缓存（`artifact(kind='cover')` 指向的文件），磁盘上不会多出任何实体文件
+（硬约束 1，磁盘只允许图片缓存与分片缓存）。
+
+- **出现条件**：这部剧**曾经**本地化成功过（`artifact(kind='cover')` 有行）。判据只看行、
+  不看文件，所以封面文件被手删、或被 `cache_lru_days` 淘汰（淘汰**不删行**，只清空
+  `path`/`bytes`/`sha256`）之后节点仍在，下一次 GET / PROPFIND 才会触发按需回源。
+  源未声明封面或同步时下载失败的剧**没有这一行**——树里就没有 `poster.jpg`，
+  `tvshow.nfo` 也不写 `<thumb>`（不产出 0 字节文件、不写空元素）。
+- **`tvshow.nfo` 的 thumb**：`<thumb aspect="poster">poster.jpg</thumb>`，值是**相对路径**
+  （与 nfo 同目录），不写外链——外链会绕过本服务的缓存与淘汰，源图换址后指向错内容。
+- **按需回源**：`Render` 时若本地文件不在，由注入的 `Coverer`（生产实现
+  `cache.CoverCache.Poster`）回源一次并写回 artifact 行；同一封面的并发请求只回源一次
+  （`cache.flightGroup`，与同步的本地化共用同一组）。取不回来就返回 `vfs.ErrNotFound`
+  → WebDAV `404`，不返回 0 字节或半截文件，坏值不写缓存，下一次请求可再试。
+- **列举不因封面失败而整体失败**：`internal/webdav` 的目录列举会**跳过**渲染成
+  `vfs.ErrNotFound` 的子项。否则一张取不回来的封面会让整个剧目录的 `PROPFIND` 变成
+  错误响应，把客户端的扫描停在这一层。
+- 封面能力通过 `vfs.Coverer` 注入（接口定义在消费方）：vfs 不认识 HTTP、不读 artifact 表，
+  回源/落盘/超时/single-flight 全在 `internal/cache`。`NewTree` 传 nil 等价于「这个库没有
+  封面」（单测用它省掉缓存）。
 
 ### 长度
 
@@ -710,7 +735,8 @@ Basic，凭据取 `settings.webdav_user` / `webdav_pass`，**每请求现读**�
 
 - 修改时间恒为零值（`entry.ModTime`）：库里没有可靠的 mtime，`sync_at` 是采集时间。
   零值让 ETag 稳定在「内容长度」上，`http.ServeContent` 也不写 `Last-Modified`。
-- 不做封面 `poster.jpg`（属 artifact 缓存，单独任务）。
+- 封面 `poster.jpg` 只在「这部剧有可用封面」时出现（MKACG-650），详见「虚拟文件树与渲染」的
+  `poster.jpg` 小节：取不回来按不存在处理（404），目录列举跳过它，不返回 0 字节文件。
 - **单目录成本随子项数线性增长，季层不摊薄**：`walkFS` 对一次 `PROPFIND` 的每个子项都要取
   props，所以一个 1000 集的季（2000 个子项）就是 2000 次渲染 + 一份大 XML。MKACG-610
   验收在 17,558 部真库上实测：该季 `Season 01` 的 `Depth: 1` = **1.8 MB / 25.9 s**（单请求）。
@@ -817,6 +843,11 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 `cache_lru_days` 淘汰，键、布局、并发与失效规则的真值是 `docs/CACHE-MODEL.md`，参数
 默认值与取值范围见本节「配置」表。淘汰循环在装配根启动（`cache.RunEviction`，启动即
 一轮、之后每 5 分钟一轮），与请求路径无关，间隔是固定值、不做成可调项。
+
+过期淘汰对三种 kind **不是同一套动作**：分片与索引「删文件 + 删行」，海报「删文件、留行」
+（行的 `path`/`bytes`/`sha256` 清空，语义见 `docs/CACHE-MODEL.md`「淘汰」第 3 步）。海报
+那条例外就是 `poster.jpg` 的存在性判据：行在 = 剧目录里有这张虚拟文件；删了行请求根本到不了
+`Render`，「淘汰后按需回源」不成立（MKACG-650）。
 
 `strm_prefix` 与缓存**无关**：它只是 `/video/{id}.m3u8` 的对外地址前缀。播放字节一律
 由本服务的 `/video/…` 产出并经本服务的缓存，rclone 只剩 WebDAV 只读挂载，**不再需要
