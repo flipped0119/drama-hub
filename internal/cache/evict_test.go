@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ func TestEvictBySizeLimit(t *testing.T) {
 	const chunk = 400 << 10
 	specs := make([]Spec, 0, 3)
 	for seq := 0; seq < 3; seq++ {
-		spec := segSpec(testUID, seq)
+		spec := segSpec("e" + strconv.Itoa(seq))
 		if _, err := tc.c.GetOrGenerate(ctx, spec, func(context.Context) ([]byte, error) {
 			return blob(chunk, byte('a'+seq)), nil
 		}); err != nil {
@@ -97,7 +98,7 @@ func TestEvictSizeDisabled(t *testing.T) {
 		t.Fatalf("设置 cache_max_mb: %v", err)
 	}
 	const chunk = 2 << 20 // 2 MB，已远超「0 MB 上限」的字面意思
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 	if _, err := tc.c.GetOrGenerate(ctx, spec, func(context.Context) ([]byte, error) {
 		return blob(chunk, 'z'), nil
 	}); err != nil {
@@ -118,12 +119,11 @@ func TestEvictExpired(t *testing.T) {
 	ctx := context.Background()
 	now := tc.clock.now()
 
-	// 40 天前写下的三种 kind 各一条。
+	// 40 天前写下的两种 kind 各一条（过期是「多久没命中」，与 kind 无关）。
 	oldTime := now.AddDate(0, 0, -40)
 	tc.clock.set(oldTime)
 	oldSpecs := []Spec{
-		segSpec(testUID, 0),
-		{Kind: store.ArtifactKindIndex, Key: IndexKey("e1"), Ext: ".json"},
+		segSpec(testUID),
 		{Kind: store.ArtifactKindCover, Key: CoverKey("web", "p1"), Ext: ".jpg"},
 	}
 	for _, spec := range oldSpecs {
@@ -133,7 +133,7 @@ func TestEvictExpired(t *testing.T) {
 	}
 	// 10 天前写下的一条分片：不该被删。
 	tc.clock.set(now.AddDate(0, 0, -10))
-	fresh := segSpec(testUID, 1)
+	fresh := segSpec("e2")
 	if _, err := tc.c.GetOrGenerate(ctx, fresh, genOf("fresh")); err != nil {
 		t.Fatalf("写新分片: %v", err)
 	}
@@ -147,15 +147,15 @@ func TestEvictExpired(t *testing.T) {
 		t.Fatalf("Evict: %v", err)
 	}
 
-	// 分片与索引：行与文件都不在。
-	for _, spec := range oldSpecs[:2] {
+	// 分片：行与文件都不在。
+	for _, spec := range oldSpecs[:1] {
 		if _, err := tc.st.ArtifactByKey(ctx, spec.Kind, spec.Key); !errors.Is(err, store.ErrNotFound) {
 			t.Fatalf("%s 过期后行 = %v, 期望 ErrNotFound", spec.Kind, err)
 		}
 	}
 	// 海报：文件删掉，**行留着**（行是「这部剧有封面」的真值，MKACG-650）；
 	// path 清空表示本地没有字节，下一轮过期查询不会又选中它（last_used_at 已推到当下）。
-	coverSpec := oldSpecs[2]
+	coverSpec := oldSpecs[1]
 	coverRow, err := tc.st.ArtifactByKey(ctx, coverSpec.Kind, coverSpec.Key)
 	if err != nil {
 		t.Fatalf("海报过期后行 = %v, 期望保留（MKACG-650）", err)
@@ -186,7 +186,7 @@ func TestRunEvictionRunsThenStops(t *testing.T) {
 
 	// 先造一条 40 天前写入的分片，循环的第一轮就该清掉它。
 	tc.clock.set(tc.clock.now().AddDate(0, 0, -40))
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 	if _, err := tc.c.GetOrGenerate(context.Background(), spec, genOf(testSegmentBody)); err != nil {
 		t.Fatalf("写分片: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestRunEvictionRunsThenStops(t *testing.T) {
 func TestEvictSelfHealsMissingFile(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 	if _, err := tc.c.GetOrGenerate(ctx, spec, genOf(testSegmentBody)); err != nil {
 		t.Fatalf("写分片: %v", err)
 	}

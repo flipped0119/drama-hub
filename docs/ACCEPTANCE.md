@@ -54,6 +54,28 @@
       5 集（5+5+5+5+2），无需重启
 - [ ] 改 N 后旧合并集的 `/video/{oldid}.m3u8` 返回 404（签名仍合法，不得返回别人的内容）
 
+## P6（每集一片 fMP4，ADR-0011 / MKACG-652）
+
+- [ ] 单集 playlist 恰 **1** 个 `.m4s`，`#EXTINF` ≈ 该集真实时长（不是 10 秒）
+- [ ] 单集分片落盘后 `head -c 8 | tail -c 4` 是 `ftyp`：`ffprobe` 单看这一片就能给出
+      视频流与完整时长（自包含，不依赖 `#EXT-X-MAP`）
+- [ ] 合并集整条 playlist 交给 ffmpeg 系播放端**不丢帧**：
+      `ffprobe -select_streams v -count_frames -count_packets -show_entries
+      stream=nb_read_frames,nb_read_packets <playlist>` 的 `frames` 必须等于 `packets`
+      （集边界时间戳回退会让解码器丢帧，只算 `#EXTINF` 之和看不出来）
+- [ ] **不取 playlist、直接请求合并集的分片**（模拟首播并发 / CDN 预取）：逐片
+      `ffprobe -show_entries packet=pts_time` 的首 PTS 必须是「前面各集时长之和」而不是全 0
+      （只请求分片时服务端要先补齐时长再平移，否则拼成 playlist 又会丢帧）
+- [ ] 合并集（10 集）playlist 有 **10** 个分片、**9** 个 `#EXT-X-DISCONTINUITY`，
+      `#EXTINF` 之和 ≈ Σ 各集时长；逐片单独 `ffprobe` 都成功
+- [ ] 同一集连续播两次：第二次日志里没有新的 `msg="segment generated"`
+- [ ] 连播 3 集后 `<cache_dir>/seg/` 下是 **3** 个 `.m4s`（不是 18 个）
+- [ ] 浏览器（hls.js）与 Emby 各播一集：画面与声音都在。
+      **若仍只有进度与声音**：先看播放端是否支持 HEVC（`isTypeSupported('video/mp4;
+      codecs="hvc1.1.6.L120.B0"')`，或在 <https://ott.dolby.com/codec_test/> 上试）；
+      流本身不是候选原因（同一片 `ffmpeg -i … -f null -` 无错误），转码是独立决策
+- [ ] `scripts/acceptance.sh` 的 `F3` / `F7` 输出 `n/n 分片是自包含 fMP4 且含视频流`
+
 ## 记录格式
 
 ```

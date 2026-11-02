@@ -1,15 +1,17 @@
 # 播放契约（`/webdav` + `/video`）
 
-状态：定稿 v2（2026-10-30 / MKACG-604，按 lxz 2026-10-30 评论重写）
-取代：旧口径——`/s/{token}/e/{uid}` 出流家族、`/dav/` 挂载点、「单集走 MP4 字节透传、只有合并集走 HLS」
-配套：`docs/CACHE-MODEL.md`、`docs/adr/0007-own-hls-and-local-cache.md`
+状态：定稿 v3（2026-11-02 / MKACG-652，ADR-0011：片段改成每集一片 fMP4）
+取代：v2 的「10 秒切片 + 关键帧索引」口径；旧一代口径——`/s/{token}/e/{uid}` 出流家族、
+`/dav/` 挂载点、「单集走 MP4 字节透传、只有合并集走 HLS」仍是历史
+配套：`docs/CACHE-MODEL.md`、`docs/adr/0007-own-hls-and-local-cache.md`、
+`docs/adr/0011-episode-per-segment-fmp4.md`
 
 ## 两个口子
 
 | 口子 | 用途 | 认证 |
 |---|---|---|
 | `/webdav/` | 只读虚拟 WebDAV，Emby/rclone 从这里读目录、`.strm`、`.nfo`、封面 | HTTP Basic（`webdav_user` / `webdav_pass`） |
-| `/video/` | 播放：`{id}.m3u8` 取播放列表，`{id}/{seq}.ts` 取分片 | id 内嵌 HMAC 签名（见下），无 Basic（Emby 取 strm 里的 URL 时不好带凭据） |
+| `/video/` | 播放：`{id}.m3u8` 取播放列表，`{id}/{seq}.m4s` 取分片（每集一片 fMP4） | id 内嵌 HMAC 签名（见下），无 Basic（Emby 取 strm 里的 URL 时不好带凭据） |
 
 `/dav/`、`/s/{token}/…` **退役，不留兼容层**：`.strm` 是按请求渲染的，
 下一次读取就是新内容，没有存量文件需要兼容。
@@ -76,24 +78,26 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 
 ```
 #EXTM3U
-#EXT-X-VERSION:3
+#EXT-X-VERSION:7
 #EXT-X-PLAYLIST-TYPE:VOD
 #EXT-X-MEDIA-SEQUENCE:0
-#EXT-X-TARGETDURATION:<最大片长向上取整>
-#EXTINF:<片长>,
-/video/{id}/0.ts
-#EXTINF:<片长>,
-/video/{id}/1.ts
-…（合并集在集边界插 #EXT-X-DISCONTINUITY）
+#EXT-X-TARGETDURATION:<最大集时长向上取整>
+#EXTINF:<该集真实时长>,
+/video/{id}/0.m4s
+#EXT-X-DISCONTINUITY                ← 只在合并集的集边界出现
+#EXTINF:<该集真实时长>,
+/video/{id}/1.m4s
 #EXT-X-ENDLIST
 ```
 
-- 生成逻辑复用现有 `segment.BuildPlaylist`，只把切片 URI 模板从 `/s/{token}/seg/{uid}/{seq}.ts`
-  改成 `/video/{id}/{seq}.ts`。
-- playlist 是 `segment` 表的**纯函数视图**，不落盘、不缓存（理由见 `docs/CACHE-MODEL.md`
-  「为什么 m3u8 文本不缓存」）。
-- `uid` 是单集时切片空间 = 本集片内序；是合并块时 = 块内成员集的跨集连续时间轴
-  （现有 `Timeline`）。**两条路径现在都走 HLS**，单集不再是特例。
+- **一集一片**（ADR-0011）：播放单元的分片数 = 成员集数，单集 1 片、合并块 N 片；
+  `seq` 就是块内成员下标，不存在「集内第几片」这一层。片段后缀 `.m4s`。
+- `#EXTINF` 取该集真实时长，来源只有一处：`episode.duration_sec`（见下「时长按需探测」）。
+  `#EXT-X-TARGETDURATION` 是它的最大值向上取整。
+- playlist 是派生视图（`Timeline` 的纯函数渲染），不落盘、不缓存（理由见
+  `docs/CACHE-MODEL.md`「为什么 m3u8 文本不缓存」）。
+- 单集与合并集走同一个函数：单集的块里只有一集，因此没有 `#EXT-X-DISCONTINUITY`。
+  **两条路径都走 HLS**，单集不是特例。
 
 | 情形 | 状态码 |
 |---|---|
@@ -101,64 +105,83 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 | id 签名不对 / 缺 `-` | 401 |
 | `uid` 在库里不存在 | 404 |
 | 该集解析不到直链（`ErrNoStream`，含受保护剧只给 10 秒预览） | 502 |
-| 关键帧索引建立超时（30 s 硬上限） | 503 + `Retry-After: 5` |
+| 时长探测超时（30 s 硬上限） | 503 + `Retry-After: 5` |
 
 **502 的语义（MKACG-626 契约 2）**：可播性只在请求时判定，失败一律 502，不降级。
 「受保护剧只给 10 秒预览」不产出「200 + 10 秒 playlist」：预览不当直链交付，App 通道也不
 可用时就是 502 + 一条 `WarnContext`（`uid` / `ep_no` / `channel` / 错误类别）。不回落、不静默
 给一个「看起来能播」的短片 —— 判据与顺序见 `docs/PLUGIN-CONTRACT.md`「通道与取流顺序」。
 
-**索引按需建立**：`m3u8` 需要每片时长，因此第一次请求某 `uid` 时若 `segment` 无行，
-**同步** ffprobe 建索引（通常 0.3–1 s）再出 playlist；超过 30 s 返回上面的 503。
-现存索引的**通道段**与本次请求的通道不一致时同样视为「没有索引」，必须重建
-（含加通道段之前写下的老索引，见下「分片身份带通道段」）。
+**时长按需探测**：`m3u8` 需要每集时长，而 `episode.duration_sec` 是唯一真值。
+第一次播放某 `uid` 时，`duration_sec` 为 0 的成员**同步** ffprobe 一次
+（只取 `format=duration`，通常 0.3–1 s）再出 playlist；整批探测超过 30 s 返回上面的 503。
+`duration_sec` 已非 0 的成员不再探测（零外呼）。
 
-**禁止批量预建索引**：L1 规模下可播集数量是「每部剧 1 集」，但库里 `episode` 有 2847 万行，
+同一次解析还顺手对齐 `segment` 行的通道：本次解析出的通道与行里不一致时覆盖它
+（通道翻转的判据仍然只有 `channelOf` 一处）。分片端点复用这一行，所以命中缓存的分片
+请求不解析直链。
+
+**禁止批量预建**：L1 规模下可播集数量是「每部剧 1 集」，但库里 `episode` 有 2847 万行，
 对全库 ffprobe 是不可完成的任务（`docs/L1-CORPUS-SCOPE.md` 取证 D/E）。
 
-建索引时 `ffprobe` 拿到的源时长会回填 `episode.duration_sec`（只填 0，不覆盖非零值）
-并重建该剧 `emby_item`，`.nfo` 的 `<runtime>` 因此变成真实值；没播过的集仍是 0。
-细节见 `docs/DEV-STANDARDS.md`「关键帧索引」。
+探测到的源时长会回填 `episode.duration_sec`（只填 0，不覆盖非零值）并重建该剧
+`emby_item`，`.nfo` 的 `<runtime>` 与 playlist 的 `#EXTINF` 因此变成真实值；没播过的集
+仍是 0。细节见 `docs/DEV-STANDARDS.md`「时长探测」。
 
-## `GET /video/{id}/{seq}.ts`
+## `GET /video/{id}/{seq}.m4s`
 
-返回 MPEG-TS 分片。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、落缓存、再回**。
+返回**一整集**的自包含 fMP4。顺序是：**查本地缓存 → 命中即回文件；未命中 → 生成、
+落缓存、再回**。
 
-- 生成：`ffmpeg -ss … -t … -c copy`（关键帧对齐时可 copy），不可 copy 时转码（现有 `Cutter`）。
-- 加密片源：`Resolve` 带 `Key`（`plugin.Stream.Key`，16 字节 AES-128）时，切片与索引
-  探测的命令 MUST 在 `-i` **之前**加 `-decryption_key <hex>`，交给 ffmpeg 的 CENC-AES-CTR
-  原生解密；本服务不实现解密、不落整集明文。key 只在本次请求的内存里过一手：
-  不进日志、不进错误文本、不落库、不进缓存键（`docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
+- `seq` 直接是播放单元里的成员下标（第 `seq` 集），越界即 404。
+- 生成：`ffmpeg -c copy -movflags +frag_keyframe+empty_moov+default_base_moof -f mp4`，
+  **一条路径**：不切、无 `-ss/-t`、无 `-output_ts_offset`。片头自带 `ftyp+moov`，
+  所以每一片都能单独 `ffprobe`（自包含），playlist 不需要 `#EXT-X-MAP`。
+- **集边界时间戳**：缓存里的片段一律 0 基（自包含、只由「集 + 通道」决定），出流时按本片
+  在播放单元里的起点（前面各集 `#EXTINF` 之和）给 `moof/traf/tfdt` 的
+  `baseMediaDecodeTime` 加 `offset × 轨道 timescale`（每轨 timescale 不同），因此整条
+  playlist 的 PTS 单调递增。**只靠 `#EXT-X-DISCONTINUITY` 不够**：MSE 系播放端按它重定
+  时间轴，但 ffmpeg 系播放端（Emby 转码/DirectStream、mpv）只按 PTS 解码，会因回退丢帧
+  （实测 3 集 325 帧只解出 275 帧；平移后 325/325）。ffmpeg 的 `-output_ts_offset` 在
+  fMP4 上无效（mov 封装器把 tfdt 归一到轨道起点），所以平移在出流这一步做。
+  起点 = 前面各集 `duration_sec` 之和；前置集还没回填（只请求分片、或首播时 playlist 与
+  分片并发）时**先补齐再平移**，不能按 0 出流（那等于又回到「每片从 0 起」，实测 1550 包
+  只解 800 帧）。补齐会解析一次直链 + `ffprobe` 并回填，失败按 502/503 返回。
+  细节与实测表见 ADR-0011「修正：集边界时间戳」，回归钉子
+  `TestMergedPlaylist_DecodesEveryFrame` 与 `TestSegmentDirectRequestFillsDuration`。
+- 加密片源：`Resolve` 带 `Key`（`plugin.Stream.Key`，16 字节 AES-128）时，转封装与
+  时长探测的命令 MUST 在 `-i` **之前**加 `-decryption_key <hex>`，交给 ffmpeg 的
+  CENC-AES-CTR 原生解密；本服务不实现解密、不落整集明文。key 只在本次请求的内存里
+  过一手：不进日志、不进错误文本、不落库、不进缓存键
+  （`docs/PLUGIN-CONTRACT.md`「加密切片与 Key」）。
 - 出站身份**按通道两份**（MKACG-638）：`ffmpeg` / `ffprobe` 取直链 MUST 带 `-headers`，
   但同一份头不能同时喂给两个通道 —— 网页通道（明文直链 `hongguoduanju.com/video/public/…`）
   要浏览器 UA + 源站根 `Referer`，与同步抓页面是同一份身份；App 通道**只带 UA、不带
   `Referer`**，它的媒体 CDN 对带站内 `Referer` 的请求回 `403`（实测二分：仅 `Referer`
   403，无头 / 仅 UA 都能探出完整集时长）。两条通道各一份、MUST NOT 互相顶掉。
-  挑哪一份的判据与「分片身份带通道段」同一个：本次解析的
-  直链带不带内容密钥（`Stream.Key`）。两份都由装配根从插件常量派生、按通道注入
+  挑哪一份的判据与「缓存键里的通道」同一个：本次解析的直链带不带内容密钥
+  （`Stream.Key`）。两份都由装配根从插件常量派生、按通道注入
   （`internal/segment` 不认识任何源，只按判据挑一份），理由见 `docs/PLUGIN-CONTRACT.md`
   硬性要求 8。
 - 生成失败：502，**不写缓存**（不许把坏值写进缓存）。
-- `Range`：分片是完整不可变对象，支持 `Range` 但不需要分段生成；`HEAD` 返回同样的
-  `Content-Length`（硬约束 3）。
-- 并发同一个 `(id, seq)` 只生成一次（single-flight），其余请求等同一个结果。
-- **分片身份带通道段**（MKACG-626 契约 4）：探测出的编码签名一律写成 `<通道>/<签名>`
-  （`web/…` / `app/…`），`segment.codec_sig` 与 `cache.SegmentKey = sha256(uid | seq | codec_sig)`
-  用同一个值——一处产出、两处消费。同一集的网页源与 App 源字节流不同，但 `codec_sig`
-  （codec / profile / level / pix_fmt / tag / time_base）可能完全相同：它不含分辨率与时长，
-  10 秒 360p 预览与 3 分钟完整集会算出同一个签名。少了通道段就会缓存串味，旧索引
-  （片数、时长都属于另一个通道）还会被永久沿用。通道的唯一判据是「本次解析有没有带
-  内容密钥」：带 `Key` = App 通道，否则网页通道——契约里没有通道名字段，不新增。
+- `Content-Type: video/mp4`。`Range`：分片是完整不可变对象，支持 `Range` 但不需要分段
+  生成；`HEAD` 返回同样的 `Content-Length`（硬约束 3）。
+- 并发同一个缓存键只生成一次（single-flight），其余请求等同一个结果。
+- **缓存键按集带通道**（ADR-0011 D3）：`cache.SegmentKey = sha256("e<episode.id>" \x1f channel)`，
+  落 `<cache_dir>/seg/<hash 前 2 位>/<hash>.m4s`。`seq` 不进键：合并集第 k 片、单集播放、
+  重新分组后的同一集命中同一个文件。通道必须进键 —— 同一集的网页源与 App 源字节流不同
+  （App 源是 CENC 密文），只按集算键会串味。通道的唯一判据是「本次解析有没有带内容
+  密钥」：带 `Key` = App 通道，否则网页通道——契约里没有通道名字段，不新增。
 - 预取：**2.0 不做**（MKACG-603「不在范围」；1.0 的 `seg_prefetch` 占位键已删除，MKACG-616）。
 
 这就是 lxz 说的「本服务负责在播放 m3u8 时提供数据转换和缓冲」：
-**转换** = ffmpeg 切片/转码，**缓冲** = 本地分片缓存（2.0 不预取）。
+**转换** = ffmpeg 整集转封装，**缓冲** = 本地分片缓存（2.0 不预取）。
 
 ## 与现有实现的关系（明确哪些留、哪些退）
 
 | 现有 | 处置 |
 |---|---|
-| `segment.BuildPlaylist` / `Timeline` / `Cutter` / `segment` 表 | **保留**，只换切片 URI 模板与 id 校验入口 |
+| `segment.BuildPlaylist` / `Timeline` / `Cutter` / `segment` 表 | **保留**，`Timeline` / `Slice` 收敛成「一集一片」，`segment` 表收窄成 `(episode_id, channel)`（0006） |
 | `emby_item.uid`（`e<id>` / `m<id>`） | **保留**，是 `/{id}` 里 `uid` 段的来源 |
 | `stream.Server` 的单集 MP4 透传端点（`/s/{token}/e/{uid}`） | **退休**。字节中继 + Range 透传能力留给分片路径复用，不再对外暴露单集 MP4 |
 | `stream.Verify` | 保留算法，移到 `/video` 的 id 校验 |
@@ -171,7 +194,7 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 |---|---|---|
 | `/webdav/…` | PROPFIND / GET | 只读虚拟文件系统 |
 | `/video/{id}.m3u8` | GET / HEAD | 播放列表 |
-| `/video/{id}/{seq}.ts` | GET / HEAD | 分片 |
+| `/video/{id}/{seq}.m4s` | GET / HEAD | 分片（整集 fMP4） |
 | `/api/dramas` / `/api/dramas/{id}/…` | — | 管理 API |
 | `/api/refresh` | POST | 手动触发一轮刷新（`docs/SCHEDULER-MODEL.md`） |
 | `/api/status` | GET | 含各源调度状态（同上） |
@@ -182,6 +205,8 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 - 多码率 / `master.m3u8` 变体列表：红果只给 360p，做 ABR 是无源之水。
 - 直播语义（`#EXT-X-ENDLIST` 恒在，VOD）。
 - 加密**输出**分片（`EXT-X-KEY`）：本地单用户，没有需要防的人。源的加密输入是另一件事，
-  解密在 ffmpeg 那一侧做（见 `GET /video/{id}/{seq}.ts`「加密片源」）。
+  解密在 ffmpeg 那一侧做（见 `GET /video/{id}/{seq}.m4s`「加密片源」）。
+- 转码：源是 HEVC，容器与切分改完之后能否播出取决于播放端的 HEVC 能力
+  （`isTypeSupported`），转码是独立决策（ADR-0011「黑屏结论」）。
 - 转码到高于源的码率/分辨率。
 - `/s/` 与 `/dav/` 的兼容层。

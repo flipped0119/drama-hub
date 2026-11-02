@@ -9,14 +9,13 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// 内容目录名。artifact 的 kind 是 'cover'/'index'/'segment'，文档里的目录名是
-// cover / index / seg（docs/CACHE-MODEL.md「落盘布局与键」）。
+// 内容目录名。artifact 的 kind 是 'cover'/'segment'，文档里的目录名是 cover / seg
+// （docs/CACHE-MODEL.md「落盘布局与键」）。
 const (
 	dirCover   = "cover"
-	dirIndex   = "index"
 	dirSegment = "seg"
 	// dirTmp 是写入中的临时文件目录。rename 只在同一文件系统内原子，所以临时文件
-	// 必须落在 <cache_dir> 下；与三个内容目录分开，进程被 kill 打断时留下的是 tmp
+	// 必须落在 <cache_dir> 下；与内容目录分开，进程被 kill 打断时留下的是 tmp
 	// 里的垃圾（淘汰时清扫），内容目录里只会出现完整文件。
 	dirTmp = "tmp"
 )
@@ -35,13 +34,11 @@ type layout struct{ root string }
 
 func layoutOf(root string) layout { return layout{root: root} }
 
-// dir 返回某个 kind 的内容目录：<cache_dir>/{cover,index,seg}。
+// dir 返回某个 kind 的内容目录：<cache_dir>/{cover,seg}。
 func (l layout) dir(kind string) (string, error) {
 	switch kind {
 	case store.ArtifactKindCover:
 		return filepath.Join(l.root, dirCover), nil
-	case store.ArtifactKindIndex:
-		return filepath.Join(l.root, dirIndex), nil
 	case store.ArtifactKindSegment:
 		return filepath.Join(l.root, dirSegment), nil
 	}

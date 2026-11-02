@@ -37,14 +37,14 @@ func TestEnsureSettingsIdempotent(t *testing.T) {
 	s := NewSettings(db)
 	ctx := context.Background()
 
-	if err := s.Set(ctx, KeySegTargetSec, "20"); err != nil {
+	if err := s.Set(ctx, KeyCacheLRUDays, "20"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	// 重复建表不得丢数据。
 	if err := EnsureSettings(ctx, db); err != nil {
 		t.Fatalf("第二次 EnsureSettings: %v", err)
 	}
-	got, err := s.Int(ctx, KeySegTargetSec)
+	got, err := s.Int(ctx, KeyCacheLRUDays)
 	if err != nil {
 		t.Fatalf("Int: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestDefaults(t *testing.T) {
 	ctx := context.Background()
 
 	ints := map[SettingKey]int{
-		KeySegTargetSec: 10,
+		KeyCacheLRUDays: 30,
 	}
 	for key, want := range ints {
 		got, err := s.Int(ctx, key)
@@ -86,19 +86,19 @@ func TestOutOfRangeNotPersisted(t *testing.T) {
 	s := NewSettings(db)
 	ctx := context.Background()
 
-	err := s.Set(ctx, KeySegTargetSec, "50")
+	err := s.Set(ctx, KeyCacheLRUDays, "366")
 	if !errors.Is(err, ErrInvalidSetting) {
-		t.Fatalf("Set(seg_target_sec, 50) 错误 = %v, 期望 ErrInvalidSetting", err)
+		t.Fatalf("Set(cache_lru_days, 366) 错误 = %v, 期望 ErrInvalidSetting", err)
 	}
-	if hasRow(t, db, KeySegTargetSec) {
+	if hasRow(t, db, KeyCacheLRUDays) {
 		t.Fatal("越界值被写入了库")
 	}
-	got, err := s.Int(ctx, KeySegTargetSec)
+	got, err := s.Int(ctx, KeyCacheLRUDays)
 	if err != nil {
 		t.Fatalf("Int: %v", err)
 	}
-	if got != 10 {
-		t.Fatalf("越界后读到 %d, 期望仍是默认 10", got)
+	if got != 30 {
+		t.Fatalf("越界后读到 %d, 期望仍是默认 30", got)
 	}
 }
 
@@ -108,11 +108,11 @@ func TestNonNumericNotPersisted(t *testing.T) {
 	s := NewSettings(db)
 	ctx := context.Background()
 
-	err := s.Set(ctx, KeySegTargetSec, "abc")
+	err := s.Set(ctx, KeyCacheLRUDays, "abc")
 	if !errors.Is(err, ErrInvalidSetting) {
-		t.Fatalf("Set(seg_target_sec, abc) 错误 = %v, 期望 ErrInvalidSetting", err)
+		t.Fatalf("Set(cache_lru_days, abc) 错误 = %v, 期望 ErrInvalidSetting", err)
 	}
-	if hasRow(t, db, KeySegTargetSec) {
+	if hasRow(t, db, KeyCacheLRUDays) {
 		t.Fatal("非数字值被写入了库")
 	}
 }
@@ -122,10 +122,10 @@ func TestSetTakesEffectImmediately(t *testing.T) {
 	s := NewSettings(newTestDB(t))
 	ctx := context.Background()
 
-	if err := s.Set(ctx, KeySegTargetSec, "20"); err != nil {
+	if err := s.Set(ctx, KeyCacheLRUDays, "20"); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	got, err := s.Int(ctx, KeySegTargetSec)
+	got, err := s.Int(ctx, KeyCacheLRUDays)
 	if err != nil {
 		t.Fatalf("Int: %v", err)
 	}
@@ -140,20 +140,20 @@ func TestSetUpdatesExistingRow(t *testing.T) {
 	s := NewSettings(db)
 	ctx := context.Background()
 
-	for _, raw := range []string{"4", "30"} {
-		if err := s.Set(ctx, KeySegTargetSec, raw); err != nil {
+	for _, raw := range []string{"1", "365"} {
+		if err := s.Set(ctx, KeyCacheLRUDays, raw); err != nil {
 			t.Fatalf("Set(%s): %v", raw, err)
 		}
 	}
-	got, err := s.Int(ctx, KeySegTargetSec)
+	got, err := s.Int(ctx, KeyCacheLRUDays)
 	if err != nil {
 		t.Fatalf("Int: %v", err)
 	}
-	if got != 30 {
-		t.Fatalf("读到 %d, 期望 30", got)
+	if got != 365 {
+		t.Fatalf("读到 %d, 期望 365", got)
 	}
 	var rows int
-	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = $1`, string(KeySegTargetSec)).Scan(&rows); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = $1`, string(KeyCacheLRUDays)).Scan(&rows); err != nil {
 		t.Fatalf("统计行数: %v", err)
 	}
 	if rows != 1 {
@@ -207,10 +207,10 @@ func TestSetIfAbsentValidates(t *testing.T) {
 		t.Fatal("非法值在库里留了行")
 	}
 
-	if _, err := s.SetIfAbsent(ctx, KeySegTargetSec, "50"); !errors.Is(err, ErrInvalidSetting) {
+	if _, err := s.SetIfAbsent(ctx, KeyCacheLRUDays, "366"); !errors.Is(err, ErrInvalidSetting) {
 		t.Fatalf("越界值错误 = %v, 期望 ErrInvalidSetting", err)
 	}
-	if hasRow(t, db, KeySegTargetSec) {
+	if hasRow(t, db, KeyCacheLRUDays) {
 		t.Fatal("越界值在库里留了行")
 	}
 	if _, err := s.SetIfAbsent(ctx, "不存在的键", "x"); !errors.Is(err, ErrUnknownSetting) {
@@ -332,8 +332,8 @@ func TestReadWithWrongType(t *testing.T) {
 	if _, err := s.Int(ctx, KeyStrmPrefix); !errors.Is(err, ErrInvalidSetting) {
 		t.Errorf("Int(strm_prefix) 错误 = %v, 期望 ErrInvalidSetting", err)
 	}
-	if _, err := s.String(ctx, KeySegTargetSec); !errors.Is(err, ErrInvalidSetting) {
-		t.Errorf("String(seg_target_sec) 错误 = %v, 期望 ErrInvalidSetting", err)
+	if _, err := s.String(ctx, KeyCacheLRUDays); !errors.Is(err, ErrInvalidSetting) {
+		t.Errorf("String(cache_lru_days) 错误 = %v, 期望 ErrInvalidSetting", err)
 	}
 }
 
@@ -383,7 +383,7 @@ func TestParseSettingBoundaries(t *testing.T) {
 		min int
 		max int
 	}{
-		{string(KeySegTargetSec), 4, 30},
+		{string(KeyCacheLRUDays), 1, 365},
 	}
 
 	for _, tt := range tests {

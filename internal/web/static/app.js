@@ -272,10 +272,8 @@ function initStatus() {
     configBody.replaceChildren(
       row('strm 前缀', c.strm_prefix === '' ? '空（按请求 Host 推导）' : c.strm_prefix, '即时',
         'strm 内 URL 前缀；空 = 用访问本服务的 Host 拼绝对地址，填了就用填的（写入时去掉尾 /）', true),
-      row('分片目标时长', c.seg_target_sec + ' 秒', '即时（仅未建索引的集）',
-        'seg_target_sec，切点对齐关键帧；已建索引的 uid 不重算'),
       row('缓存目录', c.cache_dir, '即时',
-        'cache_dir，海报/分片/索引落 <cache_dir>/{cover,seg,index,tmp}', true),
+        'cache_dir，海报与分片落 <cache_dir>/{cover,seg}，写入中的临时文件在 tmp/', true),
       row('缓存上限', c.cache_max_mb + ' MB', '≤5 分钟',
         'cache_max_mb，0 = 不按大小淘汰；下一轮淘汰生效'),
       row('缓存保留', c.cache_lru_days + ' 天', '≤5 分钟',

@@ -513,19 +513,31 @@ playlist_ok() { # playlist_ok <id> —— 合法 VOD playlist 打 200 + 时长
   echo "duration=${dur:-?}"
 }
 
-segments_ok() { # segments_ok <id> —— 前 3 个分片 200 且真有视频流
-  local id=$1 bad=0 i code
-  for i in 0 1 2; do
-    code=$(http_code "$BASE/video/$id/$i.ts")
+segments_ok() { # segments_ok <id> —— playlist 里每个分片 200、是自包含 fMP4 且真有视频流
+  # 「每集一片」（ADR-0011）：分片数 = 成员集数，所以分片清单从 playlist 里取，不写死 3 个。
+  local id=$1 bad=0 n=0 uri code file magic
+  timeout 60 curl -sS "$BASE/video/$id.m3u8" 2>/dev/null | grep -E '^/video/' >"$WORK/uris.txt"
+  if [ ! -s "$WORK/uris.txt" ]; then echo "playlist 里没有分片"; return 1; fi
+  while IFS= read -r uri; do
+    n=$((n + 1))
+    code=$(http_code "$BASE$uri")
     if [ "$code" != "200" ]; then
-      echo "seq=$i code=$code"; return 1
+      echo "$uri code=$code"; return 1
     fi
-    timeout 120 curl -sS -o "$WORK/seg$i.ts" "$BASE/video/$id/$i.ts" 2>/dev/null
-    if ! timeout 60 "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$WORK/seg$i.ts" 2>/dev/null | grep -q .; then
+    file="$WORK/seg$n.m4s"
+    timeout 300 curl -sS -o "$file" "$BASE$uri" 2>/dev/null
+    # 自包含：片头必须是 ftyp（top-level box 的 type 在偏移 4..7）。
+    magic=$(dd if="$file" bs=1 skip=4 count=4 2>/dev/null)
+    if [ "$magic" != "ftyp" ]; then
+      bad=$((bad + 1))
+      continue
+    fi
+    # 单看一片就能解析出视频流（不依赖前一片，也没有 EXT-X-MAP）。
+    if ! timeout 60 "$FFPROBE" -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 "$file" 2>/dev/null | grep -q .; then
       bad=$((bad + 1))
     fi
-  done
-  if [ "$bad" -eq 0 ]; then echo "3/3 分片含视频流"; else echo "$bad/3 分片无视频流"; return 1; fi
+  done <"$WORK/uris.txt"
+  if [ "$bad" -eq 0 ]; then echo "$n/$n 分片是自包含 fMP4 且含视频流"; else echo "$bad/$n 分片有问题"; return 1; fi
 }
 
 play_seconds() { # play_seconds <id> —— 真的拉到 N 秒内容：看 ffmpeg 的 out_time，
@@ -592,7 +604,7 @@ stage_F() {
       fail F2 "第 1 集时长 — 同上（playlist 不可用）"
     fi
     if out=$(segments_ok "$id1"); then
-      pass F3 "第 1 集前 3 个分片均 200 且有视频流 — $out"
+      pass F3 "第 1 集各分片均 200、自包含 fMP4 且有视频流 — $out"
     else
       fail F3 "第 1 集分片 — $out"
     fi
@@ -623,7 +635,7 @@ stage_F() {
         fail F6 "第 4 集 playlist 时长 ${dur4}s < 60s"
       fi
       if out=$(segments_ok "$id4"); then
-        pass F7 "第 4 集前 3 个分片均 200 且有视频流 — $out"
+        pass F7 "第 4 集各分片均 200、自包含 fMP4 且有视频流 — $out"
       else
         fail F7 "第 4 集分片 — $out"
       fi
@@ -793,7 +805,7 @@ EOF
           fail G3 "合并块 第${from}-${to}集：DISCONTINUITY $got_disc 处，期望 $want_disc"
         fi
         local seqs
-        seqs=$(printf '%s\n' "$body" | grep -oE '/video/[^/]+/[0-9]+\.ts' | grep -oE '[0-9]+\.ts$' | tr -d 't.s' | tr '\n' ' ')
+        seqs=$(printf '%s\n' "$body" | grep -oE '/video/[^/]+/[0-9]+\.m4s' | sed -E 's#.*/([0-9]+)\.m4s$#\1#' | tr '\n' ' ')
         if [ -n "$seqs" ] && [ "$(printf '%s' "$seqs" | awk '{for(i=1;i<=NF;i++) if($i!=i-1) bad=1; END{print bad+0}')" = "0" ]; then
           info "" "分片 seq 从 0 连续：$(echo $seqs | awk '{print $1".."$NF}')"
         else
@@ -812,6 +824,18 @@ EOF
           else
             fail G4 "合并块总时长 ${gotdur:-?}s ≠ Σ成员 ${wantdur}s"
           fi
+        fi
+        # G7：整条 playlist 交给 ffmpeg 系播放端不能丢帧。集边界的 PTS 回退会让解码器
+        # 丢帧，而「ΣEXTINF ≈ Σ时长」这条判据看不出来（包全读到、帧被丢）。
+        local counts nframes npackets
+        counts=$(timeout 240 "$FFPROBE" -v error -select_streams v:0 -count_frames -count_packets \
+          -show_entries stream=nb_read_frames,nb_read_packets -of csv=p=0 "$BASE/video/$mid.m3u8" 2>/dev/null | head -1)
+        nframes=${counts%%,*}
+        npackets=${counts##*,}
+        if [ -n "$nframes" ] && [ "$nframes" = "$npackets" ]; then
+          pass G7 "合并块整条 playlist 解码帧数 = 包数 = $nframes（集边界时间戳单调，不丢帧）"
+        else
+          fail G7 "合并块整条 playlist frames=$nframes ≠ packets=$npackets（集边界 PTS 回退，ffmpeg 系播放端会丢画面）"
         fi
       fi
     fi
@@ -949,7 +973,7 @@ stage_I() {
   before=$("$ENGINE" exec "$DH_CONTAINER" sh -c 'find /data/cache/seg -type f 2>/dev/null | wc -l' | tr -d ' ')
   "$ENGINE" exec -u 0 "$DH_CONTAINER" sh -c 'rm -f /data/cache/seg/* 2>/dev/null' >/dev/null 2>&1
   local code
-  code=$(http_code "$BASE/video/$id1/0.ts")
+  code=$(http_code "$BASE/video/$id1/0.m4s")
   after=$("$ENGINE" exec "$DH_CONTAINER" sh -c 'find /data/cache/seg -type f 2>/dev/null | wc -l' | tr -d ' ')
   if [ "$code" = "200" ] && [ "$after" -gt 0 ]; then
     pass I1 "清空分片缓存后重新取分片 → 200 且缓存重新落盘（缓存文件 $before → $after）；直链不落库，每次请求现解析"

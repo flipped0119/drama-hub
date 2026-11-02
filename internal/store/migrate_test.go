@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"io/fs"
 	"reflect"
 	"regexp"
@@ -176,7 +177,7 @@ func TestMigrateIdempotent(t *testing.T) {
 		t.Fatalf("首次 migrate: %v", err)
 	}
 	if _, err := db.ExecContext(ctx,
-		`INSERT INTO settings(key, value_json, updated_at) VALUES('seg_target_sec', '10', '2026-10-29T00:00:00Z')`); err != nil {
+		`INSERT INTO settings(key, value_json, updated_at) VALUES('cache_lru_days', '30', '2026-10-29T00:00:00Z')`); err != nil {
 		t.Fatalf("写入 settings 行: %v", err)
 	}
 	before := userVersion(t, db)
@@ -193,7 +194,7 @@ func TestMigrateIdempotent(t *testing.T) {
 	}
 
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = 'seg_target_sec'`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM settings WHERE key = 'cache_lru_days'`).Scan(&n); err != nil {
 		t.Fatalf("统计 settings: %v", err)
 	}
 	if n != 1 {
@@ -514,8 +515,9 @@ func columnDefaults(t *testing.T, db *sql.DB, table string) map[string]string {
 	return out
 }
 
-// AC：4 份迁移全部生效（0002 genre/tags/shard + 两索引 + source_state、
-// 0003 artifact 扩 kind、0004 删 episode.play_url / play_url_at）。
+// AC：5 份迁移全部生效（0002 genre/tags/shard + 两索引 + source_state、
+// 0003 artifact 扩 kind、0004 删 episode.play_url / play_url_at、
+// 0006 segment 收窄成每集一行 + artifact 去掉 index kind）。
 func TestMigrateAllFiles(t *testing.T) {
 	db := openRaw(t)
 	ctx := context.Background()
@@ -543,6 +545,20 @@ func TestMigrateAllFiles(t *testing.T) {
 		}
 	}
 	t.Logf("episode 列: %v", sortedMapKeys(episodeCols))
+
+	// 0006：segment 收窄成「每集的播放身份」——只剩 (episode_id, channel)。
+	// 列数断言比逐列罗列更严格：切点 / 时长 / 关键帧 / 编码签名 / mode 任何一个
+	// 漏删都会让总数不等于 2。
+	segmentCols := columnDefaults(t, db, "segment")
+	if got := len(segmentCols); got != 2 {
+		t.Errorf("segment 列数 = %d, 期望 2（实际列：%v）", got, sortedMapKeys(segmentCols))
+	}
+	for _, kept := range []string{"episode_id", "channel"} {
+		if _, ok := segmentCols[kept]; !ok {
+			t.Errorf("segment 缺列 %s", kept)
+		}
+	}
+	t.Logf("segment 列: %v", sortedMapKeys(segmentCols))
 
 	applied, err = migrate(ctx, db)
 	if err != nil {
@@ -600,8 +616,8 @@ func TestDramaGenreTagsShardColumns(t *testing.T) {
 	t.Logf("drama 默认值: genre=%s tags=%s shard=%s", defaults["genre"], defaults["tags"], defaults["shard"])
 }
 
-// AC：artifact 扩 kind 只加一类，已有 cover/index 两行逐字段保留；三类 kind 可写，
-// CHECK 拒绝未知 kind。
+// AC：artifact 的 kind 收窄（0006）：cover 行逐字段保留，kind='index' 的旧行被清掉
+// （关键帧索引整条概念已删除），cover / segment 可写，CHECK 拒绝未知 kind。
 func TestArtifactRebuildKeepsRows(t *testing.T) {
 	db := openRaw(t)
 	ctx := context.Background()
@@ -623,14 +639,14 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 		}
 	}
 
-	before := []Artifact{
-		{Kind: ArtifactKindCover, Key: "web/p1", Path: "/data/cache/cover/aa/aa.jpg", Bytes: 1234,
-			SHA256: "c0ffee", LastUsedAt: "2026-10-29T10:00:00Z"},
-		{Kind: ArtifactKindIndex, Key: "e42", Path: "/data/cache/index/bb/bb.json", Bytes: 4321,
-			SHA256: "", LastUsedAt: "2026-10-29T11:00:00Z"},
-	}
+	cover := Artifact{Kind: ArtifactKindCover, Key: "web/p1", Path: "/data/cache/cover/aa/aa.jpg", Bytes: 1234,
+		SHA256: "c0ffee", LastUsedAt: "2026-10-29T10:00:00Z"}
+	// 0006 之前的第二个 kind：关键帧索引行。0006 必须清掉它，否则收窄后的 CHECK
+	// 加不上（PostgreSQL 加 CHECK 会校验已有行）。
+	legacyIndex := Artifact{Kind: "index", Key: "e42", Path: "/data/cache/index/bb/bb.json", Bytes: 4321,
+		LastUsedAt: "2026-10-29T11:00:00Z"}
 	s := NewStore(db)
-	for _, a := range before {
+	for _, a := range []Artifact{cover, legacyIndex} {
 		if err := s.PutArtifact(ctx, a); err != nil {
 			t.Fatalf("预置 artifact %s/%s: %v", a.Kind, a.Key, err)
 		}
@@ -644,21 +660,21 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 		t.Fatalf("扩 kind 段 applied = %d, 期望 %d", applied, want)
 	}
 
-	for _, want := range before {
-		got, err := s.ArtifactByKey(ctx, want.Kind, want.Key)
-		if err != nil {
-			t.Fatalf("扩 kind 后读 %s/%s: %v", want.Kind, want.Key, err)
-		}
-		if got != want {
-			t.Errorf("扩 kind 后 %s/%s = %+v, 期望逐字段 %+v", want.Kind, want.Key, got, want)
-		}
+	got, err := s.ArtifactByKey(ctx, cover.Kind, cover.Key)
+	if err != nil {
+		t.Fatalf("迁移后读 %s/%s: %v", cover.Kind, cover.Key, err)
 	}
-	if n := countRows(t, db, "artifact"); n != len(before) {
-		t.Fatalf("扩 kind 后 artifact 行数 = %d, 期望 %d", n, len(before))
+	if got != cover {
+		t.Errorf("迁移后 %s/%s = %+v, 期望逐字段 %+v", cover.Kind, cover.Key, got, cover)
 	}
-
-	// 三类 kind 都能写：cover/index 已在，补 segment。
-	seg := Artifact{Kind: ArtifactKindSegment, Key: "sha256:abc", Path: "/data/cache/seg/cc/cc.ts",
+	if _, err := s.ArtifactByKey(ctx, legacyIndex.Kind, legacyIndex.Key); !errors.Is(err, ErrNotFound) {
+		t.Errorf("kind='index' 的旧行还在（err=%v）：0006 没清掉它", err)
+	}
+	if n := countRows(t, db, "artifact"); n != 1 {
+		t.Fatalf("迁移后 artifact 行数 = %d, 期望 1（只剩 cover）", n)
+	}
+	// 两种 kind 都能写：cover 已在，补 segment。
+	seg := Artifact{Kind: ArtifactKindSegment, Key: "sha256:abc", Path: "/data/cache/seg/cc/cc.m4s",
 		Bytes: 650000, SHA256: "abc", LastUsedAt: "2026-10-30T09:00:00Z"}
 	if err := s.PutArtifact(ctx, seg); err != nil {
 		t.Fatalf("写入 kind=segment: %v", err)
@@ -671,8 +687,8 @@ func TestArtifactRebuildKeepsRows(t *testing.T) {
 	if err := s.PutArtifact(ctx, Artifact{Kind: "poster", Key: "k", Path: "/p", LastUsedAt: "x"}); err == nil {
 		t.Fatal("未知 kind 写入未报错（CHECK 未生效）")
 	}
-	if n := countRows(t, db, "artifact"); n != len(before)+1 {
-		t.Fatalf("拒绝未知 kind 后行数 = %d, 期望 %d", n, len(before)+1)
+	if n := countRows(t, db, "artifact"); n != 2 {
+		t.Fatalf("拒绝未知 kind 后行数 = %d, 期望 2", n)
 	}
 }
 

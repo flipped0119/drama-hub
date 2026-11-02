@@ -27,9 +27,10 @@ import (
 // 本包不 import plugin，解析能力由上层以函数注入，错误原样透出。
 type ResolveFunc func(ctx context.Context, ep store.Episode) (stream.Direct, error)
 
-// Cutter 是播放面的中枢：`/video/{id}.m3u8` 与 `/video/{id}/{seq}.ts` 的 handler、
-// 按需建立的关键帧索引、以及分片缓存共用同一个实例（store / settings / 缓存 /
-// 并发闸只构造一次）。st / settings / caches / resolve 不可为 nil。
+// Cutter 是播放面的中枢：`/video/{id}.m3u8` 与 `/video/{id}/{seq}.m4s` 的 handler、
+// 每集的时长探测（episode.duration_sec）、segment 行的通道对齐、以及分片缓存共用
+// 同一个实例（store / settings / 缓存 / 并发闸只构造一次）。st / settings / caches /
+// resolve 不可为 nil。
 type Cutter struct {
 	st       *store.Store
 	settings *store.Settings
@@ -41,9 +42,9 @@ type Cutter struct {
 	// 用哪一份由本次解析出的直链决定（见 fetchHeaders）。本包不认识任何源，
 	// 两份都由装配根注入（见 NewCutter 的 headers）。
 	headers Headers
-	// indexTimeout 是「按需建立索引」的硬上限，生产固定 indexDeadline；
-	// 测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
-	indexTimeout time.Duration
+	// ensureTimeout 是「补齐播放列表所需信息」（每个成员的直链 + 时长）的硬上限，
+	// 生产固定 ensureDeadline；测试把它调短，才能在 5 分钟测试预算里验证 503 那条路径。
+	ensureTimeout time.Duration
 }
 
 // Headers 是 `ffmpeg` / `ffprobe` 取直链时的出站身份（`名称: 值` 每项一行），
@@ -57,7 +58,7 @@ type Headers struct {
 	App []string // App 通道：浏览器 UA（不带 Referer）
 }
 
-// NewCutter 装配播放面。caches 是 S7 的本地缓存（分片落盘 + single-flight），
+// NewCutter 装配播放面。caches 是本地缓存（分片落盘 + single-flight），
 // resolve 由装配根注入（stream.Resolver.DirectURL）。
 //
 // headers 是 ffmpeg / ffprobe 取直链时要带的出站请求头，按通道两份：这两个子进程
@@ -72,15 +73,14 @@ func NewCutter(st *store.Store, settings *store.Settings, logger *slog.Logger, c
 		gate:     make(chan struct{}, ffmpegSlots()),
 		headers:  headers,
 
-		indexTimeout: indexDeadline,
+		ensureTimeout: ensureDeadline,
 	}
 }
 
 // fetchHeaders 按本次解析出的直链挑一份通道身份，拼成 `-headers` 的值。
 //
-// 通道判据只有 channelOf 一处（与 codec_sig 的通道段、索引失效判定同一个），
-// 出站身份跟着它走：判据发现两条通道的字节流不同，出站身份也必须不同，否则
-// 一条通道的头会把另一条通道的请求打成 403（MKACG-638）。
+// 通道判据只有 channelOf 一处，出站身份跟着它走：判据发现两条通道的字节流不同，
+// 出站身份也必须不同，否则一条通道的头会把另一条通道的请求打成 403（MKACG-638）。
 func (c *Cutter) fetchHeaders(d stream.Direct) string {
 	if channelOf(d) == channelApp {
 		return headerBlock(c.headers.App)
@@ -115,102 +115,69 @@ func (c *Cutter) acquire(ctx context.Context) error {
 
 func (c *Cutter) release() { <-c.gate }
 
-// indexDeadline 是「按需建立关键帧索引」的硬上限（docs/PLAYBACK-CONTRACT.md：
-// 30 s，超时 503 + Retry-After）。只有第一次播放某个 uid 时会走到这里。
-const indexDeadline = 30 * time.Second
+// ensureDeadline 是「补齐播放列表所需信息」的硬上限（docs/PLAYBACK-CONTRACT.md：
+// 30 s，超时 503 + Retry-After）。只有第一次播放某个 uid 时会走到 ffprobe。
+const ensureDeadline = 30 * time.Second
 
-// ensureSegments 同步 ffprobe 建一次某集的分片索引并落库，顺手把实测时长回填到
-// episode.duration_sec。「该不该建」由调用方（timelineFor）判定：库里没有行，或者
-// 现有行的通道段与本次请求的通道不一致。
+// ensureDuration 返回某集的时长（秒）。
 //
-// 索引按需建立、禁止批量预建（库里 2847 万集，全库预扫不可完成）。建立超时
-// （indexDeadline）返回 httpx.ErrUnavailable —— 边界包据此回 503 + Retry-After，
-// 不出半截时间轴。探测失败不写任何行（库里保留旧索引或保持为空）。
-func (c *Cutter) ensureSegments(ctx context.Context, ep store.Episode, d stream.Direct) ([]store.Segment, error) {
-	target, err := c.settings.Int(ctx, store.KeySegTargetSec)
-	if err != nil {
-		return nil, fmt.Errorf("读 seg_target_sec: %w", err)
+// episode.duration_sec 是唯一真值（ADR-0011 D2）：非 0 直接用它；为 0（插件恒给 0，
+// 这一集还没人播过）时现 ffprobe 一次并回填 —— 回填只填 0、同事务重建 emby_item，
+// 之后 playlist 的 EXTINF、TARGETDURATION 与 .nfo 的 <runtime> 都用这一个值。
+//
+// 探测失败不写任何东西；超时（ensureDeadline）返回 httpx.ErrUnavailable，边界包据此
+// 回 503 + Retry-After，不出半截时间轴。
+func (c *Cutter) ensureDuration(ctx context.Context, ep store.Episode, d stream.Direct) (float64, error) {
+	if ep.DurationSec > 0 {
+		return float64(ep.DurationSec), nil
 	}
 	if err := c.acquire(ctx); err != nil {
-		return nil, err
+		return 0, err
 	}
-	info, probeErr := probe(ctx, c.logger, d, c.fetchHeaders(d))
+	seconds, probeErr := probeDuration(ctx, c.logger, d, c.fetchHeaders(d))
 	c.release()
 	if probeErr != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, fmt.Errorf("剧集 %d 的关键帧索引建立超时: %w", ep.ID, httpx.ErrUnavailable)
+			return 0, fmt.Errorf("剧集 %d 的时长探测超时: %w", ep.ID, httpx.ErrUnavailable)
 		}
-		return nil, probeErr
+		return 0, probeErr
 	}
-	// 通道段并进签名：索引行与分片缓存键都用这一个值（channel.go）。
-	info.codecSig = channelSig(channelOf(d), info.codecSig)
-	// 首次建索引顺手把实测时长回填进 episode.duration_sec：ffprobe 已经拿到了真实
-	// 时长，白丢它会让 .nfo 的 <runtime> 恒为 0（Emby 全库时长 0、进度条与续播失真）。
-	// 回填排在写索引之前：反过来一旦索引写成功而回填失败，下次请求会命中已有索引
-	// 直接返回，时长就再也补不上了。
-	if _, err := c.st.BackfillEpisodeDuration(ctx, ep.ID, int(math.Round(info.durationSec))); err != nil {
-		return nil, fmt.Errorf("回填剧集 %d 时长: %w", ep.ID, err)
+	rounded := int(math.Round(seconds))
+	if _, err := c.st.BackfillEpisodeDuration(ctx, ep.ID, rounded); err != nil {
+		return 0, fmt.Errorf("回填剧集 %d 时长: %w", ep.ID, err)
 	}
-	segs := planSegments(info, ep.ID, float64(target))
-	if err := c.st.ReplaceSegments(ctx, ep.ID, segs); err != nil {
-		return nil, fmt.Errorf("写入分片索引 episode_id=%d: %w", ep.ID, err)
-	}
-	c.logger.InfoContext(ctx, "segment index built",
-		"episode_id", ep.ID, "segments", len(segs), "duration_sec", info.durationSec,
-		"channel", channelOf(d))
-	return segs, nil
+	c.logger.InfoContext(ctx, "episode duration probed",
+		"episode_id", ep.ID, "duration_sec", rounded, "channel", channelOf(d))
+	return float64(rounded), nil
 }
 
-// sourceInfo 是 ffprobe 探测结果的最小形态。
-type sourceInfo struct {
-	keyframes   []float64 // 关键帧 pts（秒，升序）
-	durationSec float64
-	codecSig    string
-}
-
-// planSegments 把探测结果切成「目标时长附近、切点对齐关键帧」的分片（纯函数）。
+// ensureChannel 让 segment 行与本次解析出的通道一致：没行才插入，通道翻了才更新。
 //
-// 规则：首片从 0 起（整集覆盖，总时长才等于源时长），之后每个切点取第一个
-// 距当前切点 `>= target` 的关键帧。因为切点都落在关键帧上，`-c copy` 切片内部
-// 不会漂移——这正是「目标 10s 实测 10.66s」要避免的错位；代价是真实片长 ≥ target
-// （由 EXTINF 如实反映，不是缺陷）。末片收到源时长，可以短于 target。
-//
-// 不变量：Σ Dur == info.durationSec（± 浮点误差）。
-func planSegments(info sourceInfo, episodeID int64, target float64) []store.Segment {
-	seg := func(start, dur float64) store.Segment {
-		return store.Segment{
-			EpisodeID: episodeID, StartSec: start, Dur: dur,
-			Keyframe: true, CodecSig: info.codecSig, Mode: "copy",
-		}
+// 每次取 playlist 都会现解析直链，所以这里不额外外呼。分片端点复用这一行：
+// 行在就不解析直链 —— 「命中缓存零外呼」靠的就是它（626 裁决 3 的机制原样保留，
+// 判据仍然只有 channelOf 一处）。
+func (c *Cutter) ensureChannel(ctx context.Context, episodeID int64, channel string) error {
+	seg, err := c.st.GetSegment(ctx, episodeID)
+	switch {
+	case err == nil && seg.Channel == channel:
+		return nil
+	case err == nil:
+		// 通道翻转：覆盖。旧通道的片键不同，留在缓存里由 LRU 淘汰，永不命中。
+	case !errors.Is(err, store.ErrNotFound):
+		return fmt.Errorf("读取分片身份 episode_id=%d: %w", episodeID, err)
 	}
-	if len(info.keyframes) == 0 || info.durationSec <= 0 {
-		// 探测不到关键帧/时长（异常源）：退化为整段一片。切片时若源并不以关键帧
-		// 开头，ffmpeg 会自行对齐到首个可拷贝帧，片内仍有内容而不是空片。
-		return []store.Segment{seg(0, info.durationSec)}
+	if err := c.st.UpsertSegment(ctx, store.Segment{EpisodeID: episodeID, Channel: channel}); err != nil {
+		return fmt.Errorf("写入分片身份 episode_id=%d: %w", episodeID, err)
 	}
-
-	segs := make([]store.Segment, 0, 16)
-	start := 0.0
-	for _, kf := range info.keyframes {
-		// 首片固定从 0 起：源里首个关键帧通常就是 0；若略大于 0（编码器偏移），
-		// 从 0 起切仍由 ffmpeg 对齐到首帧，且总时长不丢头。
-		if kf-start+1e-9 < target {
-			continue
-		}
-		segs = append(segs, seg(start, kf-start))
-		start = kf
-	}
-	// 末片收到源时长（真实尾部，可能短于 target；时长差 ≤ 一帧）。
-	if info.durationSec > start+1e-9 {
-		segs = append(segs, seg(start, info.durationSec-start))
-	}
-	return segs
+	return nil
 }
 
 // 子进程硬超时：源直链卡死时以超时结束，不挂住请求（DEV-STANDARDS 出站超时）。
 const (
 	timeoutProbe = 30 * time.Second
-	timeoutCut   = 60 * time.Second
+	// timeoutRemux 是整集 remux 的子进程硬超时。整集要读完 CDN 全程（10 分钟集 ≈ 40 MB），
+	// 60 s 在弱网上会误杀；单集一片之后每次生成只做一次整集转封装（ADR-0011）。
+	timeoutRemux = 300 * time.Second
 )
 
 // 子进程失败的**稳定类别**：客户端可见的错误文本里只出现这几个常量。
@@ -223,7 +190,7 @@ const (
 // `<op> failed`，不会把新措辞漏出去。
 const (
 	classProbeFailed   = "ffprobe failed"
-	classCutFailed     = "ffmpeg failed"
+	classRemuxFailed   = "ffmpeg failed"
 	classDecryptFailed = "ffprobe decryption failed"
 	classRejected      = "upstream rejected"
 )
@@ -307,16 +274,15 @@ func decryptionArgs(key []byte) []string {
 	return []string{"-decryption_key", hex.EncodeToString(key)}
 }
 
-// probeArgs 拼 `ffprobe -skip_frame nokey` 的完整 argv（纯函数，argv 顺序就是契约：
+// probeArgs 拼 `ffprobe` 的完整 argv（纯函数，argv 顺序就是契约：
 // `-decryption_key` 与 `-headers` 必须落在源地址之前，否则 ffmpeg 只把它们当输出
 // 选项、静默忽略）。
+//
+// 只问时长：每集一片之后不再需要关键帧与编码签名（ADR-0011 删掉了那两样）。
 func probeArgs(src stream.Direct, headers string) []string {
 	args := []string{
 		"-v", "error",
-		"-select_streams", "v:0",
-		"-skip_frame", "nokey",
-		"-show_entries",
-		"frame=pts_time:format=duration:stream=codec_name,profile,level,pix_fmt,codec_tag_string,time_base",
+		"-show_entries", "format=duration",
 		"-of", "json",
 	}
 	args = append(args, headerArgs(headers)...)
@@ -324,18 +290,18 @@ func probeArgs(src stream.Direct, headers string) []string {
 	return append(args, src.URL)
 }
 
-// probe 执行 `ffprobe -skip_frame nokey`：只解出关键帧，收集 pts 与源时长。
+// probeDuration 执行 ffprobe，取出源时长（秒）。
 //
 // 失败返回 httpx.ErrUpstream，**错误文本只有稳定类别**（`ffprobe failed` /
 // `upstream rejected`）：stderr 原文（含完整直链与签名查询串）绝不回给客户端，
 // 只按 loggableStderr 的判据进日志，定位靠 host + 类别 + 集标识。
 //
 // 密文源要单独判一次解密自检：key 错的时候 ffprobe 常常**以 0 退出**、只往 stderr
-// 吐 `non-existing PPS …`，拿不到关键帧却也不算失败 —— 那种「成功」会把空索引写进
-// 库、把空分片写进缓存。所以 key 非空时 stderr 必须为空（实测正确 key 下 0 字节），
+// 吐 `non-existing PPS …`，拿不到时长却也不算失败 —— 那种「成功」会把 0 写进
+// episode.duration_sec。所以 key 非空时 stderr 必须为空（实测正确 key 下 0 字节），
 // 非空即解密失败（MKACG-626 AC-8）。明文流不看 stderr：`-v error` 下源本身也会吐
 // 无害告警，按它判失败会把好源打成 502。
-func probe(ctx context.Context, logger *slog.Logger, src stream.Direct, headers string) (sourceInfo, error) {
+func probeDuration(ctx context.Context, logger *slog.Logger, src stream.Direct, headers string) (float64, error) {
 	dctx, cancel := context.WithTimeout(ctx, timeoutProbe)
 	defer cancel()
 	cmd := exec.CommandContext(dctx, "ffprobe", probeArgs(src, headers)...)
@@ -347,95 +313,66 @@ func probe(ctx context.Context, logger *slog.Logger, src stream.Direct, headers 
 		logger.WarnContext(ctx, "ffprobe failed",
 			"host", safeHost(src.URL), "class", class,
 			"stderr", loggableStderr(stderrTail(err, stderr.Bytes())))
-		return sourceInfo{}, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
+		return 0, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
 	}
 	if len(src.Key) > 0 && stderr.Len() > 0 {
 		logger.WarnContext(ctx, "ffprobe decryption self-check failed",
 			"host", safeHost(src.URL),
 			"stderr", loggableStderr(stderrTail(nil, stderr.Bytes())))
-		return sourceInfo{}, fmt.Errorf("%s: %w", classDecryptFailed, httpx.ErrUpstream)
+		return 0, fmt.Errorf("%s: %w", classDecryptFailed, httpx.ErrUpstream)
 	}
 	var decoded struct {
-		Frames []struct {
-			PtsTime string `json:"pts_time"`
-		} `json:"frames"`
 		Format struct {
 			Duration string `json:"duration"`
 		} `json:"format"`
-		Streams []struct {
-			CodecName      string `json:"codec_name"`
-			Profile        string `json:"profile"`
-			Level          int    `json:"level"`
-			PixFmt         string `json:"pix_fmt"`
-			CodecTagString string `json:"codec_tag_string"`
-			TimeBase       string `json:"time_base"`
-		} `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &decoded); err != nil {
-		return sourceInfo{}, fmt.Errorf("解析 ffprobe 输出: %w（%v）", httpx.ErrUpstream, err)
+		return 0, fmt.Errorf("解析 ffprobe 输出: %w（%v）", httpx.ErrUpstream, err)
 	}
-
-	var info sourceInfo
-	for _, f := range decoded.Frames {
-		pts, perr := strconv.ParseFloat(f.PtsTime, 64)
-		if perr != nil || pts < 0 {
-			continue
-		}
-		info.keyframes = append(info.keyframes, pts)
-	}
-	info.durationSec, _ = strconv.ParseFloat(decoded.Format.Duration, 64)
-	if len(decoded.Streams) > 0 {
-		s := decoded.Streams[0]
-		info.codecSig = strings.Join([]string{
-			s.CodecName, s.Profile, strconv.Itoa(s.Level), s.PixFmt, s.CodecTagString, s.TimeBase,
-		}, "/")
-	}
-	return info, nil
+	seconds, _ := strconv.ParseFloat(decoded.Format.Duration, 64)
+	return seconds, nil
 }
 
-// cutArgs 拼 `ffmpeg` 切片的完整 argv（纯函数）：`-decryption_key` 与 `-headers`
-// 落在 `-i` 之前，才是输入选项；`-ss` 也在 `-i` 之前（输入寻址）。
-func cutArgs(src stream.Direct, start, dur, offset float64, headers string) []string {
+// remuxArgs 拼整集转封装的完整 argv（纯函数）：`-decryption_key` 与 `-headers`
+// 落在 `-i` 之前，才是输入选项。
+//
+// 一条路径、不切、无 `-ss/-t`/无 `-output_ts_offset`（ADR-0011 D4）：整集一次
+// `-c copy` 写成 fragmented MP4，片头自带 `ftyp+moov` 所以每片自包含、可单独 ffprobe；
+// 集边界的时间戳重置由 `#EXT-X-DISCONTINUITY` 表达，不再靠平移 PTS 兜。
+func remuxArgs(src stream.Direct, headers string) []string {
 	args := append([]string{"-v", "error"}, headerArgs(headers)...)
 	args = append(args, decryptionArgs(src.Key)...)
 	args = append(args,
-		"-ss", formatSeconds(start),
 		"-i", src.URL,
-		"-t", formatSeconds(dur),
 		"-c", "copy",
+		"-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4", "pipe:1",
 	)
-	if offset > 0 {
-		args = append(args, "-output_ts_offset", formatSeconds(offset))
-	}
-	return append(args, "-f", "mpegts", "pipe:1")
+	return args
 }
 
-// cut 执行 ffmpeg：`-ss` 前置（输入寻址，切点已是关键帧所以不漂移）→ `-c copy`
-// → MPEG-TS 写到 stdout。返回完整字节；失败返回 httpx.ErrUpstream，**错误文本只有
-// 稳定类别**（`ffmpeg failed` / `upstream rejected`）—— ffmpeg 的 stderr 里带着
-// 完整直链与签名查询串，只按 loggableStderr 的判据进日志（MKACG-639）。
+// remux 执行 ffmpeg：整集 `-c copy` 转封装成 fMP4 写到 stdout，返回完整字节。
 //
-// offset 是该片在合并时间轴上的绝对起点（单集传 0）：非零时用 -output_ts_offset
-// 把该片的 PTS/DTS 平移到绝对位置，跨集的连续时间轴因此没有时间戳回退——否则
-// 每集从 0 重新计时，播放器会在集边界丢帧（实测 ffmpeg 会报 non-monotonically
-// increasing dts，虽不致命但会掉帧）。
+// 失败返回 httpx.ErrUpstream，**错误文本只有稳定类别**（`ffmpeg failed` /
+// `upstream rejected`）—— ffmpeg 的 stderr 里带着完整直链与签名查询串，只按
+// loggableStderr 的判据进日志（MKACG-639）。
 //
 // 字节全部收进内存再返回，调用方才能「先定状态码再写响应」：ffmpeg 中途失败时
-// 客户端看到的是干净的 502，不是半截流。单片 10s 约 2–5 MB（DESIGN §2）。
+// 客户端看到的是干净的 502，不是半截流。
 //
 // src.Key 非空时解密交给 ffmpeg 原生 `-decryption_key`（不自己解 CENC、不落整集
-// 明文）：同一条 `-ss … -c copy` 路径，只是多一个输入选项。
-func cut(ctx context.Context, logger *slog.Logger, src stream.Direct, start, dur, offset float64, headers string) ([]byte, error) {
-	dctx, cancel := context.WithTimeout(ctx, timeoutCut)
+// 明文）：同一条 `-c copy` 路径，只是多一个输入选项。
+func remux(ctx context.Context, logger *slog.Logger, src stream.Direct, headers string) ([]byte, error) {
+	dctx, cancel := context.WithTimeout(ctx, timeoutRemux)
 	defer cancel()
-	cmd := exec.CommandContext(dctx, "ffmpeg", cutArgs(src, start, dur, offset, headers)...)
+	cmd := exec.CommandContext(dctx, "ffmpeg", remuxArgs(src, headers)...)
 	out, err := cmd.Output()
 	if err != nil {
-		// out 是 stdout（失败时可能是半截 TS 字节），既不进日志也不进错误文本：
+		// out 是 stdout（失败时可能是半截字节），既不进日志也不进错误文本：
 		// stderr 只从 ExitError 取。
 		tail := stderrTail(err, nil)
-		class := failureClass(classCutFailed, []byte(tail))
-		logger.WarnContext(ctx, "ffmpeg cut failed",
+		class := failureClass(classRemuxFailed, []byte(tail))
+		logger.WarnContext(ctx, "ffmpeg remux failed",
 			"host", safeHost(src.URL), "class", class,
 			"stderr", loggableStderr(tail))
 		return nil, fmt.Errorf("%s: %w", class, httpx.ErrUpstream)
@@ -443,7 +380,7 @@ func cut(ctx context.Context, logger *slog.Logger, src stream.Direct, start, dur
 	return out, nil
 }
 
-// formatSeconds 把秒格式化成 ffmpeg 接受的十进制（毫秒精度足够：切点已是关键帧）。
+// formatSeconds 把秒格式化成三位十进制（EXTINF 用；整数秒时长写成 `123.000`）。
 func formatSeconds(v float64) string {
 	return strconv.FormatFloat(v, 'f', 3, 64)
 }

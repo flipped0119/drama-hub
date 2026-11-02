@@ -80,16 +80,16 @@ func newTestCache(t *testing.T) *testCache {
 }
 
 const (
-	testUID   = "e1"
-	testCodec = "h264/high/31/yuv420p/avc1/1/90000"
-	// testSegmentBody 冒充一片 MPEG-TS：内容只要非空且可断言即可。
-	testSegmentBody = "\x47\x40\x00\x10 fake mpegts payload"
-	testIndexBody   = `{"keyframes":[0,10.07],"duration":21.34}`
+	testUID = "e1"
+	// testChannel 是分片键里的通道段（web 明文源）。
+	testChannel = "web"
+	// testSegmentBody 冒充一片自包含 fMP4：内容只要非空且可断言即可。
+	testSegmentBody = "\x00\x00\x00\x18ftypiso5 fake fmp4 payload"
 )
 
-// segSpec 是某个分片的缓存位置（键按契约规则算）。
-func segSpec(uid string, seq int) Spec {
-	return Spec{Kind: store.ArtifactKindSegment, Key: SegmentKey(uid, seq, testCodec), Ext: ".ts"}
+// segSpec 是某一集的缓存位置（键按契约规则算：集 uid + 通道）。
+func segSpec(uid string) Spec {
+	return Spec{Kind: store.ArtifactKindSegment, Key: SegmentKey(uid, testChannel), Ext: ".m4s"}
 }
 
 // genOf 返回一个总是产出 body 的生成函数。
@@ -133,7 +133,7 @@ func findTree(t *testing.T, root string) []string {
 	return out
 }
 
-// contentFiles 只取三个内容目录（cover/index/seg）下的普通文件，不含 tmp。
+// contentFiles 只取内容目录（cover/seg）下的普通文件，不含 tmp。
 func contentFiles(t *testing.T, root string) []string {
 	t.Helper()
 	var out []string
@@ -147,74 +147,59 @@ func contentFiles(t *testing.T, root string) []string {
 }
 
 // AC：目录布局与键规则与 docs/CACHE-MODEL.md「落盘布局与键」一致
-// （seg/<hash 前 2 位>/<hash>.ts、index/<hash 前 2 位>/<hash>.json）。
+// （seg/<hash 前 2 位>/<hash>.m4s，键 = sha256("e<id>" \x1f channel)）。
 func TestLayoutAndKeys(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
 
-	seg := segSpec(testUID, 3)
-	idx := Spec{Kind: store.ArtifactKindIndex, Key: IndexKey("m7"), Ext: ".json"}
-	for _, tc2 := range []struct {
-		spec Spec
-		body string
-	}{{seg, testSegmentBody}, {idx, testIndexBody}} {
-		got, err := tc.c.GetOrGenerate(ctx, tc2.spec, genOf(tc2.body))
-		if err != nil {
-			t.Fatalf("GetOrGenerate(%s/%s): %v", tc2.spec.Kind, tc2.spec.Key, err)
-		}
-		if string(got) != tc2.body {
-			t.Fatalf("返回字节 = %q, 期望 %q", got, tc2.body)
-		}
+	seg := segSpec(testUID)
+	got, err := tc.c.GetOrGenerate(ctx, seg, genOf(testSegmentBody))
+	if err != nil {
+		t.Fatalf("GetOrGenerate(%s/%s): %v", seg.Kind, seg.Key, err)
+	}
+	if string(got) != testSegmentBody {
+		t.Fatalf("返回字节 = %q, 期望 %q", got, testSegmentBody)
 	}
 
-	// 键规则：分片 = sha256(uid \x1f seq \x1f codec_sig)，索引 = uid。
-	wantSegHash := sha256Hex(testUID + "\x1f" + "3" + "\x1f" + testCodec)
+	// 键规则：分片 = sha256("e<id>" \x1f channel)，seq 不进键。
+	wantSegHash := sha256Hex(testUID + "\x1f" + testChannel)
 	if seg.Key != wantSegHash {
 		t.Fatalf("分片键 = %q, 期望 %q", seg.Key, wantSegHash)
 	}
-	wantIdxHash := sha256Hex("m7")
-
-	wantRows := []struct {
-		kind, key, relPath, body string
-	}{
-		{store.ArtifactKindSegment, wantSegHash,
-			filepath.Join(dirSegment, wantSegHash[:2], wantSegHash+".ts"), testSegmentBody},
-		{store.ArtifactKindIndex, "m7",
-			filepath.Join(dirIndex, wantIdxHash[:2], wantIdxHash+".json"), testIndexBody},
-	}
-	for _, want := range wantRows {
-		row, err := tc.st.ArtifactByKey(ctx, want.kind, want.key)
-		if err != nil {
-			t.Fatalf("ArtifactByKey(%s/%s): %v", want.kind, want.key, err)
-		}
-		wantPath := filepath.Join(tc.root, want.relPath)
-		if row.Path != wantPath {
-			t.Errorf("%s 落盘路径 = %q, 期望 %q", want.kind, row.Path, wantPath)
-		}
-		if row.Bytes != int64(len(want.body)) {
-			t.Errorf("%s.Bytes = %d, 期望 %d", want.kind, row.Bytes, len(want.body))
-		}
-		if row.SHA256 != sha256Hex(want.body) {
-			t.Errorf("%s.SHA256 = %q, 期望内容哈希", want.kind, row.SHA256)
-		}
-		if row.LastUsedAt != stamp(tc.clock.now()) {
-			t.Errorf("%s.LastUsedAt = %q, 期望 %q", want.kind, row.LastUsedAt, stamp(tc.clock.now()))
-		}
-		onDisk, err := os.ReadFile(row.Path)
-		if err != nil {
-			t.Fatalf("读缓存文件 %s: %v", row.Path, err)
-		}
-		if string(onDisk) != want.body {
-			t.Errorf("%s 落盘内容 = %q, 期望 %q", want.kind, onDisk, want.body)
-		}
+	// 同一集换通道 → 键必变（否则两条通道的字节会互相冒充）。
+	if SegmentKey(testUID, "app") == seg.Key {
+		t.Fatalf("同一集的 app 通道算出了与 web 相同的键")
 	}
 
-	// 目录布局：贴出 find 形式的完整清单并逐条断言（只有两条内容 + tmp/）。
+	row, err := tc.st.ArtifactByKey(ctx, seg.Kind, seg.Key)
+	if err != nil {
+		t.Fatalf("ArtifactByKey(%s/%s): %v", seg.Kind, seg.Key, err)
+	}
+	wantPath := filepath.Join(tc.root, dirSegment, wantSegHash[:2], wantSegHash+".m4s")
+	if row.Path != wantPath {
+		t.Errorf("分片落盘路径 = %q, 期望 %q", row.Path, wantPath)
+	}
+	if row.Bytes != int64(len(testSegmentBody)) {
+		t.Errorf("分片.Bytes = %d, 期望 %d", row.Bytes, len(testSegmentBody))
+	}
+	if row.SHA256 != sha256Hex(testSegmentBody) {
+		t.Errorf("分片.SHA256 = %q, 期望内容哈希", row.SHA256)
+	}
+	if row.LastUsedAt != stamp(tc.clock.now()) {
+		t.Errorf("分片.LastUsedAt = %q, 期望 %q", row.LastUsedAt, stamp(tc.clock.now()))
+	}
+	onDisk, err := os.ReadFile(row.Path)
+	if err != nil {
+		t.Fatalf("读缓存文件 %s: %v", row.Path, err)
+	}
+	if string(onDisk) != testSegmentBody {
+		t.Errorf("分片落盘内容 = %q, 期望 %q", onDisk, testSegmentBody)
+	}
+
+	// 目录布局：贴出 find 形式的完整清单并逐条断言（一条内容 + tmp/）。
 	want := []string{
-		"index/", filepath.Join("index", wantIdxHash[:2]) + "/",
-		filepath.Join("index", wantIdxHash[:2], wantIdxHash+".json"),
-		"seg/", filepath.Join("seg", wantSegHash[:2]) + "/",
-		filepath.Join("seg", wantSegHash[:2], wantSegHash+".ts"),
+		dirSegment + "/", filepath.Join(dirSegment, wantSegHash[:2]) + "/",
+		filepath.Join(dirSegment, wantSegHash[:2], wantSegHash+".m4s"),
 		dirTmp + "/",
 	}
 	sort.Strings(want)
@@ -231,7 +216,7 @@ func TestLayoutAndKeys(t *testing.T) {
 func TestHitDoesNotRegenerateAndTouches(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 
 	var gens atomic.Int32
 	gen := func(context.Context) ([]byte, error) {
@@ -278,7 +263,7 @@ func TestHitDoesNotRegenerateAndTouches(t *testing.T) {
 func TestMissingFileRegenerates(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 2)
+	spec := segSpec("e3")
 
 	var gens atomic.Int32
 	gen := func(context.Context) ([]byte, error) {
@@ -317,7 +302,7 @@ func TestMissingFileRegenerates(t *testing.T) {
 func TestGenerateFailureWritesNothing(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 1)
+	spec := segSpec("e2")
 	genErr := errors.New("假 CDN 返回 500")
 
 	before := findTree(t, tc.root)
@@ -339,7 +324,7 @@ func TestGenerateFailureWritesNothing(t *testing.T) {
 func TestSingleFlightTenConcurrent(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 
 	var gens atomic.Int32
 	gen := func(context.Context) ([]byte, error) {
@@ -390,7 +375,7 @@ func TestSingleFlightTenConcurrent(t *testing.T) {
 func TestSingleFlightPublishesBeforeRemoving(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 	id := spec.Kind + keySeparator + spec.Key
 
 	var probes atomic.Int32
@@ -446,7 +431,7 @@ func TestSingleFlightPublishesBeforeRemoving(t *testing.T) {
 func TestSingleFlightLeaderRechecksHit(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	spec := segSpec(testUID, 0)
+	spec := segSpec(testUID)
 
 	var gens atomic.Int32
 	gen := func(context.Context) ([]byte, error) {
@@ -507,7 +492,7 @@ func TestSingleFlightLeaderRechecksHit(t *testing.T) {
 func TestDifferentKeysDoNotBlock(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
-	aSpec, bSpec := segSpec("e1", 0), segSpec("e1", 1)
+	aSpec, bSpec := segSpec("e1"), segSpec("e2")
 	bStarted := make(chan struct{})
 
 	aGen := func(context.Context) ([]byte, error) {
@@ -548,15 +533,16 @@ func TestRejectsNonContractContent(t *testing.T) {
 		genCalled = true
 		return []byte("#EXTM3U\n"), nil
 	}
+	segKey := SegmentKey("e1", testChannel)
 	bad := []Spec{
-		{Kind: "playlist", Key: "e1", Ext: ".m3u8"},                                          // m3u8 文本没有 kind
-		{Kind: "source", Key: "e1", Ext: ".mp4"},                                             // 源整片没有 kind
-		{Kind: store.ArtifactKindSegment, Key: SegmentKey("e1", 0, testCodec), Ext: ".m3u8"}, // m3u8 冒充分片
-		{Kind: store.ArtifactKindSegment, Key: SegmentKey("e1", 0, testCodec), Ext: ".mp4"},  // 整片冒充分片
-		{Kind: store.ArtifactKindIndex, Key: "e1", Ext: ".ts"},                               // 索引写成片
-		{Kind: store.ArtifactKindCover, Key: CoverKey("web", "p1"), Ext: ".mp4"},             // 整片冒充海报
-		{Kind: store.ArtifactKindSegment, Key: "", Ext: ".ts"},                               // 空键
-		{Kind: store.ArtifactKindSegment, Key: "not-a-hash", Ext: ".ts"},                     // 键不是 sha256
+		{Kind: "playlist", Key: "e1", Ext: ".m3u8"},                              // m3u8 文本没有 kind
+		{Kind: "source", Key: "e1", Ext: ".mp4"},                                 // 源整片没有 kind
+		{Kind: store.ArtifactKindSegment, Key: segKey, Ext: ".m3u8"},             // m3u8 冒充分片
+		{Kind: store.ArtifactKindSegment, Key: segKey, Ext: ".mp4"},              // 整片冒充分片
+		{Kind: store.ArtifactKindSegment, Key: segKey, Ext: ".ts"},               // 旧的 TS 后缀不再接受
+		{Kind: store.ArtifactKindCover, Key: CoverKey("web", "p1"), Ext: ".mp4"}, // 整片冒充海报
+		{Kind: store.ArtifactKindSegment, Key: "", Ext: ".m4s"},                  // 空键
+		{Kind: store.ArtifactKindSegment, Key: "not-a-hash", Ext: ".m4s"},        // 键不是 sha256
 	}
 	for _, spec := range bad {
 		if _, err := tc.c.GetOrGenerate(ctx, spec, gen); err == nil {
@@ -571,23 +557,19 @@ func TestRejectsNonContractContent(t *testing.T) {
 	}
 }
 
-// 键规则（纯函数）：分片三段任一变化都换键；索引键就是 uid；海报键是 <provider>/<id>。
+// 键规则（纯函数）：分片键只由「集 uid + 通道」决定；海报键是 <provider>/<id>。
 func TestKeyRules(t *testing.T) {
-	base := SegmentKey(testUID, 3, testCodec)
-	if want := sha256Hex(testUID + "\x1f" + "3" + "\x1f" + testCodec); base != want {
-		t.Fatalf("SegmentKey = %q, 期望 sha256(uid|seq|codec_sig) = %q", base, want)
+	base := SegmentKey(testUID, testChannel)
+	if want := sha256Hex(testUID + "\x1f" + testChannel); base != want {
+		t.Fatalf("SegmentKey = %q, 期望 sha256(uid|channel) = %q", base, want)
 	}
 	distinct := map[string]bool{
-		base:                                  true,
-		SegmentKey("e2", 3, testCodec):        true, // 换 uid
-		SegmentKey(testUID, 4, testCodec):     true, // 换 seq
-		SegmentKey(testUID, 3, testCodec+"x"): true, // 换 codec_sig
+		base:                          true,
+		SegmentKey("e2", testChannel): true, // 换集
+		SegmentKey(testUID, "app"):    true, // 换通道
 	}
-	if len(distinct) != 4 {
-		t.Fatalf("四种输入只得到 %d 个不同键，期望 4", len(distinct))
-	}
-	if IndexKey("m7") != "m7" {
-		t.Fatalf("IndexKey(m7) = %q, 期望 uid 自身", IndexKey("m7"))
+	if len(distinct) != 3 {
+		t.Fatalf("三种输入只得到 %d 个不同键，期望 3", len(distinct))
 	}
 	if CoverKey("web", "7503745441910017049") != "web/7503745441910017049" {
 		t.Fatalf("CoverKey = %q", CoverKey("web", "7503745441910017049"))

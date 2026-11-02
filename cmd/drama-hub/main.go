@@ -161,7 +161,7 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // 领域包只提供自己的 handler，不关心挂载点。
 //
 // 播放面（docs/PLAYBACK-CONTRACT.md）只有两个口子：`/video/{id}.m3u8` 与
-// `/video/{id}/{seq}.ts`，单集与合并集同一路径形态，id 自带 HMAC 签名、不要 Basic。
+// `/video/{id}/{seq}.m4s`，单集与合并集同一路径形态，id 自带 HMAC 签名、不要 Basic。
 // `/webdav/` 是只读元数据面。1.0 的 `/dav/` 与 `/s/{token}/*` 已退役，不留兼容层
 // （`.strm` 是按请求渲染的，下一次读取就是新内容）。
 //

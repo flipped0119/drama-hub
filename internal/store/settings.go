@@ -35,7 +35,6 @@ type SettingKey string
 const (
 	KeyStrmPrefix   SettingKey = "strm_prefix"
 	KeyStreamSecret SettingKey = "stream_secret"
-	KeySegTargetSec SettingKey = "seg_target_sec"
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
 	KeyCacheDir     SettingKey = "cache_dir"
@@ -382,20 +381,18 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		return settingSpec{kind: kindURL}, true
 	case KeyStreamSecret:
 		return settingSpec{kind: kindSecret, required: true}, true
-	case KeySegTargetSec:
-		return settingSpec{kind: kindInt, def: "10", min: 4, max: 30}, true
 	case KeyWebDAVUser:
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyWebDAVPass:
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyCacheDir:
-		// 缓存根目录：海报/分片/关键帧索引落 <cache_dir>/{cover,seg,index}/…；写盘时按需 MkdirAll。
+		// 缓存根目录：海报与分片落 <cache_dir>/{cover,seg}/…；写盘时按需 MkdirAll。
 		return settingSpec{kind: kindString, def: "./data/cache"}, true
 	case KeyCacheMaxMB:
 		// 分片缓存上限（MB）：0 = 不按大小淘汰，只受 cache_lru_days 约束。
 		return settingSpec{kind: kindInt, def: "8192", min: 0, max: 1048576}, true
 	case KeyCacheLRUDays:
-		// 超过 N 天未命中的缓存条目（三种 kind 都算）删除。
+		// 超过 N 天未命中的缓存条目（所有 kind 都算）删除。
 		return settingSpec{kind: kindInt, def: "30", min: 1, max: 365}, true
 	case KeyCoverTimeoutSec:
 		// 海报下载的单次出站超时：百 KB 级图片，离线时不该按插件超时（30 s）等。

@@ -14,7 +14,7 @@ ffmpeg -y -hide_banner -loglevel error \
   -c:v libx264 -pix_fmt yuv420p -profile:v baseline -level 3.0 \
   -c:a aac -shortest "$out/ep-a.mp4"
 
-# 集 B：hevc + aac（解码器签名与 A 不同，用于测试 codec_sig 分派）
+# 集 B：hevc + aac（另一种编码，用于验证 fMP4 转封装对 HEVC 也成立）
 ffmpeg -y -hide_banner -loglevel error \
   -f lavfi -i "testsrc2=size=320x240:rate=30:duration=5" \
   -f lavfi -i "sine=frequency=880:duration=5" \

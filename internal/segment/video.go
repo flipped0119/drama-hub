@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -17,23 +18,23 @@ import (
 )
 
 // 播放面路由（docs/PLAYBACK-CONTRACT.md「两个口子」）。装配根把两个 pattern 挂在
-// 顶层 mux 上；`{id}` 承载整段 `<uid>-<签名>`，`{file}` 承载 `<seq>.ts`（Go 的路由
-// pattern 不支持段内通配 `{seq}.ts`，因此用整段承载）。
+// 顶层 mux 上；`{id}` 承载整段 `<uid>-<签名>`，`{file}` 承载 `<seq>.m4s`（Go 的路由
+// pattern 不支持段内通配 `{seq}.m4s`，因此用整段承载）。
 const (
 	// PlaylistRoute 是播放列表端点：`GET|HEAD /video/{id}.m3u8`。
 	PlaylistRoute = "GET /video/{id}"
-	// SegmentRoute 是分片端点：`GET|HEAD /video/{id}/{seq}.ts`。
+	// SegmentRoute 是分片端点：`GET|HEAD /video/{id}/{seq}.m4s`。
 	SegmentRoute = "GET /video/{id}/{file}"
 )
 
 // m3u8Suffix 是播放列表的扩展名（契约：单集与合并集同一路径形态）。
 const m3u8Suffix = ".m3u8"
 
-// ServePlaylist 实现 `GET /video/{id}.m3u8`：鉴权 → 展开播放单元 → 按需建索引 →
+// ServePlaylist 实现 `GET /video/{id}.m3u8`：鉴权 → 展开播放单元 → 补齐每集时长 →
 // 渲染 VOD playlist。
 //
 // 状态码（docs/PLAYBACK-CONTRACT.md「GET /video/{id}.m3u8」）：secret 读失败 500、
-// 签名不对/缺 `-` 401、uid 非法或库里没有 404、解析不到直链 502、索引建立超时
+// 签名不对/缺 `-` 401、uid 非法或库里没有 404、解析不到直链 502、时长探测超时
 // 503 + Retry-After。
 func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -61,7 +62,7 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 	}
 	// 播放列表也现解析直链：某个成员拿不到直链时按契约回 502，而不是放出
 	// 一份「能读、一播就失败」的时间轴。
-	tl, err := c.timelineFor(ctx, u, true)
+	tl, err := c.timelineFor(ctx, u)
 	if err != nil {
 		writeVideoError(w, err)
 		return
@@ -74,12 +75,12 @@ func (c *Cutter) ServePlaylist(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(body)
 }
 
-// ServeSegment 实现 `GET /video/{id}/{seq}.ts`：鉴权 → 时间轴定位 → 缓存命中即回 /
-// 未命中切片落缓存再回。
+// ServeSegment 实现 `GET /video/{id}/{seq}.m4s`：鉴权 → 定位第 seq 集 → 缓存命中即回 /
+// 未命中整集转封装落缓存再回。
 //
 // 缓存返回的 []byte 在 single-flight 下是多个等待者共享的只读字节，这里只读不写
 // （ServeContent 只读）。Range 与 HEAD 都由 http.ServeContent 处理：分片是完整
-// 不可变对象，不需要分片生成。
+// 不可变对象，不需要分段生成。
 func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	seq, ok := parseSeqFile(r.PathValue("file"))
@@ -104,44 +105,159 @@ func (c *Cutter) ServeSegment(w http.ResponseWriter, r *http.Request) {
 		writeVideoError(w, err)
 		return
 	}
-	// 分片端点只解析它真正要切的那一集（合并集的不同 seq 属于不同源集）。
-	tl, err := c.timelineFor(ctx, u, false)
+	// 「每集一片」：BuildPlaylist 按成员顺序编号，所以第 seq 片就是第 seq 集。
+	if seq < 0 || seq >= len(u.eps) {
+		httpx.WriteError(w, fmt.Errorf("%w: 播放单元 %s 没有分片 %d", httpx.ErrNotFound, uid, seq))
+		return
+	}
+	ep := u.eps[seq]
+
+	channel, direct, resolved, err := c.episodeChannel(ctx, ep)
 	if err != nil {
 		writeVideoError(w, err)
 		return
 	}
-	if seq < 0 || seq >= len(tl.slices) {
-		httpx.WriteError(w, fmt.Errorf("%w: 播放单元 %s 没有分片 %d", httpx.ErrNotFound, uid, seq))
-		return
-	}
-	sl := tl.slices[seq]
-	key := cache.SegmentKey(uid, seq, sl.CodecSig)
+	key := cache.SegmentKey(episodeUID(ep.ID), channel)
 	body, err := c.caches.GetOrGenerate(ctx,
-		cache.Spec{Kind: store.ArtifactKindSegment, Key: key, Ext: ".ts"},
+		cache.Spec{Kind: store.ArtifactKindSegment, Key: key, Ext: segmentSuffix},
 		func(ctx context.Context) ([]byte, error) {
-			// 直链只在真要切片时才解析：命中缓存的分片请求零外呼
+			// 直链只在真要生成时才解析：命中缓存的分片请求零外呼
 			// （契约「命中即回文件」，也是缓存存在的意义）。
-			d, err := c.direct(ctx, tl, sl.EpisodeID)
+			src := direct
+			if !resolved {
+				var rerr error
+				if src, rerr = c.resolve(ctx, ep); rerr != nil {
+					return nil, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, rerr, httpx.ErrUpstream)
+				}
+			}
+			out, err := remux(ctx, c.logger, src, c.fetchHeaders(src))
 			if err != nil {
 				return nil, err
 			}
-			return cut(ctx, c.logger, d, sl.StartSec, sl.Dur, sl.OffsetSec, c.fetchHeaders(d))
+			// 每次真实生成一条 Info：AC「同一集第二次播放 ffmpeg 调用 0 次」的计次依据。
+			c.logger.InfoContext(ctx, "segment generated",
+				"episode_id", ep.ID, "channel", channel, "bytes", len(out))
+			return out, nil
 		})
 	if err != nil {
-		c.logger.WarnContext(ctx, "segment slice failed",
-			"uid", uid, "seq", seq, "start_sec", sl.StartSec, "err", err)
+		c.logger.WarnContext(ctx, "segment remux failed",
+			"uid", uid, "seq", seq, "episode_id", ep.ID, "channel", channel, "err", err)
 		// 生成失败（ffmpeg）是 502 且不写缓存；缓存自身故障按 500 报，不冒充上游问题。
 		if errors.Is(err, httpx.ErrUpstream) {
-			writeVideoError(w, fmt.Errorf("切片 %s 分片 %d（%v）: %w", uid, seq, err, httpx.ErrUpstream))
+			writeVideoError(w, fmt.Errorf("转封装 %s 分片 %d（%v）: %w", uid, seq, err, httpx.ErrUpstream))
 			return
 		}
 		httpx.WriteError(w, fmt.Errorf("写分片 %s %d: %w", uid, seq, err))
 		return
 	}
 
-	w.Header().Set("Content-Type", "video/mp2t")
+	// 集边界的时间戳：缓存里的字节一律 0 基（键只由「集 + 通道」决定），出流时按本片在
+	// 播放单元里的起点平移 tfdt —— ffmpeg 系播放端（Emby 转码/DirectStream、mpv）按 PTS
+	// 解码，只有 DISCONTINUITY 不重定基准会丢帧（ADR-0011 D6'）。
+	start, err := c.timelineStart(ctx, uid, u.eps, seq)
+	if err != nil {
+		writeVideoError(w, err)
+		return
+	}
+	served, err := shiftTimeline(body, start)
+	if err != nil {
+		httpx.WriteError(w, fmt.Errorf("平移分片 %s %d 的时间轴: %w", uid, seq, err))
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/mp4")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
-	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(body))
+	http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(served))
+}
+
+// timelineStart 返回第 seq 片在播放单元时间轴上的起点（前面各集的 duration_sec 之和），
+// 并在前置集时长还没回填时先补齐。
+//
+// 为什么必须补齐而不是「算不准就按 0」：起点决定出站片的 tfdt，算错就是集边界 PTS 回退、
+// ffmpeg 系播放端丢帧（功能检测实测：直接请求分片、不取 playlist 时 4 片首 PTS 全 0，
+// 拼成 playlist 后 1550 包只解出 800 帧）。所以缺时长时在这里现补齐 —— 解析一次直链 +
+// ffprobe 取时长 + 回填（`ensureDuration`，与 playlist 路径同一份实现），补齐后写库，
+// 后续请求回到「零外呼」。
+//
+// 代价边界：只有「直接请求分片 / 首播并发（分片早于 playlist 到达）」这一种情形会外呼，
+// 次数 = 前面还没回填的集数（≤ 一个合并块的成员数，默认 10），且只发生一次。
+// 补齐失败（上游解析不到 / 探测失败 / 超时）按播放面的错误矩阵返回，绝不出一片时间轴错误
+// 的字节。
+func (c *Cutter) timelineStart(ctx context.Context, uid string, eps []store.Episode, seq int) (time.Duration, error) {
+	if start, exact := sliceStart(eps, seq); exact {
+		return start, nil
+	}
+	ensureCtx, cancel := context.WithTimeout(ctx, c.ensureTimeout)
+	defer cancel()
+
+	for i := 0; i < seq && i < len(eps); i++ {
+		if eps[i].DurationSec > 0 {
+			continue
+		}
+		d, err := c.resolve(ctx, eps[i])
+		if err != nil {
+			return 0, fmt.Errorf("解析剧集 %d 直链（%v）: %w", eps[i].ID, err, httpx.ErrUpstream)
+		}
+		seconds, err := c.ensureDuration(ensureCtx, eps[i], d)
+		if err != nil {
+			return 0, err
+		}
+		eps[i].DurationSec = int(math.Round(seconds))
+		c.logger.InfoContext(ctx, "timeline start backfilled",
+			"uid", uid, "seq", seq, "episode_id", eps[i].ID, "duration_sec", eps[i].DurationSec)
+	}
+
+	start, exact := sliceStart(eps, seq)
+	if !exact {
+		// 补齐后仍然为 0：这一集的源探测不出时长（异常源）。此时没有正确的时间轴可用，
+		// 记一条 warn 继续用已有值出流 —— 比让整块播不了更可接受，也不会污染缓存。
+		c.logger.WarnContext(ctx, "segment timeline start is approximate",
+			"uid", uid, "seq", seq, "reason", "probe 拿不到前面某集的时长")
+	}
+	return start, nil
+}
+
+// sliceStart 返回第 seq 片在播放单元时间轴上的起点（前面各集的 duration_sec 之和），
+// 以及这些前置集的时长是否都已回填。纯函数：补齐由调用方（timelineStart）负责。
+//
+// 时长用 episode.duration_sec（唯一真值，首播回填），与 playlist 里 EXTINF 是同一个值，
+// 所以「起点 == 前面各条 EXTINF 之和」，播放端按它解码不会回退。
+func sliceStart(eps []store.Episode, seq int) (time.Duration, bool) {
+	exact := true
+	total := 0
+	for _, ep := range eps[:min(seq, len(eps))] {
+		if ep.DurationSec <= 0 {
+			exact = false
+			continue
+		}
+		total += ep.DurationSec
+	}
+	return time.Duration(total) * time.Second, exact
+}
+
+// episodeChannel 取某集在 segment 表里的通道，并返回本次可直接复用的直链。
+//
+// 行在就是一次零外呼的读：命中缓存的分片请求从此不解析直链。行不在时才现解析
+// 一次，按解析结果把行写进去（正常情况下 playlist 已经建好，这里只是兜底）。
+// resolved=true 表示 direct 是本次刚解析的，生成时直接复用，不解析第二次。
+func (c *Cutter) episodeChannel(ctx context.Context, ep store.Episode) (channel string, direct stream.Direct, resolved bool, err error) {
+	seg, err := c.st.GetSegment(ctx, ep.ID)
+	switch {
+	case err == nil:
+		return seg.Channel, stream.Direct{}, false, nil
+	case !errors.Is(err, store.ErrNotFound):
+		return "", stream.Direct{}, false, fmt.Errorf("读分片身份 episode_id=%d: %w", ep.ID, err)
+	}
+
+	direct, err = c.resolve(ctx, ep)
+	if err != nil {
+		return "", stream.Direct{}, false, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, err, httpx.ErrUpstream)
+	}
+	channel = channelOf(direct)
+	if err := c.st.UpsertSegment(ctx, store.Segment{EpisodeID: ep.ID, Channel: channel}); err != nil {
+		return "", stream.Direct{}, false, fmt.Errorf("写分片身份 episode_id=%d: %w", ep.ID, err)
+	}
+	return channel, direct, true, nil
 }
 
 // playbackUnit 是一个播放单元：单集或合并块，eps 按播放顺序排列。
@@ -188,80 +304,47 @@ func (c *Cutter) unit(ctx context.Context, uid string) (playbackUnit, error) {
 	return playbackUnit{eps: []store.Episode{ep}}, nil
 }
 
-// resolvedTimeline 是播放单元的时间轴加上本次已解析的直链与 key（集 id → 直链）。
+// timelineFor 把一个播放单元的成员集展开成时间轴：每集一片。
 //
-// 直链只活在这次请求里：不落库、不缓存、不进 Timeline（时间轴是纯时长视图）。
-type resolvedTimeline struct {
-	slices []Slice
-	direct map[int64]stream.Direct
-}
-
-// timelineFor 把播放单元展开成时间轴；索引缺失、或现存索引属于另一个通道的集
-// 同步重建一次索引。
+// 每个成员都要现解析一次直链：拿不到就 502，不放一份「能读、一播就失败」的播放
+// 列表。解析结果同时给出通道，顺手把 segment 行的 channel 对齐（626 裁决 3 的机制
+// 原样保留：判据仍然只有 channelOf 一处）。时长取 episode.duration_sec，为 0 的
+// 现 ffprobe 一次并回填（ADR-0011 D2：唯一真值，不再有第二份时长）。
 //
-// resolveAll=true（playlist）：每个成员都现解析直链一次，拿不到就 502 —— 契约要求
-// 播放列表在「该集解析不到直链」时直接失败。通道判据（web / app）就在这次解析的
-// 结果里，所以「索引是不是别的通道建的」只有这条路径能判，也只需要这条路径判：
-// 播放器总是先取 playlist 再取分片。
-// resolveAll=false（分片）：只在需要建索引时才解析（探测要源地址），其余的集留给
-// 调用方按需解析，免得一次分片请求把整组都解析一遍；已有索引的分片请求零外呼
-// （契约「命中即回文件」）。
-//
-// 索引建立整体受 indexDeadline 约束：超时 → 503 + Retry-After（httpx.ErrUnavailable）。
-func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit, resolveAll bool) (resolvedTimeline, error) {
-	idxCtx, cancel := context.WithTimeout(ctx, c.indexTimeout)
+// 整体受 ensureDeadline 约束：超时 → 503 + Retry-After（httpx.ErrUnavailable）。
+func (c *Cutter) timelineFor(ctx context.Context, u playbackUnit) (*Timeline, error) {
+	ensureCtx, cancel := context.WithTimeout(ctx, c.ensureTimeout)
 	defer cancel()
 
-	eps := make([]EpisodeSegments, 0, len(u.eps))
-	direct := make(map[int64]stream.Direct, len(u.eps))
+	eps := make([]TimelineEpisode, 0, len(u.eps))
 	for _, ep := range u.eps {
-		segs, err := c.st.ListSegments(ctx, ep.ID)
+		d, err := c.resolve(ctx, ep)
 		if err != nil {
-			return resolvedTimeline{}, fmt.Errorf("读分片索引剧集 %d: %w", ep.ID, err)
+			return nil, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, err, httpx.ErrUpstream)
 		}
-		if resolveAll || len(segs) == 0 {
-			d, err := c.resolve(ctx, ep)
-			if err != nil {
-				return resolvedTimeline{}, fmt.Errorf("解析剧集 %d 直链（%v）: %w", ep.ID, err, httpx.ErrUpstream)
-			}
-			direct[ep.ID] = d
-			// 没有索引，或者索引是另一个通道（含没有通道段的老索引）留下的：重建。
-			// 不重建就会把旧通道的片数、时长与分片键永久沿用下去（626 裁决 3）。
-			if len(segs) == 0 || indexStale(segs, channelOf(d)) {
-				if segs, err = c.ensureSegments(idxCtx, ep, d); err != nil {
-					return resolvedTimeline{}, err
-				}
-			}
+		dur, err := c.ensureDuration(ensureCtx, ep, d)
+		if err != nil {
+			return nil, err
 		}
-		eps = append(eps, EpisodeSegments{EpisodeID: ep.ID, EpNo: ep.EpNo, Segments: segs})
+		if err := c.ensureChannel(ctx, ep.ID, channelOf(d)); err != nil {
+			return nil, err
+		}
+		eps = append(eps, TimelineEpisode{EpisodeID: ep.ID, Dur: dur})
 	}
-	return resolvedTimeline{slices: NewTimeline(eps).slices, direct: direct}, nil
+	return NewTimeline(eps), nil
 }
 
-// direct 取某一集的直链与 key：本次请求已解析过就复用，否则现解析一次。
-//
-// 解析失败包 httpx.ErrUpstream（契约：Resolve 失败一律 502），且绝不写库、不写缓存
-// —— 调用方是缓存生成函数，返回错误即「不落缓存」。
-func (c *Cutter) direct(ctx context.Context, tl resolvedTimeline, episodeID int64) (stream.Direct, error) {
-	if d, ok := tl.direct[episodeID]; ok {
-		return d, nil
-	}
-	ep, err := c.st.EpisodeByID(ctx, episodeID)
-	if err != nil {
-		return stream.Direct{}, fmt.Errorf("查分片所属剧集 %d: %w", episodeID, err)
-	}
-	d, err := c.resolve(ctx, ep)
-	if err != nil {
-		return stream.Direct{}, fmt.Errorf("解析剧集 %d 直链（%v）: %w", episodeID, err, httpx.ErrUpstream)
-	}
-	return d, nil
+// episodeUID 是播放单元句柄里「一集」的形态：`e<episode.id>`（DESIGN D3）。
+// 分片缓存键用它做前半段——片段只由「哪一集 + 哪个通道」决定（ADR-0011 D3）。
+func episodeUID(episodeID int64) string {
+	return "e" + strconv.FormatInt(episodeID, 10)
 }
 
-// parseSeqFile 解析 `<seq>.ts` 文件名：必须以 `.ts` 结尾，seq 是**纯十进制数字**
-// （允许前导零：缓存 key 由 (uid, seq, codec_sig) 决定，本包不改写客户端 URL）。
+// parseSeqFile 解析 `<seq>.m4s` 文件名：必须以 `.m4s` 结尾，seq 是**纯十进制数字**
+// （允许前导零：缓存键由 (集, 通道) 决定，本包不改写客户端 URL）。
 // 显式拒绝符号与非数字字符——strconv.Atoi 会接受 `+1`/`-1`，那不是本包产出的 URL 形态。
 func parseSeqFile(name string) (int, bool) {
-	seqStr, ok := strings.CutSuffix(name, ".ts")
+	seqStr, ok := strings.CutSuffix(name, segmentSuffix)
 	if !ok || seqStr == "" {
 		return 0, false
 	}
@@ -290,7 +373,7 @@ func parseEpisodeUID(uid string) (int64, bool) {
 	return id, true
 }
 
-// writeVideoError 按播放面的错误矩阵写出响应：索引未就绪/超时 → 503 + Retry-After
+// writeVideoError 按播放面的错误矩阵写出响应：时长探测超时 → 503 + Retry-After
 // （不出半截流），其余走 httpx 统一映射（404 / 502 / 500）。
 func writeVideoError(w http.ResponseWriter, err error) {
 	if errors.Is(err, httpx.ErrUnavailable) {

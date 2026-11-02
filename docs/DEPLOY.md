@@ -155,8 +155,10 @@ Emby 库路径指到 `/mnt/dramahub`，类型「电视节目」。
 STRM=$(rclone cat "dramahub:/<分类>/<分片>/<剧>/Season 01/<剧> - S01E01 - 第1集.strm")
 curl -sS "$STRM" | head -12         # #EXTM3U … #EXT-X-ENDLIST；单集就是一条 playlist
 ID=$(echo "$STRM" | sed -E 's#.*/video/([^/]+)\.m3u8#\1#')
-curl -sS -o /tmp/0.ts -w '%{http_code}\n' "http://127.0.0.1:8080/video/$ID/0.ts"
-ffprobe -v error -show_streams /tmp/0.ts | head -20
+curl -sS -o /tmp/0.m4s -w '%{http_code}\n' "http://127.0.0.1:8080/video/$ID/0.m4s"
+# 每集一片的 fMP4：片头是 ftyp，且单看这一片就能 ffprobe 出视频流与完整时长
+head -c 8 /tmp/0.m4s | tail -c 4
+ffprobe -v error -show_streams -show_entries format=duration /tmp/0.m4s | head -20
 ffmpeg -v error -i "$STRM" -t 60 -f null - && echo "播了 60 秒"
 ```
 
@@ -183,7 +185,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 - F 段默认实播 60 秒（`PLAY_SECONDS`），并用 ffmpeg 的 `out_time` 证明**真的拉了 60 秒内容**
   ——只看退出码 0 不行：10 秒的 playlist 也会正常结束。
 
-## 升级须知（含 0005 的版本）
+## 升级须知（含 0005 / 0006 的版本）
 
 - `0005` 删掉手工编排的 `merge_group` / `merge_item`，并清掉 `emby_item` 里新代码读不动
   的旧合并行（uid 形如 `m<组 id>`）。**派生表不迁移数据**：升级后、下一次重建之前，
@@ -191,6 +193,11 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
   或首播回填按当前 `merge_chunk_size` 重建后恢复。
 - 从本版起合并是自动的：改 `merge_chunk_size`（默认 10）后，下一次重建生效，对外集号
   重排、旧合并 id 立即 404。
+- `0006` 把 `segment` 表收窄成「每集的播放身份」`(episode_id, channel)`，并清空整张表
+  （切点/时长/关键帧/编码签名/mode 五个概念都消失）；`artifact` 去掉 `index` kind，
+  `settings` 里「分片目标时长」那一项已删除、不再是合法配置项。**旧缓存不迁移**：`.ts` 分片因为
+  键与后缀都变了而永不命中，由 `cache_lru_days` 自然淘汰；升级后每个从没播过的 `uid`
+  首次播放会多一次 `ffprobe`（取时长），并且首播必须读完整个源（一集一片的既定代价）。
 
 ## 常见失败
 
@@ -202,7 +209,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 | 缓存目录 `permission denied` | 忘了 `--userns=keep-id` |
 | 同步/播放日志里大量 `upstream_status:444` | 上游限流（累计约 1 万次 `/player` 后触发），等十几分钟；不要写重试循环 |
 | `/video/{id}.m3u8` 502 | 该集解析不到片源：受保护剧的网页只有预览，完整片源走 App 通道；App 被拒/不可用时按契约回 502（日志一条 `WarnContext` 说明 `uid`/`ep_no`/`channel`/`reason`） |
-| `/video/{id}.m3u8` 503 + `Retry-After` | 首次播放要建关键帧索引，30 秒硬上限；稍后重试 |
+| `/video/{id}.m3u8` 503 + `Retry-After` | 首次播放要探测时长，30 秒硬上限；稍后重试 |
 | URL 变了 / 换了 `stream_secret` 后全部 401 | 出流 id 是 HMAC 签名（ADR-0003）：换密钥等于所有旧 URL 失效 |
 | 日志出现 `package_manager` 之外的「未知的 DRAMA_HUB_* 环境变量」 | 变量名拼错，值被忽略 |
 

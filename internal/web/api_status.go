@@ -33,7 +33,6 @@ type totalsView struct {
 // 死键已删除（MKACG-616）：看板不再展示没有任何消费者的配置项。
 type configView struct {
 	StrmPrefix   string `json:"strm_prefix"`
-	SegTargetSec int    `json:"seg_target_sec"`
 	CacheDir     string `json:"cache_dir"`
 	CacheMaxMB   int    `json:"cache_max_mb"`
 	CacheLRUDays int    `json:"cache_lru_days"`
@@ -143,10 +142,6 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 	}
 	// B2：显示归一化后的值（去尾 `/`）。手改进库的行也照样显示成真正参与拼接的形态。
 	prefix = strings.TrimRight(prefix, "/")
-	target, err := s.settings.Int(ctx, store.KeySegTargetSec)
-	if err != nil {
-		return configView{}, fmt.Errorf("读 seg_target_sec: %w", err)
-	}
 	cacheDir, err := s.settings.String(ctx, store.KeyCacheDir)
 	if err != nil {
 		return configView{}, fmt.Errorf("读 cache_dir: %w", err)
@@ -177,7 +172,6 @@ func (s *Server) readConfig(ctx context.Context) (configView, error) {
 	}
 	out := configView{
 		StrmPrefix:         prefix,
-		SegTargetSec:       target,
 		CacheDir:           cacheDir,
 		CacheMaxMB:         cacheMaxMB,
 		CacheLRUDays:       cacheLRUDays,

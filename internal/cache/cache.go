@@ -14,7 +14,7 @@ import (
 	"github.com/justforlxz/drama-hub/internal/store"
 )
 
-// ErrUnsupportedKind 表示要缓存的对象不在契约里：只有海报 / 分片 / 关键帧索引三类
+// ErrUnsupportedKind 表示要缓存的对象不在契约里：只有海报与分片两类
 // （docs/CACHE-MODEL.md「缓存什么、不缓存什么」）。m3u8 文本与源整片没有对应的 kind，
 // 因此写不进缓存。
 var ErrUnsupportedKind = errors.New("不支持的缓存类型")
@@ -22,7 +22,7 @@ var ErrUnsupportedKind = errors.New("不支持的缓存类型")
 // Spec 是一次缓存读写的位置：kind 决定内容目录与允许的后缀，key 是契约键（见
 // keys.go），ext 是落盘后缀。组合不合法时 GetOrGenerate 直接报错、不落盘。
 type Spec struct {
-	Kind string // store.ArtifactKindSegment | ArtifactKindIndex | ArtifactKindCover
+	Kind string // store.ArtifactKindSegment | ArtifactKindCover
 	Key  string
 	Ext  string
 }
@@ -35,17 +35,13 @@ func (s Spec) validate() error {
 	}
 	switch s.Kind {
 	case store.ArtifactKindSegment:
-		if s.Ext != ".ts" {
-			return fmt.Errorf("%w: 分片后缀必须是 .ts，实际 %q", ErrUnsupportedKind, s.Ext)
+		if s.Ext != ".m4s" {
+			return fmt.Errorf("%w: 分片后缀必须是 .m4s，实际 %q", ErrUnsupportedKind, s.Ext)
 		}
 		if !isSHA256Hex(s.Key) {
 			// 分片的键就是落盘文件名，只能由 SegmentKey 产出（64 位十六进制）；
 			// 放任意字符串进来会写出路径里没法分桶、也没法和别人对齐的文件。
 			return fmt.Errorf("%w: 分片键必须是 sha256 十六进制，实际 %q", ErrUnsupportedKind, s.Key)
-		}
-	case store.ArtifactKindIndex:
-		if s.Ext != ".json" {
-			return fmt.Errorf("%w: 索引后缀必须是 .json，实际 %q", ErrUnsupportedKind, s.Ext)
 		}
 	case store.ArtifactKindCover:
 		if !imageExt(s.Ext) {
@@ -79,13 +75,13 @@ func imageExt(ext string) bool {
 	return false
 }
 
-// GenerateFunc 生成一份缓存内容（一次 ffmpeg 切片、一次 ffprobe 建索引……）。
+// GenerateFunc 生成一份缓存内容（一次整集 ffmpeg remux、一次海报下载……）。
 //
 // 失败必须原样返回错误：本包不吞错误也不写缓存，边界包据此映射状态码
 // （生成失败 → 502，且目录与 artifact 都不变 —— docs/CACHE-MODEL.md「命中后的读取路径」）。
 type GenerateFunc func(ctx context.Context) ([]byte, error)
 
-// Cache 是本地缓存（海报 / 分片 / 关键帧索引）的入口：命中即回本地字节并 touch，
+// Cache 是本地缓存（海报 / 分片）的入口：命中即回本地字节并 touch，
 // 未命中走 single-flight 生成 → 原子落盘 → 写 artifact 行。淘汰见 evict.go。
 //
 // 不缓存 artifact 行、不缓存 settings：每次都读库，改完即时生效（硬约束 5）。

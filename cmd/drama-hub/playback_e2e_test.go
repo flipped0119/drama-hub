@@ -24,6 +24,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -402,10 +403,10 @@ func e2ePlaylist(t *testing.T, h http.Handler, uid string) (string, float64) {
 		if seg.Code != http.StatusOK {
 			t.Fatalf("GET %s 状态码 = %d, 期望 200（body=%s）", uri, seg.Code, seg.Body.String())
 		}
-		if ct := seg.Header().Get("Content-Type"); ct != "video/mp2t" {
-			t.Errorf("分片 %d 的 Content-Type = %q, 期望 video/mp2t", i, ct)
+		if ct := seg.Header().Get("Content-Type"); ct != "video/mp4" {
+			t.Errorf("分片 %d 的 Content-Type = %q, 期望 video/mp4", i, ct)
 		}
-		file := filepath.Join(t.TempDir(), fmt.Sprintf("seg-%d.ts", i))
+		file := filepath.Join(t.TempDir(), fmt.Sprintf("seg-%d.m4s", i))
 		if err := os.WriteFile(file, seg.Body.Bytes(), 0o644); err != nil {
 			t.Fatalf("写分片 %d: %v", i, err)
 		}
@@ -515,7 +516,6 @@ func TestPlaybackFullEpisode(t *testing.T) {
 	settings := store.NewSettings(db.DB)
 	for k, v := range map[store.SettingKey]string{
 		store.KeyStreamSecret: e2eSecret,
-		store.KeySegTargetSec: "10",
 		store.KeyCacheDir:     filepath.Join(t.TempDir(), "cache"),
 		// 每个 subtest 都用 e<episode.id> 直接取某集的播放单元：夹具按 N=1 布置。
 		store.KeyMergeChunkSize: "1",
@@ -596,7 +596,7 @@ func TestPlaybackFullEpisode(t *testing.T) {
 	t.Run("ep4 网页无片源走 App：集页 404 后仍拿到完整片源", func(t *testing.T) {
 		_, total := e2ePlaylist(t, h, "e"+strconv.FormatInt(openEp4, 10))
 		// 网页通道先试集页、拿到 404（ErrNoStream）才落 App。直链按契约不缓存，
-		// 所以每次解析都会试一次：playlist 一次 + 每个分片一次。
+		// 所以每次解析都会试一次：playlist 一次 + 生成那一片一次（命中缓存后不再解析）。
 		if n := up.hit("/player/" + e2eSIDOpen + "/" + e2eVidProtected[3]); n < 1 {
 			t.Error("第 4 集页一次都没请求：网页无片源 → 落 App 的分支没被走到")
 		}
@@ -608,17 +608,14 @@ func TestPlaybackFullEpisode(t *testing.T) {
 		}
 	})
 
-	// 播放面的收尾断言：索引确实按 App 通道建立、时长回填到 episode.duration_sec。
-	t.Run("索引与时长回填按 App 通道落库", func(t *testing.T) {
-		segs, err := st.ListSegments(ctx, protectedEp1)
+	// 播放面的收尾断言：通道行确实按 App 通道落库、时长回填到 episode.duration_sec。
+	t.Run("通道行与时长回填按 App 通道落库", func(t *testing.T) {
+		seg, err := st.GetSegment(ctx, protectedEp1)
 		if err != nil {
-			t.Fatalf("ListSegments: %v", err)
+			t.Fatalf("GetSegment: %v", err)
 		}
-		if len(segs) == 0 {
-			t.Fatal("ep1 没有建立分片索引")
-		}
-		if !strings.HasPrefix(segs[0].CodecSig, "app/") {
-			t.Errorf("ep1 codec_sig = %q, 期望带 app/ 通道段（防跨通道串味）", segs[0].CodecSig)
+		if seg.Channel != "app" {
+			t.Errorf("ep1 channel = %q, 期望 app（防跨通道串味）", seg.Channel)
 		}
 		ep, err := st.EpisodeByID(ctx, protectedEp1)
 		if err != nil {
@@ -670,13 +667,9 @@ func TestPlaybackFullEpisode(t *testing.T) {
 			t.Error("日志泄露了 spade_a 或内容密钥")
 		}
 
-		// 失败不污染库：这一集没有索引行。
-		segs, err := st.ListSegments(ctx, protectedEp2)
-		if err != nil {
-			t.Fatalf("ListSegments: %v", err)
-		}
-		if len(segs) != 0 {
-			t.Errorf("App 被拒后写了 %d 行分片索引，期望 0", len(segs))
+		// 失败不污染库：这一集没有通道行。
+		if _, err := st.GetSegment(ctx, protectedEp2); !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("App 被拒后写了通道行（err=%v），期望 ErrNotFound", err)
 		}
 	})
 }
