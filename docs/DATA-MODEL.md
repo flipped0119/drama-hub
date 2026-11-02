@@ -150,13 +150,47 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 
 | 对象 | 用途 |
 |---|---|
-| `artifact(kind='segment')` | 分片缓存索引：`key = sha256(uid\x1fseq\x1fcodec_sig)`，`path` 是本地文件，`bytes` 供淘汰算总量，`last_used_at` 供 LRU 与过期 |
-| `artifact(kind='cover')` | 海报（已有；本次把「刷新时下载」接上） |
-| `artifact(kind='index')` | 关键帧索引（已有；改为按需建立） |
+| `artifact(kind='segment')` | 分片缓存索引：`key = sha256("e<episode.id>"\x1fchannel)`，`path` 是本地文件（`.m4s`），`bytes` 供淘汰算总量，`last_used_at` 供 LRU 与过期（0006 起无 `index`） |
+| `artifact(kind='cover')` | 海报（刷新时下载并本地化） |
 | `idx_artifact_kind_last_used` | `WHERE kind=? ORDER BY last_used_at` 的淘汰查询；也覆盖按 `kind` 的计数/求和 |
 
 **缓存里也不存直链**：`key` 是内容哈希，`path` 是本地路径，两者都不含上游 URL。
 换成 `stream_secret` 或上游换链都不会在缓存索引里留下痕迹。
+
+### 0006：每集一片 fMP4（ADR-0011）
+
+`internal/store/migrations/0006_segment_per_episode.sql`（PG 版，就地改，不重建表）：
+
+```sql
+-- 派生数据整体清空：切点 / 时长 / 关键帧 / 编码签名 / mode 五个概念都已消失。
+DELETE FROM segment;
+
+ALTER TABLE segment DROP COLUMN start_sec;
+ALTER TABLE segment DROP COLUMN dur;
+ALTER TABLE segment DROP COLUMN keyframe;
+ALTER TABLE segment DROP COLUMN mode;
+ALTER TABLE segment DROP COLUMN codec_sig;
+ALTER TABLE segment DROP COLUMN id;
+
+ALTER TABLE segment ADD COLUMN channel TEXT NOT NULL CHECK (channel IN ('web','app'));
+ALTER TABLE segment ADD PRIMARY KEY (episode_id);
+
+-- 关键帧索引这个 kind 一起删除（全仓无写入方）。先删行再收窄 CHECK：
+-- PostgreSQL 加 CHECK 会校验已有行。
+DELETE FROM artifact WHERE kind = 'index';
+ALTER TABLE artifact DROP CONSTRAINT artifact_kind_check;
+ALTER TABLE artifact ADD CONSTRAINT artifact_kind_check CHECK (kind IN ('cover','segment'));
+```
+
+`segment` 从「每 10 秒一行的分片索引」收窄成「每集的播放身份」：一集一行，
+只剩 `(episode_id, channel)`。`channel` 决定分片缓存键与 ffmpeg 的出站身份
+（`web` 明文 / `app` CENC 密文），是这一行唯一还活着的语义。
+
+| 对象 | 用途 |
+|---|---|
+| `segment` | 每集的播放身份：`episode_id`（主键，FK → `episode`，级联删）+ `channel` ∈ web/app |
+| `episode.duration_sec` | 唯一的时长真值：playlist 的 `#EXTINF`、`#EXT-X-TARGETDURATION`、`.nfo` 的 `<runtime>` 都用它 |
+| `artifact(kind='segment')` | 每集一片的缓存行（见上） |
 
 ## 字段来源逐个定稿
 
@@ -196,10 +230,10 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
   源侧批量拿不到（每集要 1 请求，2847 万次已否决）。
   → 契约上这是**允许留零值**（`docs/PLUGIN-CONTRACT.md` `Episode` 注释），
   实现上不许为此逐集抓。
-  → 首次播放该集（建关键帧索引）时用 `ffprobe` 实测时长回填 `duration_sec`
+  → 首次播放该集（`duration_sec` 仍为 0）时用 `ffprobe` 只取 `format=duration` 回填
   （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值），并同事务重建该剧
   `emby_item`，让 `.nfo` 的 `<runtime>` 当次就变成真实值；没播过的集仍是 0
-  （见 `docs/DEV-STANDARDS.md`「关键帧索引」）。
+  （见 `docs/DEV-STANDARDS.md`「时长探测」）。
   → 刷新（`UpsertEpisode`）携带上游的 0 时不清零已回填的值，上游真给了非零值才覆盖。
   → NFO 的 `<title>` 因此回落到 `第 N 集`（`internal/vfs/tree.go:embyLabel` 已这么写）。
 - `episode.source` = 插件名（`"web"`）。
@@ -222,9 +256,10 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 
 ### 播放入口（直链不落库）
 
-- 库中**没有任何一列**保存直链（0003 删两列后），缓存索引里也没有（见 0004）。
-- 请求路径：`/video/{id}.m3u8` → 读 `segment` 表出 playlist；`/video/{id}/{seq}.ts`
-  → 查本地分片缓存 → 未命中则 `plugin.Resolve` 取直链、ffmpeg 切片、落缓存、回字节。
+- 库中**没有任何一列**保存直链（0004 删两列后），缓存索引里也没有（见 0004）。
+- 请求路径：`/video/{id}.m3u8` → 读 `episode.duration_sec` + `segment.channel` 出 playlist；
+  `/video/{id}/{seq}.m4s` → 查本地分片缓存 → 未命中则 `plugin.Resolve` 取直链、
+  ffmpeg 整集转封装、落缓存、回字节。
   详见 `docs/PLAYBACK-CONTRACT.md` 与 `docs/CACHE-MODEL.md`。
 - 失败语义：`ErrNoStream` / `ErrNotFound` → **502，不写库、不写缓存**。
 - 红果实况：只有第 1 集有直链且是 10 秒预览，第 2..N 集 `ErrNoStream`，
@@ -260,9 +295,10 @@ CREATE INDEX idx_artifact_kind_last_used ON artifact (kind, last_used_at);
 
 > 本节是换 PostgreSQL 之前（SQLite 后端）的一次 dry-run 记录：SQL 块、命令与输出都按
 > 当时的口径，保留下来只为说明「本文曾是 SQL 的唯一真值、文档与代码一起改」这条工作方式。
-> **现行迁移文件是 `internal/store/migrations/0001…0004` 的 PG DDL**（ADR-0009），
+> **现行迁移文件是 `internal/store/migrations/0001…0006` 的 PG DDL**（ADR-0009），
 > 与本节的 SQLite 版本不要互相校对：`0003` 现在是就地 drop/add CHECK，`0004` 的列名
-> 与顺序也不变但表类型是 PostgreSQL。
+> 与顺序也不变但表类型是 PostgreSQL；`0005` 删掉合并表（ADR-0010），`0006` 是 segment
+> 收窄 + artifact 去掉 index kind（PG 版 SQL 见上「0006：每集一片 fMP4」）。
 
 验证方式：把本文上面三个 `sql` 代码块**原样抽出来**（不是手抄），放进仓库副本的
 `internal/store/migrations/`，用**仓库自己的迁移 runner**（`store.Open` → `migrate`）跑：

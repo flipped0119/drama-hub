@@ -77,7 +77,7 @@ func (c *Cache) Evict(ctx context.Context) error {
 	return c.evictOverLimit(ctx, int64(maxMB)<<20)
 }
 
-// evictExpired 删掉 last_used_at 早于 before 的条目，三种 kind 都算：过期是「多久
+// evictExpired 删掉 last_used_at 早于 before 的条目，所有 kind 都算：过期是「多久
 // 没命中」，与类型无关（docs/CACHE-MODEL.md「淘汰」第 1 步）。
 func (c *Cache) evictExpired(ctx context.Context, before time.Time) error {
 	cutoff := stamp(before)
@@ -163,7 +163,7 @@ func (c *Cache) deleteOne(ctx context.Context, row store.Artifact) error {
 
 // sweepTmp 删掉 tmp 目录里超过 tmpMaxAge 的文件，返回删掉的数量。
 //
-// 写盘被 kill 打断会在 tmp 留下半截文件（三个内容目录里不会有）。它不是缓存内容，
+// 写盘被 kill 打断会在 tmp 留下半截文件（内容目录里不会有）。它不是缓存内容，
 // 留着只白占磁盘，所以在淘汰里一起清扫。
 func sweepTmp(dir string, now time.Time) (int, error) {
 	entries, err := os.ReadDir(dir)

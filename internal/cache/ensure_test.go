@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// EnsureLayout 在启动时建出四个目录；重复调用幂等，已有的缓存内容不受影响。
+// EnsureLayout 在启动时建出三个目录；重复调用幂等，已有的缓存内容不受影响。
 func TestEnsureLayout(t *testing.T) {
 	tc := newTestCache(t)
 	ctx := context.Background()
@@ -16,7 +16,7 @@ func TestEnsureLayout(t *testing.T) {
 		t.Fatalf("EnsureLayout: %v", err)
 	}
 	// findTree 给的是相对 root 的路径，目录带尾 `/`。
-	want := []string{dirCover + "/", dirIndex + "/", dirSegment + "/", dirTmp + "/"}
+	want := []string{dirCover + "/", dirSegment + "/", dirTmp + "/"}
 	got := findTree(t, tc.root)
 	slices.Sort(got)
 	if !slices.Equal(got, want) {

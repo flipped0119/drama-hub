@@ -384,9 +384,9 @@ func TestAPI_Status(t *testing.T) {
 		got.Totals.EmbyItems != 1 || got.Totals.LastSyncAt != "2026-10-30T08:00:00Z" {
 		t.Errorf("totals = %+v", got.Totals)
 	}
-	if got.Config.SegTargetSec != 10 || got.Config.CacheDir != "./data/cache" ||
+	if got.Config.CacheDir != "./data/cache" ||
 		got.Config.CacheMaxMB != 8192 || got.Config.CacheLRUDays != 30 {
-		t.Errorf("配置默认值 = %+v, 期望 10 / ./data/cache / 8192 / 30", got.Config)
+		t.Errorf("配置默认值 = %+v, 期望 ./data/cache / 8192 / 30", got.Config)
 	}
 	if got.Config.MergeChunkSize != 10 {
 		t.Errorf("merge_chunk_size 默认值 = %d, 期望 10", got.Config.MergeChunkSize)

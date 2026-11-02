@@ -20,7 +20,7 @@
 2. **合并集只有一种实现：虚拟 HLS 分片聚合。** 禁止物化合并文件、禁止字节拼接多集 MP4（`moov` 只描述首集，拼字节必然时长错、seek 崩）。这条是两个方案对比后定的，不要再试。
 3. **每个虚拟文件必须给出精确 `Content-Length`。** WebDAV 的 `PROPFIND` 少了它，rclone mount 读不到文件、Emby 扫不出集。渲染 → 算长度 → 再返回，一次请求内完成。
 4. **单二进制 + PostgreSQL。** 一个 Go 二进制装三个面：没有 Node、没有前端构建步骤、没有第二个应用运行时、没有外部缓存服务。界面用 Go 模板 + 少量原生 JS，模板随二进制嵌入（`embed`）。**PostgreSQL 是必选外部依赖**（ADR-0009）：连接串由 `DRAMA_HUB_DB_URL` 给，迁移随启动自动执行，连不上就启动失败；代码里不留任何内嵌数据库路径。
-5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、分片时长、缓存目录/上限/LRU 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存由本服务自己负责（ADR-0007）**：海报、分片、关键帧索引落 `<cache_dir>`，按 `cache_max_mb` 与 `cache_lru_days` 淘汰，规则与测试见 `docs/CACHE-MODEL.md`。2.0 不做缓存预热：1.0 的 `seg_prefetch` / `pin_days` 占位键已删除（MKACG-616），代码里没有预取实现。
+5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、缓存目录/上限/LRU 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存由本服务自己负责（ADR-0007）**：海报与分片落 `<cache_dir>`，按 `cache_max_mb` 与 `cache_lru_days` 淘汰，规则与测试见 `docs/CACHE-MODEL.md`。分片是**每集一片**的 fMP4，键按「集 + 通道」算（ADR-0011）——「切多长」不再是配置项（这一项已从 `settings` 删除，不再有开关或别名）。2.0 不做缓存预热：1.0 的 `seg_prefetch` / `pin_days` 占位键已删除（MKACG-616），代码里没有预取实现。
 6. **对外集号只由 `emby_item` 派生表决定。** 合并调整只重建派生表，`drama` / `episode` 原始数据不动。
 7. **出流用字节透传，不用 302。** 302 到签名 CDN 会让缓存键漂移、过期链接命中旧缓存返回错内容。
 8. **出流 token 是 HMAC 常量签名，无过期、无状态、无 token 表**（ADR-0003）。带过期的 token 会破坏缓存键稳定性，与缓存目标直接冲突。
@@ -37,8 +37,8 @@ internal/store/         PostgreSQL 连接、迁移、派生表重建
 internal/vfs/           虚拟文件树 → strm/nfo/图片 渲染
 internal/webdav/        x/net/webdav 自定义 FileSystem
 internal/stream/        播放 id 签名（HMAC）与请求时直链解析（不碰 HTTP）
-internal/segment/       播放面 handler：关键帧索引、播放列表、分片转封装与缓存编排
-internal/cache/         本地缓存（封面/关键帧索引/分片）+ 淘汰（ADR-0007）
+internal/segment/       播放面 handler：每集一片的时间轴、播放列表、整集转封装与缓存编排
+internal/cache/         本地缓存（封面/分片）+ 淘汰（ADR-0007）
 internal/web/           管理 API + 页面模板
 docs/                   规范与 ADR
 ```

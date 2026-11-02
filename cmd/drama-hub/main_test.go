@@ -509,20 +509,19 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 	}
 	var ids []int64
 	for i := 1; i <= 3; i++ {
-		id, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: i, Source: "web", Vid: "v"})
+		// 时长直接给值：装配面测试不跑 ffprobe，playlist 的 EXTINF 靠它。
+		id, err := st.UpsertEpisode(ctx, store.Episode{
+			DramaID: dramaID, EpNo: i, Source: "web", Vid: "v", DurationSec: 6,
+		})
 		if err != nil {
 			t.Fatalf("UpsertEpisode: %v", err)
 		}
 		ids = append(ids, id)
 	}
-	// 索引由 S8 按需建立；装配面测试不跑 ffprobe，直接写每集各 2 片。
-	// codec_sig 带通道段（`web/`）：没有通道段的签名会被当成老索引重建（MKACG-629）。
+	// 通道行同理直接写：每集一片，装配面测试不跑 ffmpeg。
 	for _, id := range ids {
-		if err := st.ReplaceSegments(ctx, id, []store.Segment{
-			{EpisodeID: id, StartSec: 0, Dur: 4, Keyframe: true, Mode: "copy", CodecSig: "web/h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
-			{EpisodeID: id, StartSec: 4, Dur: 2, Keyframe: true, Mode: "copy", CodecSig: "web/h264/High/40/yuv420p/[0][0][0][0]/1/12800"},
-		}); err != nil {
-			t.Fatalf("ReplaceSegments: %v", err)
+		if err := st.UpsertSegment(ctx, store.Segment{EpisodeID: id, Channel: "web"}); err != nil {
+			t.Fatalf("UpsertSegment: %v", err)
 		}
 	}
 	// 播放单元只认派生表：N=2 把第 1-2 集并成一块，第 3 集自成一集。
@@ -538,7 +537,7 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 	singleUID := "e" + strconv.FormatInt(ids[2], 10)
 	mergedUID := fmt.Sprintf("m%d_1_2", dramaID)
 
-	// 单集：合法 VOD playlist，分片 URI 指回 /video/{id}/{seq}.ts，没有 DISCONTINUITY。
+	// 单集：合法 VOD playlist，恰 1 片，分片 URI 指回 /video/{id}/0.m4s，没有 DISCONTINUITY。
 	singleID := stream.ID(secret, singleUID)
 	rec := serve(t, h, http.MethodGet, "/video/"+singleID+".m3u8")
 	if rec.Code != http.StatusOK {
@@ -551,8 +550,14 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 	if !strings.HasPrefix(body, "#EXTM3U\n") || !strings.HasSuffix(body, "#EXT-X-ENDLIST\n") {
 		t.Errorf("单集 playlist 不是完整 VOD：\n%s", body)
 	}
-	if !strings.Contains(body, "/video/"+singleID+"/0.ts") {
-		t.Errorf("playlist 分片 URI 没指回 /video/{id}/{seq}.ts：\n%s", body)
+	if !strings.Contains(body, "/video/"+singleID+"/0.m4s") {
+		t.Errorf("playlist 分片 URI 没指回 /video/{id}/{seq}.m4s：\n%s", body)
+	}
+	if got := strings.Count(body, "#EXTINF:"); got != 1 {
+		t.Errorf("单集 EXTINF 行数 = %d, 期望 1（每集一片）：\n%s", got, body)
+	}
+	if !strings.Contains(body, "#EXT-X-VERSION:7\n") {
+		t.Errorf("单集 playlist 缺 EXT-X-VERSION:7（fMP4）：\n%s", body)
 	}
 	if strings.Contains(body, "#EXT-X-DISCONTINUITY") {
 		t.Errorf("单集 playlist 不该有 DISCONTINUITY：\n%s", body)
@@ -569,6 +574,9 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "#EXT-X-DISCONTINUITY") {
 		t.Errorf("合并集 playlist 缺集边界 DISCONTINUITY：\n%s", rec.Body.String())
+	}
+	if got := strings.Count(rec.Body.String(), "#EXTINF:"); got != 2 {
+		t.Errorf("合并集 EXTINF 行数 = %d, 期望 2（每集一片）：\n%s", got, rec.Body.String())
 	}
 
 	// 签名错 → 401；uid 在库里不存在 → 404；没有 .m3u8 后缀 → 404。
@@ -913,7 +921,6 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	settings := store.NewSettings(db.DB)
 	for k, v := range map[store.SettingKey]string{
 		store.KeyStreamSecret: secret,
-		store.KeySegTargetSec: "10",
 		// 缓存目录必须在临时目录里：默认的 ./data/cache 会写进源码树。
 		store.KeyCacheDir: filepath.Join(t.TempDir(), "cache"),
 		// 本测试用 e<episode.id> 直接取某一集，并对 .nfo 断言「第N集」标签。

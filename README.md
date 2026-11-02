@@ -57,7 +57,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
 | `/webdav/` 及全部子路径 | 任意 | 207/200/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength，**只支持 `Depth: 0/1`**——数值深度 ≥2 由 `x/net/webdav` 直接 400，不是本服务的缺陷）、GET strm/nfo 200；树是 `/{分类}/{分片}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
-| `/video/{id}/{seq}.ts` | GET / HEAD | 200/206/401/404/502/503 | MPEG-TS 分片：本地缓存命中即回，未命中现切并落缓存 |
+| `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/404/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
 | `/`、`/status` | GET | 200 | 管理界面两页：剧目 / 同步与缓存看板 |
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
@@ -77,19 +77,22 @@ uid))[:12]`，`uid` 是 `e<episode.id>`（单集）或 `m<dramaID>_<epFrom>_<epT
 短时凭据，落库就是过期链接），每次播放请求现调插件 `Resolve`，换链后下一次请求自然拿到
 新链。
 
-关键帧索引由 `internal/segment` 在**第一次播放某个 uid 时**用 `ffprobe -skip_frame
-nokey` 预扫建立（切点对齐关键帧后写入 `segment` 表），30 秒硬上限、超时 503 +
-`Retry-After`；**不做批量预建**（库里 2847 万集）。切片走 `ffmpeg -ss <切点> -t <片长>
--c copy -f mpegts`，单片返回 `video/mp2t` 并带 `Cache-Control: public, max-age=86400`；
-ffmpeg 失败 → 502 且不写缓存。
+**第一次播放某个 uid 时**，`internal/segment` 为每个成员集同步 `ffprobe` 一次取
+`format=duration` 并回填 `episode.duration_sec`（只填 0），30 秒硬上限、超时 503 +
+`Retry-After`；**不做批量预建**（库里 2847 万集）。分片是**一整集**：`ffmpeg -c copy
+-movflags +frag_keyframe+empty_moov+default_base_moof -f mp4` 转成自包含 fMP4，
+单片返回 `video/mp4` 并带 `Cache-Control: public, max-age=86400`；
+ffmpeg 失败 → 502 且不写缓存。详见 `docs/adr/0011-episode-per-segment-fmp4.md`。
 
-分片缓存归本服务（ADR-0007）：键 `sha256(uid | seq | codec_sig)`，落
-`<cache_dir>/seg/`，命中零外呼、并发同一片只生成一次（single-flight），按
-`cache_max_mb` / `cache_lru_days` 淘汰（`docs/CACHE-MODEL.md`）。
+分片缓存归本服务（ADR-0007）：键 `sha256("e<episode.id>" | channel)` —— **seq 不进键**，
+同一集在单集 / 合并集 / 重新分组后共用一份，落 `<cache_dir>/seg/<hash>.m4s`。命中零外呼、
+并发同键只生成一次（single-flight），按 `cache_max_mb` / `cache_lru_days` 淘汰
+（`docs/CACHE-MODEL.md`）。
 
-合并集（`uid = m<dramaID>_<epFrom>_<epTo>`）是虚拟 HLS 分片聚合：playlist 在集边界插
-`#EXT-X-DISCONTINUITY`，分片 URL 是 `/video/{id}/{seq}.ts`，seq 是跨集连续时间轴；切片
-按 `seq → (集号, 集内秒)` 解析，`-output_ts_offset` 保证跨集时间戳连续。
+合并集（`uid = m<dramaID>_<epFrom>_<epTo>`）是虚拟 HLS 分片聚合：**每集一片**，playlist
+在集边界插 `#EXT-X-DISCONTINUITY`，分片 URL 是 `/video/{id}/{seq}.m4s`，`seq` 就是块内
+成员下标；每片自带 `ftyp+moov`，所以集边界的时间戳重置由 DISCONTINUITY 表达，不需要平移
+PTS（ADR-0011）。
 
 **合并是自动的**（ADR-0010）：每部剧的集按 `settings.merge_chunk_size`（默认 10）切连续
 块，第 i 块占对外集号 i，块内 1 集走单集规则、≥2 集是合并集。改这个值后，下一次重建
@@ -108,7 +111,7 @@ ffmpeg 失败 → 502 且不写缓存。
 删除 / 改配置）要先用顶栏的「管理令牌」填上 `DRAMA_HUB_ADMIN_TOKEN`，令牌只存在
 本标签页（`sessionStorage`）。
 
-缓存由本服务自己负责（ADR-0007）：海报、分片、关键帧索引落 `<cache_dir>`，按
+缓存由本服务自己负责（ADR-0007）：海报与分片落 `<cache_dir>`，按
 `cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
 服务的 `/video/…`，rclone 只剩 WebDAV 只读挂载，不再需要 `--vfs-cache-mode full`。
 （`/api/status` 原先那份 rclone 建议参数属 ADR-0004 遗留，已在 MKACG-616 删除：

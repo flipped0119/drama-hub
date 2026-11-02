@@ -6,12 +6,16 @@ import (
 	"strings"
 )
 
-// playVersion 是自造 playlist 的 HLS 版本（docs/PLAYBACK-CONTRACT.md 的示例同款）。
-const playVersion = 3
+// playVersion 是自造 playlist 的 HLS 版本。fMP4 片段要求 ≥ 6（EXT-X-MAP 引入），
+// 本实现不给 EXT-X-MAP（片段自包含），取 7 与契约示例一致（docs/PLAYBACK-CONTRACT.md）。
+const playVersion = 7
+
+// segmentSuffix 是分片 URL 的后缀：fragmented MP4（每集一片）。
+const segmentSuffix = ".m4s"
 
 // BuildPlaylist 把时间轴渲染成 VOD playlist 字节（纯函数）。
 //
-// 每片一行 `#EXTINF:<真实时长>,` + 分片 URI `/video/{id}/{seq}.ts`；集边界
+// 每片一行 `#EXTINF:<该集真实时长>,` + 分片 URI `/video/{id}/{seq}.m4s`；集边界
 // （EpisodeID 变化）插 `#EXT-X-DISCONTINUITY`。单集与合并集走同一个函数：单集的
 // 时间轴只有一集，因此不会出现 DISCONTINUITY（契约：对外不再有「单集是 MP4」）。
 //
@@ -37,7 +41,7 @@ func BuildPlaylist(id string, slices []Slice) []byte {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 		}
 		b.WriteString("#EXTINF:" + formatSeconds(s.Dur) + ",\n")
-		b.WriteString("/video/" + id + "/" + strconv.Itoa(s.Seq) + ".ts\n")
+		b.WriteString("/video/" + id + "/" + strconv.Itoa(s.Seq) + segmentSuffix + "\n")
 		prevEpisode = s.EpisodeID
 	}
 	b.WriteString("#EXT-X-ENDLIST\n")

@@ -93,7 +93,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 **生效时机逐键标注在配置表里**，只有四种取值（MKACG-617 的生效性矩阵是实测真值来源）：
 
 - **即时**：每次使用都查库（`Settings` 本身不缓存，硬约束 5）。请求路径现读
-  `strm_prefix` / `stream_secret` / `webdav_user` / `webdav_pass` / `seg_target_sec`，
+  `strm_prefix` / `stream_secret` / `webdav_user` / `webdav_pass`，
   缓存每次读写现读 `cache_dir`，调度器每轮现读 `plugin.<源>.enabled` /
   `refresh_batch` / `refresh_timeout_sec`。
 - **≤60 秒**：调度器每 60 秒醒一次，用 `refresh_interval_sec`（或
@@ -147,11 +147,10 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `strm_prefix` | `""` | 带 host 的绝对 URL 或空 | 即时（每次渲染 `.strm`） | `.strm` 里 `/video/{id}.m3u8` 前面的**对外地址前缀**（本服务自己的公开地址；反向代理/自定义端口时填，尾 `/` 写入时归一掉）；空 = 按请求 `Host` 推导绝对地址（见上「`.strm` 的绝对地址」）。不指向 rclone/openlist |
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
 | `merge_chunk_size` | `10` | 1–500 | 下次重建（同步完成 / 首播回填） | 每 N 集并成 1 条对外剧集（ADR-0010）。分块只在 `RebuildEmbyItems` 里现读，改完下一次重建即生效、不用重启；改 N 会重排全库对外集号，旧合并 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
-| `seg_target_sec` | `10` | 4–30 | 即时（仅未建索引的 uid，见下） | 分片目标时长；**只对还没建索引的 uid 生效**——已建索引的 uid 不重算，改了要等它下一次重建（`segment` 表被整体替换时） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
-| `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`、索引 `index/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；四个目录在启动时预先建出 |
+| `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；三个目录在启动时预先建出 |
 | `cache_max_mb` | `8192` | 0–1048576 | ≤5 分钟（下一轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
-| `cache_lru_days` | `30` | 1–365 | ≤5 分钟（下一轮淘汰） | 超过 N 天未命中的缓存条目（三种 kind 都算）删除 |
+| `cache_lru_days` | `30` | 1–365 | ≤5 分钟（下一轮淘汰） | 超过 N 天未命中的缓存条目（所有 kind 都算）删除 |
 | `cover_timeout_sec` | `5` | 1–60 | 即时（每次海报下载） | 海报（`artifact(kind='cover')`）的单次出站超时。**不跟插件 `base_url` / `request_timeout_sec` 走**：封面 URL 是上游页面里的三方 CDN 绝对地址（实测 `p3-novel.byteimg.com`），`base_url` 改不到它，而页面的 30 s 超时会让一张卡住的图拖住整部剧的同步。取不到只记一条 warn，该剧不算同步失败（MKACG-620） |
 | `plugin.<源>.enabled` | `true` | 布尔 | 即时（每轮调度现读） | 是否参与**刷新调度**（缺失按 `true`）；手动同步（`POST /api/dramas`）与播放（`/video`）不受影响 |
 | `plugin.<源>.base_url` | `""` | 带 host 的绝对 URL 或空 | **重启后**（构造期注入） | 源地址；空 = 用插件内置默认（红果 `https://hongguoduanju.com`） |
@@ -208,7 +207,7 @@ ffmpeg 并发上限固定为 `min(4, max(1, NumCPU/2))`，不做成可调项（�
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/video/{id}.m3u8` | GET / HEAD | 播放列表；单集与合并集**同一路径形态** |
-| `/video/{id}/{seq}.ts` | GET / HEAD | MPEG-TS 分片：查本地缓存 → 未命中现切、落缓存、再回 |
+| `/video/{id}/{seq}.m4s` | GET / HEAD | 整集 fMP4 分片：查本地缓存 → 未命中整集转封装、落缓存、再回 |
 
 - `/dav/`、`/s/{token}/*` 与 `/s/*/master.m3u8` **已退役、不留兼容层**：`.strm` 是按
   请求渲染的，下一次读取就是新内容，没有存量文件需要兼容。
@@ -238,40 +237,40 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
   （播放单元不存在）的分界。
 - 状态码矩阵里没有 302、没有过期时间、没有 token 表。
 
-### 关键帧索引（按需建立）
+### 时长探测（按需）
 
-`ensureSegments` 在**第一次播放某个 uid** 时同步 `ffprobe -skip_frame nokey` 预扫源，
-把切点按 `seg_target_sec` 对齐到关键帧后整体写入 `segment` 表：
+`ensureDuration` 在**第一次播放某个 uid** 时同步 `ffprobe` 一次，只问
+`format=duration`（ADR-0011 删掉了关键帧与编码签名，探测不再做关键帧预扫）：
 
-- **切点规则**：首片从 0 起；之后每个切点取第一个 `>= 当前切点 + seg_target_sec`
-  的关键帧。切点都落在关键帧上，`-c copy` 切片内部才不会漂移（实测「目标 10 s
-  实际 10.66 s」就是这条规则）。
-- **总时长**：Σ `dur` == 源时长（±一帧）。`Timeline` 把有序的各集分片拼成连续 seq
-  空间，`seq → (集号, 集内秒, 绝对起点)` 供合并集 O(1) 定位。
+- **唯一真值**：`episode.duration_sec`。playlist 的 `#EXTINF`、`#EXT-X-TARGETDURATION`、
+  `.nfo` 的 `<runtime>` 全部由它派生，没有第二份时长。
+- **只探 0**：`duration_sec` 已非 0 的集直接用它（零外呼）。插件恒给 0，所以「首播多一次
+  ffprobe」只发生在从没播过的集上。
 - **按需、不预建**：库里有 2847 万集，全库 ffprobe 不可完成，代码里没有任何批量
-  预建入口（索引只在请求路径上按需建立）。
-- **30 s 硬上限**：整次建立（`indexDeadline`）走一个 `context.WithTimeout`，超时回
+  预建入口（只在请求路径上按需探测）。
+- **30 s 硬上限**：整次补齐（`ensureDeadline`）走一个 `context.WithTimeout`，超时回
   503 + `Retry-After: 5`（`httpx.ErrUnavailable`），不出半截时间轴。
-- **幂等与失败**：`ReplaceSegments` 一事务内先删后插；探测失败不写任何行（库里保留
-  旧索引或保持为空）。
-- **时长回填**：建索引时 `ffprobe` 已经拿到源时长，因此顺手回填 `episode.duration_sec`
+- **失败不写**：探测失败不写任何东西（`duration_sec` 保持 0、也没有 `segment` 行）。
+- **回填**：探测到的源时长回填 `episode.duration_sec`
   （`store.BackfillEpisodeDuration`：只填 0、不覆盖非零值，非正时长视为探测失败），并在
   同一事务内重建该剧 `emby_item` —— `runtime_sec` 单集取本集时长、合并集取组内之和，
   只有一个派生实现。`.nfo` 的 `<runtime>` 取 `runtime_sec / 60`，回填后当次即为真实值；
-  没建过索引的集仍是 0，`.nfo` 照常渲染（`<runtime>0</runtime>`，Emby 视为未知）。
-  回填排在写索引之前：若反序，索引写成功而回填失败时下次请求会命中已有索引直接返回，
-  时长就再也补不上。
+  没播过的集仍是 0，`.nfo` 照常渲染（`<runtime>0</runtime>`，Emby 视为未知）。
+- **整数秒**：时长按整数秒写库（每集 ≤ 0.5 s 误差，合并 10 集最多累计 ~5 s 显示差），
+  不为它加 float 列（第二份真值）。
+- **顺带对齐通道行**：同一次解析出的通道与 `segment.channel` 不一致时覆盖它
+  （`ensureChannel`）。分片端点复用这一行，所以命中缓存的分片请求不解析直链。
 
 ### 状态码矩阵
 
-| 情形 | `/video/{id}.m3u8` | `/video/{id}/{seq}.ts` |
+| 情形 | `/video/{id}.m3u8` | `/video/{id}/{seq}.m4s` |
 |---|---|---|
-| 正常 | 200 + `application/vnd.apple.mpegurl` | 200 + `video/mp2t` + `Content-Length` + `Cache-Control` |
+| 正常 | 200 + `application/vnd.apple.mpegurl` | 200 + `video/mp4` + `Content-Length` + `Cache-Control` |
 | id 签名不对 / 缺 `-` | 401（`httpx.ErrUnauthorized`） | 401 |
 | 路径不是 `.m3u8` | 404 | — |
 | `uid` 不在派生表 / seq 越界 / 分片名非法 | 404（`httpx.ErrNotFound`） | 404 |
 | 解析不到直链（`ErrNoStream` 等） | 502（`httpx.ErrUpstream`） | 502 |
-| 索引建立超时 | 503 + `Retry-After: 5` | 503 + `Retry-After: 5` |
+| 时长探测超时 | 503 + `Retry-After: 5` | 503 + `Retry-After: 5` |
 | secret 读失败 | 500（响应体与日志都不含 secret） | 500 |
 
 - **直链只在请求时解析**（`stream.Resolver.Direct`）：不落库（0004 已删
@@ -279,38 +278,50 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
   自然拿到新链。解析失败一律 502，且不写库、不写缓存。返回的 `Key`（加密片源的内容
   密钥，`nil` = 明文）与直链同生命周期：只在本次请求的内存里，不落库、不进日志、
   不进缓存键。
-- **加密片源解密归 ffmpeg**（MKACG-626 契约 1/6，MKACG-629 落地）：`Key` 非空时切片与索引
+- **加密片源解密归 ffmpeg**（MKACG-626 契约 1/6，MKACG-629 落地）：`Key` 非空时整集转封装与时长
   探测的命令 MUST 把 `-decryption_key <hex>` 放在**源地址（`-i`）之前** —— 放到后面 ffmpeg
   只会把它当输出选项静默忽略。明文流的 argv 里不出现这个参数（空值会被 ffmpeg 判非法）。
 - **探针解密自检**（MKACG-626 AC-8）：key 错时 ffprobe 常常**以 0 退出**、只往 stderr 吐
-  `non-existing PPS …`，拿不到关键帧却也不算失败——那种「成功」会把空索引写进库、把空分片
-  写进缓存。所以 `Key` 非空时 stderr **必须为空**（实测正确 key 下 0 字节），非空即解密失败
-  → 502、不写索引、不写缓存。明文流不看 stderr（`-v error` 下好源也会吐无害告警）。
+  `non-existing PPS …`，拿不到时长却也不算失败——那种「成功」会把 0 写进
+  `episode.duration_sec`、把坏片写进缓存。所以 `Key` 非空时 stderr **必须为空**
+  （实测正确 key 下 0 字节），非空即解密失败 → 502、不写时长、不写缓存。
+  明文流不看 stderr（`-v error` 下好源也会吐无害告警）。
 - playlist 是 `segment` 表的**纯函数视图**（`BuildPlaylist`）：不落盘、不缓存
   （理由见 `docs/CACHE-MODEL.md`「为什么 m3u8 文本不缓存」）。
 - HEAD 与 GET 的 `Content-Length` 一致（硬约束 3）：playlist 手写长度；分片走
   `http.ServeContent`（Range 也由它处理，分片是完整不可变对象，不需要分段生成）。
-- 分片字节先完整收进内存再生效（单片 10 s 约 2–5 MB）：ffmpeg 中途失败时客户端看到
+- 分片字节先完整收进内存再生效（一集 12–40 MB）：ffmpeg 中途失败时客户端看到
   干净的 502，不是截断流。
 
 ### 分片缓存
 
-`GET /video/{id}/{seq}.ts` 的顺序是「查缓存 → 命中即回；未命中生成、落盘、再回」：
+`GET /video/{id}/{seq}.m4s` 的顺序是「查缓存 → 命中即回；未命中生成、落盘、再回」：
 
-- 键 `sha256(uid \x1f seq \x1f codec_sig)`（`cache.SegmentKey`），落
-  `<cache_dir>/seg/<hash 前 2 位>/<hash>.ts`；`artifact(kind='segment')` 是索引行。
-  `codec_sig` 是 **`<通道>/<探测签名>`**（`web/…` / `app/…`，MKACG-626 契约 4）：由
-  `ensureSegments` 一处产出，`segment.codec_sig` 与分片键共用这一个值；现存索引的通道段与
-  本次请求不一致即重建（含加通道段之前写下的老索引）。通道判据是「本次解析有没有带
-  `Key`」，内容密钥本身不进键。
-- 并发同一个 `(id, seq)` 只生成一次（`Cache.GetOrGenerate` 的 single-flight）；
+- 键 `sha256("e<episode.id>" \x1f channel)`（`cache.SegmentKey`），落
+  `<cache_dir>/seg/<hash 前 2 位>/<hash>.m4s`；`artifact(kind='segment')` 是缓存行。
+  `seq` **不进键**：同一集在单集 / 合并块 / 改 `merge_chunk_size` 后命中同一个文件（ADR-0011 D3）。
+  通道（`web` / `app`）必须进键：同一集的两条通道字节流不同；判据是「本次解析有没有带
+  `Key`」，内容密钥本身不进键。`segment.channel` 是它的持久形态。
+- 并发同一个缓存键只生成一次（`Cache.GetOrGenerate` 的 single-flight）；
   **返回的 `[]byte` 是共享只读**，调用方不得就地改写。
+- 每次**真实生成**打一条 `Info`（`msg="segment generated"`，带 `episode_id` / `channel` /
+  `bytes`）——「第二次播放 ffmpeg 调用 0 次」在测试里就靠这条计数。
+- **集边界时间戳在出流时平移**（ADR-0011「修正：集边界时间戳」）：缓存字节 0 基自包含，
+  `ServeSegment` 取到字节后调 `shiftTimeline(body, start)`，把每个 `moof/traf/tfdt` 的
+  `baseMediaDecodeTime` 加 `start × 该轨 timescale`（`start` = 本片在播放单元里的起点 =
+  前面各集 `duration_sec` 之和，与 `#EXTINF` 同源）。`start == 0` 时零拷贝。
+  不这么做，ffmpeg 系播放端（Emby 转码/DirectStream、mpv）会因集边界 PTS 回退丢帧
+  （实测 3 集 325 帧只解 275 帧）。前置集 `duration_sec` 还没回填时**先补齐再平移**
+  （`timelineStart`：解析一次直链 + `ffprobe` + 回填，与 playlist 同一份 `ensureDuration`），
+  不能按 0 出流——那会把「每片从 0 起」原样放回去（检测现场 1550 包只解 800 帧）。补齐失败
+  按 502/503 返回；只有「直接请求分片 / 首播并发」会走到这里，补齐后写库、后续零外呼。
+  平移函数是纯函数（`internal/segment/mp4time.go`），结构不合规直接报错、不静默出流。
 - 生成失败 → 502，**不写缓存**（失败结果绝不进缓存）；缓存自身故障按 500 报，
   不冒充上游问题。
 - 淘汰归 `internal/cache`（每 5 分钟一轮，`cache_max_mb` / `cache_lru_days`，
   `docs/CACHE-MODEL.md`）。
-- ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutCut=60s`）；stderr 尾部
-  只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
+- ffmpeg/ffprobe 一律带硬超时（`timeoutProbe=30s` / `timeoutRemux=300s`，整集要读完
+  CDN 全程）；stderr 尾部只进日志，不落响应体；日志只记源 host，不落完整直链。并发闸
   `min(4, max(1, NumCPU/2))`，超出的请求排队不丢弃。
 - **没有预取**：2.0 不做缓存预热（MKACG-603「不在范围」），1.0 的两个占位键
   `seg_prefetch` / `pin_days` 已删除（MKACG-616），代码里没有预取循环、没有整集预热。
@@ -319,9 +330,10 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }
 
 `uid = m<dramaID>_<epFrom>_<epTo>`：`unit` 用 `store.ParseMergedUID` 反解出剧与集号
 区间，再用 `ListEpisodesInRange` 取 `ep_no ∈ [a,b]` 的集（连续列表切片保证区间里没有
-别块的集），`Timeline` 把它们的分片拼成连续 seq 空间；playlist 在集边界插
-`#EXT-X-DISCONTINUITY`；切片的 `-output_ts_offset` 用绝对起点保证跨集 DTS 连续（否则
-播放器在集边界因时间戳回退丢帧）。分片端点只解析它要切的那一集，不把整块都解析一遍。
+别块的集），`Timeline` 把它们排成连续 seq 空间（**第 k 片就是区间内第 k 集**）；playlist
+在集边界插 `#EXT-X-DISCONTINUITY`。每片自带 `ftyp+moov`，所以集边界的时间戳重置由
+DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端点只需要它那一片的
+直链：通道行在就直接读，不在才解析一次。
 
 ## 日志
 
@@ -598,7 +610,7 @@ SSR 的 `contentUrl` 只有当集为第 1 集时有值，且下载到的 MP4 **�
   **单集与合并集没有区别**，对外统一是 HLS 播放列表（`docs/PLAYBACK-CONTRACT.md`）。
 - 签名算法在 `internal/stream`（rank 20）：vfs（rank 30）可以 import 它，但仍在装配根
   注入 `vfs.IDFunc`（`cmd` 传 `stream.ID`），让 vfs 只依赖「一个纯函数」这条缝。
-- 播放面（`/video/{id}.m3u8` + `/video/{id}/{seq}.ts`）见本节前面的「播放面」章。
+- 播放面（`/video/{id}.m3u8` + `/video/{id}/{seq}.m4s`）见本节前面的「播放面」章。
 - `strm_prefix` 与 `stream_secret` 每次渲染现读，改值即时生效（硬约束 5）。
 
 ### NFO 形态
@@ -802,7 +814,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas/{id}` | DELETE | 删剧目（级联删集与对外集号），204；不存在 404 |
 | `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
-| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `seg_target_sec` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
+| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」） |
 | `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
@@ -839,7 +851,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 ### 缓存面（ADR-0007）
 
 **缓存由本服务自己负责**（`docs/adr/0007-own-hls-and-local-cache.md` 推翻 ADR-0004 的划界）：
-海报、分片、关键帧索引落 `<cache_dir>` 的三个子目录，按 `cache_max_mb` 与
+海报与分片落 `<cache_dir>` 的两个子目录（分片是「每集一片」的 `.m4s`），按 `cache_max_mb` 与
 `cache_lru_days` 淘汰，键、布局、并发与失效规则的真值是 `docs/CACHE-MODEL.md`，参数
 默认值与取值范围见本节「配置」表。淘汰循环在装配根启动（`cache.RunEviction`，启动即
 一轮、之后每 5 分钟一轮），与请求路径无关，间隔是固定值、不做成可调项。

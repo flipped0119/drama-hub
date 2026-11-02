@@ -7,14 +7,13 @@ import (
 	"fmt"
 )
 
-// artifact 表的 kind 取值（docs/DATA-MODEL.md「0003」的 CHECK 约束）。
+// artifact 表的 kind 取值（docs/DATA-MODEL.md「0003」「0006」的 CHECK 约束）。
 const (
 	ArtifactKindCover   = "cover"   // 海报：key = <provider>/<provider_id>
-	ArtifactKindIndex   = "index"   // 关键帧索引：key = uid
-	ArtifactKindSegment = "segment" // 视频分片：key = sha256(uid \x1f seq \x1f codec_sig)
+	ArtifactKindSegment = "segment" // 视频分片：key = sha256("e<episode.id>" \x1f channel)
 )
 
-// Artifact 是 artifact 表的一行：一份本地缓存资产（海报 / 关键帧索引 / 分片）。
+// Artifact 是 artifact 表的一行：一份本地缓存资产（海报 / 分片）。
 //
 // Path 是相对或绝对的本地文件路径，Bytes 是文件大小（供淘汰算总量），SHA256 是
 // 内容哈希（分片用），LastUsedAt 是不透明 TEXT（UTC RFC3339），语义同 Drama.SyncAt。
@@ -58,7 +57,7 @@ func (s *Store) ArtifactByKey(ctx context.Context, kind, key string) (Artifact, 
 // PutArtifact 以 (kind, key) 为身份写入或更新一份缓存资产的索引行。
 //
 // 冲突时覆盖 path / bytes / sha256 / last_used_at（同键的内容只会是同一个内容，
-// 覆盖等价于刷新使用时间）。kind 不在三个合法取值内时由 schema 的 CHECK 拒绝。
+// 覆盖等价于刷新使用时间）。kind 不在合法取值内时由 schema 的 CHECK 拒绝。
 func (s *Store) PutArtifact(ctx context.Context, a Artifact) error {
 	if _, err := s.db.ExecContext(ctx,
 		`INSERT INTO artifact(kind, key, path, bytes, sha256, last_used_at)
@@ -171,7 +170,7 @@ func (s *Store) ListArtifactsOldest(ctx context.Context, kind string, limit int)
 }
 
 // ListExpiredArtifacts 按 last_used_at 升序返回 last_used_at 早于 before 的最多
-// limit 行，三种 kind 都算（过期是「多久没命中」，与类型无关）。
+// limit 行，两种 kind 都算（过期是「多久没命中」，与类型无关）。
 //
 // before 是与 last_used_at 同格式的 UTC RFC3339 文本：该列是同格式定长文本，
 // 字符串比较即时间比较。

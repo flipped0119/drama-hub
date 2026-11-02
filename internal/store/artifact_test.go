@@ -50,10 +50,10 @@ func TestArtifactRoundTrip(t *testing.T) {
 	}
 
 	// 同一个 key 不同 kind 是两行（主键是 (kind, key)）。
-	index := Artifact{Kind: ArtifactKindIndex, Key: want.Key, Path: "/data/cache/index/aa/aa.json",
+	seg := Artifact{Kind: ArtifactKindSegment, Key: want.Key, Path: "/data/cache/seg/aa/aa.m4s",
 		Bytes: 1, LastUsedAt: "2026-10-30T10:00:00Z"}
-	if err := s.PutArtifact(ctx, index); err != nil {
-		t.Fatalf("PutArtifact(index): %v", err)
+	if err := s.PutArtifact(ctx, seg); err != nil {
+		t.Fatalf("PutArtifact(segment): %v", err)
 	}
 	if n := countRows(t, s.db, "artifact"); n != 2 {
 		t.Fatalf("artifact 行数 = %d, 期望 2", n)
