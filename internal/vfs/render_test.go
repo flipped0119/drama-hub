@@ -419,8 +419,8 @@ func TestRenderShowNFOThumb(t *testing.T) {
 
 // AC-3：同一部剧的 .strm 内容与它的目录路径无关。
 //
-// 内容只由三样东西决定：settings 的 strm_prefix、emby_item.uid、注入的 IDFunc。
-// 分片层下线后路径全变，这条测试钉住「路径不参与内容」——同一 emby_item 在两条
+// 内容只由三样东西决定：settings 的 strm_prefix、对外剧集 uid、注入的 IDFunc。
+// 分片层下线后路径全变，这条测试钉住「路径不参与内容」——同一条对外剧集在两条
 // 不同目录路径下渲染出来的字节必须逐字节相同。
 func TestStrmContentIndependentOfPath(t *testing.T) {
 	f := seed(t, "")

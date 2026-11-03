@@ -1,0 +1,11 @@
+-- 0008_drop_emby_item.sql（PostgreSQL 版）：删掉 emby_item 派生表（MKACG-666）。
+--
+-- 为什么删：库里只存原始集（episode），合并集在每次读取时按当前
+-- merge_chunk_size 运行时派生（docs/adr/0014）。派生表是「合并结果落库」，
+-- 改 N 必须等下一次重建才生效——正是本 issue 要消除的滞后。
+--
+-- 不可回滚：文件一经提交不再修改（迁移只向前）。索引与唯一约束随表删除，
+-- 不需要单独 DROP。
+--
+-- 同一二进制既迁移也不再读该表：服务启动即迁移，代码里已经没有 emby_item。
+DROP TABLE IF EXISTS emby_item;

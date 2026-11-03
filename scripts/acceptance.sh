@@ -102,6 +102,63 @@ dbq() { # dbq <SQL> —— 一行一值（tAc 输出）
   timeout 60 "$ENGINE" exec "$PG_CONTAINER" psql -U "$DB_USER" -d "$DB_NAME" -tAc "$1" 2>/dev/null | tr -d '\r'
 }
 
+# 对外剧集在运行时派生（ADR-0014）：库里只存 episode，没有 emby_item 表。
+merge_chunk_size() { # 当前 N（无 settings 行取默认 10）
+  dbq "SELECT COALESCE((SELECT value_json::int FROM settings WHERE key='merge_chunk_size'), 10)"
+}
+
+derived_items() { # derived_items <drama_id> —— 对外集数 = ceil(集数 / N)
+  dbq "SELECT ceil(count(*)::numeric / $(merge_chunk_size))::int FROM episode WHERE drama_id=$1"
+}
+
+derived_item_rows() { # derived_item_rows <drama_id> —— 对外集号|kind|uid，与 vfs 派生同规则
+  dbq "WITH n AS (SELECT $(merge_chunk_size) AS n),
+  ordered AS (SELECT id, ep_no, ceil(row_number() OVER (ORDER BY ep_no)::numeric / n.n)::int AS blk
+              FROM episode, n WHERE drama_id=$1)
+  SELECT blk, CASE WHEN count(*)=1 THEN 'single' ELSE 'merged' END,
+         CASE WHEN count(*)=1 THEN 'e' || min(id) ELSE 'm$1_' || min(ep_no) || '_' || max(ep_no) END
+  FROM ordered GROUP BY blk ORDER BY blk"
+}
+
+derived_ep_no() { # derived_ep_no <uid> —— uid 反算对外集号（该块起始成员的位置 / N）
+  local uid=$1 chunk did from id eps
+  chunk=$(merge_chunk_size)
+  case "$uid" in
+    m*)
+      did=${uid%%_*}; did=${did#m}
+      from=$(printf '%s' "$uid" | cut -d_ -f2)
+      eps=$(dbq "SELECT count(*) FROM episode WHERE drama_id=$did AND ep_no < $from")
+      dbq "SELECT ceil(($eps + 1)::numeric / $chunk)::int"
+      ;;
+    e*)
+      id=${uid#e}
+      did=$(dbq "SELECT drama_id FROM episode WHERE id=$id")
+      [ -z "$did" ] && return 1
+      eps=$(dbq "SELECT count(*) FROM episode WHERE drama_id=$did AND ep_no <= (SELECT ep_no FROM episode WHERE id=$id)")
+      [ -z "$eps" ] && return 1
+      dbq "SELECT ceil($eps::numeric / $chunk)::int"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+derived_runtime() { # derived_runtime <uid> —— 单集本集时长，合并集区间之和（秒）
+  local uid=$1 did from to id
+  case "$uid" in
+    m*)
+      did=${uid%%_*}; did=${did#m}
+      from=$(printf '%s' "$uid" | cut -d_ -f2)
+      to=$(printf '%s' "$uid" | cut -d_ -f3)
+      dbq "SELECT COALESCE(sum(duration_sec), 0) FROM episode WHERE drama_id=$did AND ep_no BETWEEN $from AND $to"
+      ;;
+    e*)
+      id=${uid#e}
+      dbq "SELECT COALESCE((SELECT duration_sec FROM episode WHERE id=$id), 0)"
+      ;;
+    *) echo 0 ;;
+  esac
+}
+
 rclone_setup() {
   timeout 60 "$RCLONE" config create dramahub webdav url "$BASE/webdav" vendor other \
     user "$WEBDAV_USER" pass "$WEBDAV_PASS" --non-interactive >/dev/null 2>&1
@@ -118,7 +175,7 @@ strm_id_for_uid() { # strm_id_for_uid <uid>
   return 1
 }
 
-# refresh_list 重列一遍虚拟目录树（改 N 并重建会改派生表，清单必须重取）
+# refresh_list 重列一遍虚拟目录树（改 N 会改对外剧集，清单必须重取）
 refresh_list() {
   rclone_setup
   timeout 300 "$RCLONE" lsf --files-only -R dramahub:/ >"$WORK/list.txt" 2>/dev/null
@@ -286,11 +343,12 @@ stage_D() {
     skip D4 "文件数与库比对：未给 PG_CONTAINER"
     return
   fi
-  local want got genres empty
-  want=$(dbq "SELECT 2*count(*) + count(DISTINCT drama_id) FROM emby_item")
+  local want got genres empty items
+  items=$(dbq "SELECT COALESCE(sum(ceil(cnt::numeric / $(merge_chunk_size))), 0) FROM (SELECT count(*) AS cnt FROM episode GROUP BY drama_id) t")
+  want=$(( 2 * items + $(dbq "SELECT count(*) FROM drama") ))
   got=$n
   if [ "$got" = "$want" ]; then
-    pass D4 "文件数 = 库派生数（emby_item×2 + 每剧 tvshow.nfo）= $got"
+    pass D4 "文件数 = 库派生数（对外集数×2 + 每剧 tvshow.nfo）= $got"
   else
     fail D4 "文件数 $got ≠ 库派生数 $want"
   fi
@@ -373,18 +431,18 @@ PY
       fail E1 "tvshow.nfo 与库不一致 — nfo=$e1 / db=title:$db_title year:$db_year plot:$db_plot"
     fi
     # 口径说明：tvshow.nfo 只有 title/year/plot（docs/DIRECTORY-CONTRACT.md 冻结的内容）；
-    # 「季/集数」落在目录与派生表上，见 E1b。
+    # 「季/集数」落在目录与运行时派生的对外剧集上，见 E1b。
     local seasons eps
     seasons=$(grep -cF "$show/Season 01/" "$WORK/list.txt")
-    eps=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
+    eps=$(derived_items "$DRAMA_ID")
     if [ "$seasons" -eq $((2 * eps)) ]; then
-      pass E1b "季目录 Season 01 文件数 = 2×emby_item（$eps 集）"
+      pass E1b "季目录 Season 01 文件数 = 2×对外集数（$eps 集，按 N 派生）"
     else
       fail E1b "Season 01 文件数 $seasons ≠ 2×$eps"
     fi
   fi
 
-  # E2/E4：逐集 nfo 的 season/episode 与 emby_item 对外集号一致；strm id 可 GET
+  # E2/E4：逐集 nfo 的 season/episode 与运行时派生的对外集号一致；strm id 可 GET
   local n=0 bad_nfo=0 bad_strm=0 bad_get=0 code200=0 code502=0 first=1
   local line ep
   for line in $(season_files "$show" strm | sed 's/ /%20/g'); do
@@ -422,20 +480,20 @@ PY
   fi
 
   if ! db_ready; then
-    skip E4 "集 .nfo 与 emby_item 集号一致：未给 PG_CONTAINER"
+    skip E4 "集 .nfo 与运行时派生的对外集号一致：未给 PG_CONTAINER"
     skip E5 "runtime 与实测时长：未给 PG_CONTAINER"
     return
   fi
 
-  # E4 集号一致性：id → emby_item.ep_no / season，与同目录 .nfo 的 <episode>/<season> 比对
+  # E4 集号一致性：id → 运行时派生的 ep_no / season（恒 1），与同目录 .nfo 的 <episode>/<season> 比对
   local nfo_bad=0 checked=0
   for line in $(season_files "$show" nfo | sed 's/ /%20/g'); do
     line=${line//%20/ }
     local id want_season want_ep got_season got_ep
     id=$(strm_id "$(echo "$line" | sed 's/\.nfo$/.strm/')")
     [ -z "$id" ] && continue
-    want_season=$(dbq "SELECT season FROM emby_item WHERE uid='${id%%-*}'")
-    want_ep=$(dbq "SELECT ep_no FROM emby_item WHERE uid='${id%%-*}'")
+    want_season=1
+    want_ep=$(derived_ep_no "${id%%-*}")
     [ -z "$want_ep" ] && continue
     timeout 60 "$RCLONE" cat "dramahub:/$line" >"$WORK/ep.nfo" 2>/dev/null
     read -r got_season got_ep <<EOF
@@ -456,7 +514,7 @@ EOF
     fi
   done
   if [ "$nfo_bad" -eq 0 ] && [ "$checked" -gt 0 ]; then
-    pass E4 "$checked 集 .nfo 的 season/episode 与 emby_item 对外集号逐一相符"
+    pass E4 "$checked 集 .nfo 的 season/episode 与运行时派生的对外集号逐一相符"
   else
     fail E4 "$nfo_bad/$checked 集 .nfo 集号不符"
   fi
@@ -470,10 +528,10 @@ EOF
     id=$(strm_id "$line")
     [ -z "$id" ] && continue
     uid=${id%%-*}
-    want=$(dbq "SELECT ep_no FROM emby_item WHERE uid='$uid'")
+    want=$(derived_ep_no "$uid")
     [ -z "$want" ] && continue
     timeout 60 "$RCLONE" cat "dramahub:/$line" >/dev/null 2>&1 # 保证文件可读
-    rt=$(dbq "SELECT runtime_sec FROM emby_item WHERE uid='$uid'")
+    rt=$(derived_runtime "$uid")
     if [ "$rt" = "0" ]; then
       rt_zero=$((rt_zero + 1))
       continue
@@ -572,7 +630,7 @@ item_uid_for_ep() { # item_uid_for_ep <ep_no> —— 从清单里找对外集号
     id=$(strm_id "$line")
     if [ -n "$id" ] && db_ready; then
       local ep
-      ep=$(dbq "SELECT ep_no FROM emby_item WHERE uid='${id%%-*}'")
+      ep=$(derived_ep_no "${id%%-*}")
       [ "$ep" = "$want" ] && { echo "$id"; return 0; }
     fi
   done
@@ -716,12 +774,12 @@ stage_F() {
 }
 
 # ------------------------------------------------------------------ G 合并集
-# 判据（ADR-0010）：分块是自动的，不需要也不允许人工建组。
+# 判据（ADR-0010 分块语义 / ADR-0014 运行时派生）：分块是自动的，没有派生表。
 #   G1 对外集数 = ceil(集数 / N)
 #   G2 每块 ep_no 连续、uid 形态正确（single e<id> / merged m<drama>_<a>_<b>）
 #   G3 合并块的 playlist 集边界有 DISCONTINUITY、seq 从 0 连续
 #   G4 合并块 playlist 的总时长 ≈ 块内成员 duration_sec 之和（误差 ≤2s）
-#   G5 改 N 后重建：对外集数变 ceil(集数 / 新 N)（无需重启）
+#   G5 改 N 后无需同步/重建：下一次读取对外集数即变 ceil(集数 / 新 N)
 #   G6 旧合并 id 的 .m3u8 变 404（签名仍合法，不返回别人的内容）
 stage_G() {
   section "G 合并集（自动分块 + 虚拟 HLS 聚合）"
@@ -731,9 +789,6 @@ stage_G() {
   fi
 
   local eps chunk
-  if [ -z "$SERIES_ID" ]; then
-    info "" "未给 SERIES_ID：改 N 的 G5/G6 会 SKIP（重建只能由同步或首播触发）"
-  fi
   eps=$(dbq "SELECT count(*) FROM episode WHERE drama_id=$DRAMA_ID")
   chunk=$(dbq "SELECT value_json FROM settings WHERE key='merge_chunk_size'" | tr -d '"')
   [ -z "$chunk" ] && chunk=10
@@ -750,9 +805,9 @@ stage_G() {
   # G1 对外集数 = ceil(集数 / N)
   local want_items got_items
   want_items=$(( (eps + chunk - 1) / chunk ))
-  got_items=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
+  got_items=$(derived_items "$DRAMA_ID")
   if [ "$got_items" = "$want_items" ]; then
-    pass G1 "对外集数 = ceil($eps/$chunk) = $want_items（emby_item 行数一致）"
+    pass G1 "对外集数 = ceil($eps/$chunk) = $want_items（运行时派生，无派生表）"
   else
     fail G1 "对外集数 = $got_items, 期望 ceil($eps/$chunk) = $want_items"
   fi
@@ -769,7 +824,7 @@ stage_G() {
       *) bad_uid=$((bad_uid + 1)) ;;
     esac
   done <<EOF
-$(dbq "SELECT ep_no || '|' || kind || '|' || uid FROM emby_item WHERE drama_id=$DRAMA_ID ORDER BY ep_no")
+$(derived_item_rows "$DRAMA_ID")
 EOF
   if [ "$bad_no" -eq 0 ] && [ "$bad_uid" -eq 0 ]; then
     pass G2 "$got_items 块：对外集号 1..$got_items 连续，uid 形态全部正确"
@@ -779,19 +834,19 @@ EOF
 
   # 找一个合并块（块内 ≥2 集）：G3/G4 只对它有意义。N=1 或集数不足时跳过。
   local muid=""
-  muid=$(dbq "SELECT uid FROM emby_item WHERE drama_id=$DRAMA_ID AND kind='merged' ORDER BY ep_no LIMIT 1")
+  muid=$(derived_item_rows "$DRAMA_ID" | awk -F'|' '$2=="merged"{print $3; exit}')
   if [ -z "$muid" ]; then
     skip G3 "没有合并块（N=1 或集数 ≤1），无法验 DISCONTINUITY"
     skip G4 "没有合并块，无法验总时长"
   else
     local mid from to wantdur m_ep_no
-    m_ep_no=$(dbq "SELECT ep_no FROM emby_item WHERE uid='$muid'")
+    m_ep_no=$(derived_ep_no "$muid")
     refresh_list
     mid=$(item_uid_for_ep "$(find_show_dir)" "$m_ep_no")
-    from=$(dbq "SELECT split_part(substr(uid, 2), '_', 2) FROM emby_item WHERE uid='$muid'")
-    to=$(dbq "SELECT split_part(substr(uid, 2), '_', 3) FROM emby_item WHERE uid='$muid'")
+    from=$(printf '%s' "$muid" | cut -d_ -f2)
+    to=$(printf '%s' "$muid" | cut -d_ -f3)
     if [ -z "$mid" ]; then
-      fail G3 "清单里找不到合并块 $muid 的 .strm（派生表有行但目录没渲染出来？）"
+      fail G3 "清单里找不到合并块 $muid 的 .strm（派生结果里有这个块但目录没渲染出来？）"
       fail G4 "合并块 $muid 的 playlist 取不到 id"
     else
       local code body
@@ -847,12 +902,7 @@ EOF
     fi
   fi
 
-  # G5/G6 改 N 生效：N 只在「下一次重建」生效，验收用一次重新同步触发重建。
-  if [ -z "$SERIES_ID" ]; then
-    skip G5 "改 N：未给 SERIES_ID，无法触发重建"
-    skip G6 "改 N：同 G5"
-    return
-  fi
+  # G5/G6 改 N 生效：N 在下一次读取时现算（ADR-0014），不触发任何同步。
   if [ "$MERGE_CHUNK_ALT" = "$chunk" ]; then
     skip G5 "MERGE_CHUNK_ALT=$MERGE_CHUNK_ALT 与原 N 相同，改 N 不可判定"
     skip G6 "同 G5"
@@ -870,22 +920,19 @@ EOF
     fail G6 "改 N 失败，G6 无法判定"
     return
   fi
-  local sync_code
-  sync_code=$(api POST "/api/dramas" "{\"series_id\":\"$SERIES_ID\"}")
-  if [ "$sync_code" != "200" ] && [ "$sync_code" != "201" ]; then
-    fail G5 "重新同步（触发重建）期望 200/201，实得 $sync_code — $(head -c 200 "$WORK/api.body")"
-    fail G6 "重建失败，G6 无法判定"
-    return
-  fi
+  # 不触发任何同步/重建：改 N 后下一次读取就按新分块（ADR-0014）。
   refresh_list
+  local show_dir alt_files
+  show_dir=$(find_show_dir)
   want_alt=$(( (eps + MERGE_CHUNK_ALT - 1) / MERGE_CHUNK_ALT ))
-  got_alt=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
-  if [ "$got_alt" = "$want_alt" ]; then
-    pass G5 "N=$MERGE_CHUNK_ALT 重建后对外集数 = ceil($eps/$MERGE_CHUNK_ALT) = $want_alt（无需重启）"
+  got_alt=$(derived_items "$DRAMA_ID")
+  alt_files=$(grep -cF "$show_dir/Season 01/" "$WORK/list.txt")
+  if [ "$got_alt" = "$want_alt" ] && [ "$alt_files" = "$((2 * want_alt))" ]; then
+    pass G5 "N=$MERGE_CHUNK_ALT 后对外集数 = ceil($eps/$MERGE_CHUNK_ALT) = $want_alt、目录 $alt_files 个文件（未触发同步）"
   else
-    fail G5 "N=$MERGE_CHUNK_ALT 重建后对外集数 = $got_alt, 期望 $want_alt"
+    fail G5 "N=$MERGE_CHUNK_ALT 后对外集数 = $got_alt（期望 $want_alt）、目录文件 $alt_files（期望 $((2 * want_alt))）"
   fi
-  # 旧 uid 已不在派生表里 → 旧 id 走 404（签名仍合法，不能变 401、不能返回别人的内容）
+  # 旧 uid 不是当前派生规则下的播放单元 → 旧 id 走 404（签名仍合法，不能变 401、不能返回别人的内容）
   if [ -n "${old_id:-}" ]; then
     old_code=$(http_code "$BASE/video/$old_id.m3u8")
     if [ "$old_code" = "404" ]; then
@@ -897,12 +944,11 @@ EOF
     skip G6 "没有可复用的旧合并 id（原 N 下没有合并块）"
   fi
 
-  # 改回原 N 并重建一次，避免影响后续段与重跑。
-  api PATCH "/api/settings" "{\"merge_chunk_size\":\"$chunk\"}" >/dev/null
-  api POST "/api/dramas" "{\"series_id\":\"$SERIES_ID\"}" >/dev/null
+  # 改回原 N，避免影响后续段与重跑（同样不需要同步/重建）。
+  api PATCH "/api/settings" "{\"settings\":{\"merge_chunk_size\":\"$chunk\"}}" >/dev/null
   refresh_list
   local restored
-  restored=$(dbq "SELECT count(*) FROM emby_item WHERE drama_id=$DRAMA_ID")
+  restored=$(derived_items "$DRAMA_ID")
   if [ "$restored" = "$want_items" ]; then
     info "" "已把 merge_chunk_size 改回 $chunk（对外集数 $restored）"
   else

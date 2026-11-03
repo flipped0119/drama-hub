@@ -21,7 +21,7 @@
 3. **每个虚拟文件必须给出精确 `Content-Length`。** WebDAV 的 `PROPFIND` 少了它，rclone mount 读不到文件、Emby 扫不出集。渲染 → 算长度 → 再返回，一次请求内完成。
 4. **单二进制 + PostgreSQL。** 一个 Go 二进制装三个面：没有 Node、没有前端构建步骤、没有第二个应用运行时、没有外部缓存服务。界面用 Go 模板 + 少量原生 JS，模板随二进制嵌入（`embed`）。**PostgreSQL 是必选外部依赖**（ADR-0009）：连接串由 `DRAMA_HUB_DB_URL` 给，迁移随启动自动执行，连不上就启动失败；代码里不留任何内嵌数据库路径。
 5. **可调参数进 `settings` 表。** strm 前缀、出流签名密钥、缓存目录/上限/LRU 天数运行时可变，改完即时生效。代码里出现这类魔法数字视为缺陷。**缓存由本服务自己负责（ADR-0007）**：海报与分片落 `<cache_dir>`，按 `cache_max_mb` 与 `cache_lru_days` 淘汰，规则与测试见 `docs/CACHE-MODEL.md`。分片是**每集一片**的 fMP4，键按「集 + 通道」算（ADR-0011）——「切多长」不再是配置项（这一项已从 `settings` 删除，不再有开关或别名）。2.0 不做缓存预热：1.0 的 `seg_prefetch` / `pin_days` 占位键已删除（MKACG-616），代码里没有预取实现。
-6. **对外集号只由 `emby_item` 派生表决定。** 合并调整只重建派生表，`drama` / `episode` 原始数据不动。
+6. **对外集号只由运行时派生规则决定。** 库里只存原始 `episode`，合并集在每次读取时按当前 `merge_chunk_size` 现算：改 N 后下一次列举 / 播放 / NFO 立刻是新分块，不需要同步、不需要重建（ADR-0014）。派生规则只有一份实现（`internal/store` 的 `deriveEmbyItems`），`drama` / `episode` 原始数据不动。
 7. **出流用字节透传，不用 302。** 302 到签名 CDN 会让缓存键漂移、过期链接命中旧缓存返回错内容。
 8. **出流 token 是 HMAC 常量签名，无过期、无状态、无 token 表**（ADR-0003）。带过期的 token 会破坏缓存键稳定性，与缓存目标直接冲突。
 9. **不做理论性加固。** 新增任何防护/兜底/校验前，先说明具体的失败模式、发生可能性、复杂度成本，取得确认再写。单用户本机场景下概率接近零的边缘情况一律不写。
@@ -32,9 +32,9 @@
 ```
 cmd/drama-hub/          main，只做装配，不含业务逻辑
 internal/plugin/        播放源插件契约（接口 / 5 条哨兵 / 注册表）与实现 hongguo/
-internal/sync/          框架侧同步编排：插件取数 → 事务写库 → 重建派生表
+internal/sync/          框架侧同步编排：插件取数 → 事务写库（只写 drama / episode）
 internal/scheduler/     刷新调度：一轮三段、同源单飞、间隔热读、手动触发与状态
-internal/store/         PostgreSQL 连接、迁移、派生表重建
+internal/store/         PostgreSQL 连接、迁移、对外剧集的运行时派生
 internal/vfs/           虚拟文件树 → strm/nfo/图片 渲染
 internal/webdav/        x/net/webdav 自定义 FileSystem
 internal/stream/        播放 id 签名（HMAC）与请求时直链解析（不碰 HTTP）

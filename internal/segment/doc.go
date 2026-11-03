@@ -11,8 +11,8 @@
 //     （`ServeSegment`），单集与合并集同一路径形态。
 //  2. 时长：`episode.duration_sec` 是唯一真值。第一次播放某个 uid 时 `probeDuration`
 //     现 `ffprobe` 一次取源时长并回填（`store.BackfillEpisodeDuration`，只填 0），
-//     同事务重建该剧 `emby_item`，`.nfo` 的 `<runtime>` 与 playlist 的 EXTINF 因此
-//     变成真实值。整体 30 s 硬上限，超时 503。
+//     下一次读取派生结果时 `.nfo` 的 `<runtime>` 与 playlist 的 EXTINF 就是真实值
+//     （docs/adr/0014）。整体 30 s 硬上限，超时 503。
 //  3. 时间轴映射：`Timeline` 把有序的成员集拼成连续 seq 空间。每集一片，所以
 //     `seq` 就是成员下标（合并集播放的 O(1) 定位）。
 //  4. 播放列表生成：`BuildPlaylist` 把时间轴渲成 VOD m3u8，集边界插

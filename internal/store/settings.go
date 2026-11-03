@@ -46,7 +46,7 @@ const (
 	// 该更早放弃，因此单独一项，不跟插件超时走（MKACG-620）。
 	KeyCoverTimeoutSec SettingKey = "cover_timeout_sec"
 	// KeyMergeChunkSize 是「几集并成一条对外剧集」（默认 10，范围 1–500）。分块是
-	// 纯派生：重建 emby_item 时现读本值，改完下一次重建即生效（docs/adr/0010）。
+	// 纯派生：每次列举 / 播放都现读本值，改完下一次读取即生效（docs/adr/0014）。
 	KeyMergeChunkSize SettingKey = "merge_chunk_size"
 	// 刷新调度的三项（范围与语义见 docs/SCHEDULER-MODEL.md「配置」）。
 	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
