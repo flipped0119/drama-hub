@@ -303,7 +303,7 @@ func TestRenderStrmMissingSecret(t *testing.T) {
 }
 
 // AC：标题被 sanitize 过的剧（目录名与 title 原文不同）仍能按目录名定位并渲染
-// ——点查 idx_drama_title 不中时退到分片内比对，不是 404。
+// ——点查 idx_drama_title 不中时退到分类内比对，不是 404。
 func TestRenderSanitizedDramaDir(t *testing.T) {
 	f := seed(t, "")
 	body, err := f.tree.Render(context.Background(), f.dirB+"/tvshow.nfo")
@@ -323,15 +323,14 @@ func TestRenderSanitizedDramaDir(t *testing.T) {
 func TestRenderConflictSuffixDirs(t *testing.T) {
 	f := seed(t, "")
 	ctx := context.Background()
-	shard := shardOf("dup-0")
-	ids := providerIDsWithShard(shard, "web", 2)
+	ids := []string{"dup-0", "dup-1"}
 	dirs := make([]string, 0, 2)
 	for i, id := range ids {
 		f.addDrama(t, store.Drama{
 			Provider: "web", ProviderID: id, Title: "同名剧", Year: 2026,
 			Genre: genreA, Plot: "第" + strconv.Itoa(i) + "部",
 		})
-		dirs = append(dirs, dramaDirPath(genreA, id, "同名剧 (2026) [web-"+id+"]"))
+		dirs = append(dirs, dramaDirPath(genreA, "同名剧 (2026) [web-"+id+"]"))
 	}
 
 	for i, dir := range dirs {
@@ -415,5 +414,41 @@ func TestRenderShowNFOThumb(t *testing.T) {
 	}
 	if got.Title != titleA || got.Year != 2024 {
 		t.Errorf("带 thumb 后 title/year = %q/%d, 期望 %q/2024", got.Title, got.Year, titleA)
+	}
+}
+
+// AC-3：同一部剧的 .strm 内容与它的目录路径无关。
+//
+// 内容只由三样东西决定：settings 的 strm_prefix、emby_item.uid、注入的 IDFunc。
+// 分片层下线后路径全变，这条测试钉住「路径不参与内容」——同一 emby_item 在两条
+// 不同目录路径下渲染出来的字节必须逐字节相同。
+func TestStrmContentIndependentOfPath(t *testing.T) {
+	f := seed(t, "")
+	ctx := context.Background()
+
+	before, err := f.tree.Render(ctx, f.dirA+"/"+seasonDir+"/"+titleA+" - S01E01 - 开局.strm")
+	if err != nil {
+		t.Fatalf("Render(改造后路径): %v", err)
+	}
+
+	// 换分类（上游 tags[0] 变了）：剧目录整体搬到另一个分类目录下。
+	if _, err := f.store().UpsertDrama(ctx, store.Drama{
+		Provider: "web", ProviderID: "a1", Title: titleA, Year: 2024,
+		Plot: "第一行 & <第二行>", EpisodeTotal: 2, Genre: "都市",
+	}); err != nil {
+		t.Fatalf("UpsertDrama(换分类): %v", err)
+	}
+	moved := Root + "/都市/" + titleA + " (2024)"
+	after, err := f.tree.Render(ctx, moved+"/"+seasonDir+"/"+titleA+" - S01E01 - 开局.strm")
+	if err != nil {
+		t.Fatalf("Render(换分类后的路径 %s): %v", moved, err)
+	}
+
+	if !bytes.Equal(before, after) {
+		t.Errorf("同一集在两条路径下的 strm 不同：\n%s\n%s", before, after)
+	}
+	// 旧路径随之失效（剧已搬走），不是另一份拷贝。
+	if _, err := f.tree.Render(ctx, f.dirA+"/"+seasonDir+"/"+titleA+" - S01E01 - 开局.strm"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("旧路径仍可渲染（err = %v），期望 ErrNotFound", err)
 	}
 }

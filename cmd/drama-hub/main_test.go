@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"math"
 	"net/http"
@@ -33,14 +32,6 @@ import (
 	"github.com/justforlxz/drama-hub/internal/vfs"
 	"github.com/justforlxz/drama-hub/internal/web"
 )
-
-// shardOf 独立实现目录分片号 fnv32a(provider_id) % 128（不复用生产代码）：
-// 用它算「这部剧的目录应该挂在哪个分片下」。
-func shardOf(providerID string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(providerID))
-	return fmt.Sprintf("%02x", h.Sum32()%128)
-}
 
 // newTestHandler 与 main 用同一条装配路径：httptest 起真实 handler，不 mock 自己的
 // handler。播放面需要数据库（settings / episode 表），因此开一个临时库装配。
@@ -322,7 +313,7 @@ func TestHandler_WebDAV(t *testing.T) {
 	}
 
 	// 文件名含空格与中文，请求目标必须是转义后的形式（真实客户端也这样发）。
-	path := "/webdav/" + url.PathEscape("爱情") + "/" + shardOf("p1") + "/" +
+	path := "/webdav/" + url.PathEscape("爱情") + "/" +
 		url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
 		url.PathEscape("测试剧 - S01E01 - 开局") + ".strm"
 	req = httptest.NewRequest(http.MethodGet, path, nil)
@@ -436,7 +427,7 @@ func TestHandler_SettingsWrite(t *testing.T) {
 	}
 
 	// B2 的归一化要落到渲染：写进去的是带尾 `/` 的地址，`.strm` 里不能出现双斜杠。
-	strmPath := "/webdav/" + url.PathEscape("爱情") + "/" + shardOf("p1") + "/" +
+	strmPath := "/webdav/" + url.PathEscape("爱情") + "/" +
 		url.PathEscape("测试剧 (2024)") + "/Season%2001/" +
 		url.PathEscape("测试剧 - S01E01 - 开局") + ".strm"
 	strmReq := httptest.NewRequest(http.MethodGet, strmPath, nil)
@@ -977,7 +968,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	tree := vfs.NewTree(st, settings, stream.ID, nil, logger)
 
-	season := "短剧/爱情/" + shardOf("g1") + "/回填剧 (2026)/Season 01"
+	season := "短剧/爱情/回填剧 (2026)/Season 01"
 	nfoOf := func(epNo int) string {
 		return fmt.Sprintf("%s/回填剧 - S01E%02d - 第%d集.nfo", season, epNo, epNo)
 	}

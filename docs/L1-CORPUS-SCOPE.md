@@ -145,14 +145,16 @@ ffprobe -v error -show_entries format=duration  # duration=10.066667
 | WebDAV 每类目录子项 | 最大类 ≈ 18.3 万 | 17,558 部实测「剧情」占 30.1%，外推（取证 F4） |
 
 `/全部/` 一级目录已按 lxz 2026-10-30 口径删除（`docs/DIRECTORY-CONTRACT.md` v2），
-但单个分类目录仍有约 21.6 万个子目录。`x/net/webdav` 的 `walkFS` 对一次 `PROPFIND`
-调用 `Readdir(0)` 把**全部**子项读进内存再逐个 `Stat`
-（`x/net/webdav@v0.62.0/webdav/file.go:787`），所以 20 万级子项的目录不是「慢」而是
-「不可列举」。对策已定（`docs/DIRECTORY-CONTRACT.md`「D2」）：分类目录下加一层纯函数分片
-（`shard = fnv32a(provider_id) % N`，默认 `N=128`），把最大分类从 21.6 万摊到 ~1.7k。
-具体 `N` 已由 S5 的 `SELECT genre, COUNT(*) FROM drama GROUP BY genre`（取证 F4）校准：
-`N=128` 时最大分片目录外推 ≈ 1,900 子项，结论见 `docs/DIRECTORY-CONTRACT.md`「`N` 怎么定」，
-不改 schema、不需要再决策。
+所以单个分类目录约有 21.6 万个子目录（L1 最大分类）。`x/net/webdav` 的 `walkFS` 对一次
+`PROPFIND` 调用 `Readdir(0)` 把**全部**子项读进内存再逐个 `Stat`
+（`x/net/webdav@v0.62.0/webdav/file.go:787`）。
+
+v3 曾为此加一层分片目录摊薄，**v5（MKACG-651）删除了它**：实测 Jellyfin 会把分片目录当
+Season，反而让剧认不出来。现在这一层不摊薄，代价与判据已实测（冷启动真服务 + 真 PG）：
+`Depth: 1` 下 10 万子项 1.99 s / 52.9 MB / RSS +68 MB，21.6 万子项 4.06 s / 114.7 MB /
+RSS +137 MB；**省略 `Depth`（= infinity，递归整棵子树）时 21.6 万子项 369.0 MB / 116 s /
+RSS +501 MB，三项判据全越线**。数字、判据线与升级路径（客户端带 `Depth: 1`、库根按分类
+目录分挂）见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。
 
 ## 取证 F：S5 全量同步实测（2026-10-30 23:47–2026-10-31 01:15 UTC+8）
 
@@ -234,6 +236,6 @@ S5（MKACG-607）把 `Enumerate` 落地成「sitemap 三段 + `/category` 全页
 
 - 集数：均值 **42.4**、最小 1、最大 1000（全库按此均值 ≈ 2,580 万集，取证 C 的 46.8
   是从 sitemap 均匀抽样的偏高值）。
-- 分片校准（`N=128`）：最大分类的单分片最多 **55 部**、均值 41.3 部（比均值高 1.33×）；
-  按占比外推到 608,372 部 → 最大分类 ≈ 18.3 万部 → 单分片 ≈ 1,900 子项。
-  结论与建议的 `N` 见 `docs/DIRECTORY-CONTRACT.md`「`N` 怎么定」。
+- 分类分布用于估「最大分类目录一次 `PROPFIND` 的子项数」：最大分类「剧情」占 30.1%，
+  按占比外推到 608,372 部 → 最大分类 ≈ 18.3 万部（取 21.6 万作上界），实测见
+  `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。

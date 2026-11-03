@@ -187,9 +187,6 @@ func TestSyncSeriesWritesDramaAndEpisodes(t *testing.T) {
 	if d.Genre != "" || d.Tags != "[]" {
 		t.Fatalf("无标签页面的 genre/tags = (%q, %q), 期望 (\"\", \"[]\")", d.Genre, d.Tags)
 	}
-	if want := store.ShardOf(fixtureSID); d.Shard != want {
-		t.Fatalf("shard = %d, 期望按身份派生 %d", d.Shard, want)
-	}
 	syncAt, err := time.Parse(time.RFC3339, d.SyncAt)
 	if err != nil {
 		t.Fatalf("sync_at %q 不是 RFC3339: %v", d.SyncAt, err)
@@ -451,9 +448,9 @@ func newCoverCDN(t *testing.T) (*coverCDN, *httptest.Server) {
 	return c, srv
 }
 
-// AC：genre = Genres[0]、tags = 保序去重的 JSON 数组、shard 按身份派生；刷新时
-// 三列随上游覆盖（改名/改分类是上游行为的忠实反映）。
-func TestSyncSeriesWritesGenreTagsShard(t *testing.T) {
+// AC：genre = Genres[0]、tags = 保序去重的 JSON 数组；刷新时两列随上游覆盖
+// （改名/改分类是上游行为的忠实反映）。
+func TestSyncSeriesWritesGenreTags(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 	p := &fakePlugin{name: "fake", detail: plugin.WorkDetail{
@@ -477,9 +474,6 @@ func TestSyncSeriesWritesGenreTagsShard(t *testing.T) {
 	}
 	if d.Tags != `["爱情","都市"]` {
 		t.Fatalf("tags = %q, 期望保序去重的 JSON 数组", d.Tags)
-	}
-	if want := store.ShardOf("w1"); d.Shard != want {
-		t.Fatalf("shard = %d, 期望 fnv32a(provider_id)%%%d = %d", d.Shard, store.ShardCount, want)
 	}
 
 	// 刷新：tags[0] 从「爱情」变「家庭」→ genre 跟着换目录（tags 整体被覆盖）。

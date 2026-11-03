@@ -139,14 +139,20 @@ curl -sS http://127.0.0.1:8080/api/dramas | python3 -m json.tool | head -20
 ```bash
 rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other \
   user emby pass '<密码>'
-rclone lsf --max-depth 5 dramahub:/       # <分类>/<分片>/<剧>/Season 01/{.strm,.nfo}
+rclone lsf --max-depth 4 dramahub:/       # <分类>/<剧>/Season 01/{.strm,.nfo}
 rclone lsf --files-only -R dramahub:/ | wc -l    # = emby_item×2 + 每剧 1 个 tvshow.nfo
 rclone mount dramahub:/ /mnt/dramahub --dir-cache-time 30s
 ```
 
-Emby 库路径指到 `/mnt/dramahub`，类型「电视节目」。
-`PROPFIND` 只支持 `Depth: 0/1`（数值深度 ≥2 由 `x/net/webdav` 回 400），rclone 与 Emby
-本来都是逐层扫，不是缺陷。
+Emby / Jellyfin 的库**必须按分类目录分挂**：一个「电视节目」库，媒体文件夹加
+`/mnt/dramahub/<分类>`（每个分类一个，真实 `genre` 词表 68 个）。库根直接挂
+`/mnt/dramahub` 会把分类目录当 Series（1436 部剧只识别出 59 部），见
+`docs/DIRECTORY-CONTRACT.md`「被推翻的做法」。
+
+`PROPFIND` 的 `Depth` 只认 `0` / `1` / `infinity`（数值深度 ≥2 由 `x/net/webdav` 回 400），
+rclone 与 Emby 本来都是逐层 `Depth: 1` 扫，不是缺陷。**注意省略 `Depth` 头等于
+`infinity`（递归整棵树）**：21.6 万剧的分类目录实测 369 MB / 116 s / 服务端 RSS +501 MB，
+所以手工 `curl` 排障必须显式带 `-H 'Depth: 1'`（`docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）。
 
 ## 5b. 接 Jellyfin：一分类一媒体库（ADR-0012）
 
@@ -208,7 +214,7 @@ curl -sS -H "Authorization: MediaBrowser Token=\"<Jellyfin API key>\"" \
 
 ```bash
 # 取任意一条 .strm 里的 URL
-STRM=$(rclone cat "dramahub:/<分类>/<分片>/<剧>/Season 01/<剧> - S01E01 - 第1集.strm")
+STRM=$(rclone cat "dramahub:/<分类>/<剧>/Season 01/<剧> - S01E01 - 第1集.strm")
 curl -sS "$STRM" | head -12         # #EXTM3U … #EXT-X-ENDLIST；单集就是一条 playlist
 ID=$(echo "$STRM" | sed -E 's#.*/video/([^/]+)\.m3u8#\1#')
 curl -sS -o /tmp/0.m4s -w '%{http_code}\n' "http://127.0.0.1:8080/video/$ID/0.m4s"
@@ -241,7 +247,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 - F 段默认实播 60 秒（`PLAY_SECONDS`），并用 ffmpeg 的 `out_time` 证明**真的拉了 60 秒内容**
   ——只看退出码 0 不行：10 秒的 playlist 也会正常结束。
 
-## 升级须知（含 0005 / 0006 的版本）
+## 升级须知（含 0005 / 0006 / 0007 的版本）
 
 - `0005` 删掉手工编排的 `merge_group` / `merge_item`，并清掉 `emby_item` 里新代码读不动
   的旧合并行（uid 形如 `m<组 id>`）。**派生表不迁移数据**：升级后、下一次重建之前，
@@ -254,6 +260,11 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
   `settings` 里「分片目标时长」那一项已删除、不再是合法配置项。**旧缓存不迁移**：`.ts` 分片因为
   键与后缀都变了而永不命中，由 `cache_lru_days` 自然淘汰；升级后每个从没播过的 `uid`
   首次播放会多一次 `ffprobe`（取时长），并且首播必须读完整个源（一集一片的既定代价）。
+- `0007` 删掉 `drama.shard` 列与 `idx_drama_genre_shard_title`，改走 `idx_drama_genre_title`，
+  **WebDAV 路径全变**（少一层 `<分片>/`）。**Emby / Jellyfin 的库必须重建重扫**，并把库根
+  改成「每个分类目录一个 media folder」——库根挂在 `/webdav` 时分类目录会被当成 Series
+  （实测 1436 部剧只认出 59 部，`docs/DIRECTORY-CONTRACT.md`「被推翻的做法」）。
+  `DROP COLUMN` 不可回滚。
 
 ## 常见失败
 

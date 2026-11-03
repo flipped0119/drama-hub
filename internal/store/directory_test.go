@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"hash/fnv"
 	"strings"
 	"testing"
 )
@@ -12,8 +11,7 @@ import (
 //
 //  1. 它们必须走索引（EXPLAIN 断言索引名，docs/DIRECTORY-CONTRACT.md
 //     「MUST：目录列举必须是「一个目录一次查询」」），
-//  2. 返回值形态（排序、空集合、点查未命中），
-//  3. 改分片数 N 只需一条 UPDATE、不改 schema。
+//  2. 返回值形态（排序、空集合、点查未命中）。
 
 // seedDirectory 造一组跨越两个分类、多个分片的剧目。
 func seedDirectory(t *testing.T, s *Store) {
@@ -36,7 +34,7 @@ func seedDirectory(t *testing.T, s *Store) {
 // seedPlanCorpus 用 generate_series 灌一批足够大的行集再 ANALYZE。
 //
 // 为什么必须灌数据：PostgreSQL 在小表上直接选 Seq Scan，计划断言就只剩噪音。
-// 数据分布按真实规模造：68 个分类 × 300 部 × 128 分片；artifact 灌 5000 行分片。
+// 数据分布按真实规模造：68 个分类 × 300 部；artifact 灌 5000 行分片。
 //
 // 只用 ANALYZE 不用 VACUUM：测试连接上 VACUUM 不置 visibility map（实测
 // relallvisible 恒为 0），index-only scan 会按需回表估成高成本，计划噪音更大。
@@ -45,8 +43,8 @@ func seedPlanCorpus(t *testing.T, s *Store) {
 	t.Helper()
 	ctx := context.Background()
 	stmts := []string{
-		`INSERT INTO drama(provider, provider_id, title, year, genre, shard)
-		 SELECT 'web', 'p' || g || '-' || i, '剧' || g || '-' || i, 2020, '分类' || g, (g * 7 + i) % 128
+		`INSERT INTO drama(provider, provider_id, title, year, genre)
+		 SELECT 'web', 'p' || g || '-' || i, '剧' || g || '-' || i, 2020, '分类' || g
 		 FROM generate_series(1, 68) g, generate_series(1, 300) i`,
 		`INSERT INTO artifact(kind, key, path, bytes, sha256, last_used_at)
 		 SELECT 'segment', 'k' || i, '/p/' || i, 650000, '',
@@ -129,7 +127,7 @@ func TestDirectoryQueryPlans(t *testing.T) {
 		{
 			name:       "分类列举（覆盖索引）",
 			query:      `SELECT DISTINCT genre FROM drama ORDER BY genre`,
-			want:       "idx_drama_genre_shard_title",
+			want:       "idx_drama_genre_title",
 			disableSeq: true,
 		},
 		{
@@ -137,18 +135,18 @@ func TestDirectoryQueryPlans(t *testing.T) {
 			// seqscan 才能看覆盖索引（Index Only Scan / Index Scan）确实可服务它。
 			name:       "分类存在性点查",
 			query:      `SELECT EXISTS(SELECT 1 FROM drama WHERE genre = '分类3')`,
-			want:       "idx_drama_genre_shard_title",
+			want:       "idx_drama_genre_title",
 			disableSeq: true,
 		},
 		{
-			name:  "分片剧目列举",
-			query: dramaColumns + ` WHERE genre IN ('分类3') AND shard = 5 ORDER BY title`,
-			want:  "idx_drama_genre_shard_title",
+			name:  "分类剧目列举",
+			query: dramaColumns + ` WHERE genre IN ('分类3') ORDER BY title`,
+			want:  "idx_drama_genre_title",
 		},
 		{
-			name:  "分片剧目列举（兜底名两个 genre 值）",
-			query: dramaColumns + ` WHERE genre IN ('', '分类4') AND shard = 5 ORDER BY title`,
-			want:  "idx_drama_genre_shard_title",
+			name:  "分类剧目列举（兜底名两个 genre 值）",
+			query: dramaColumns + ` WHERE genre IN ('', '分类4') ORDER BY title`,
+			want:  "idx_drama_genre_title",
 		},
 		{
 			name:  "剧目录点查",
@@ -222,30 +220,41 @@ func TestGenreExists(t *testing.T) {
 	}
 }
 
-// AC：一个分片的剧目按 title 升序返回，且只返回该分片的行。
-func TestListDramasByShard(t *testing.T) {
+// AC：一个分类的剧目按 title 升序返回，且只返回该分类的行。
+//
+// 目录列举只取窄列（DramaDir）：plot / tags 这些大列只在渲染 NFO 时点查，
+// 216k 子项时它们占分类列举堆峰值的一半（MKACG-651 实测，见契约文档）。
+func TestListDramaDirsByGenre(t *testing.T) {
 	s := NewStore(newCRUDTestDB(t).DB)
 	seedDirectory(t, s)
 	ctx := context.Background()
 
-	shard := ShardOf("d3")
-	got, err := s.ListDramasByShard(ctx, []string{"剧情"}, shard)
+	got, err := s.ListDramaDirsByGenre(ctx, []string{"爱情"})
 	if err != nil {
-		t.Fatalf("ListDramasByShard: %v", err)
+		t.Fatalf("ListDramaDirsByGenre: %v", err)
 	}
-	if len(got) != 1 || got[0].ProviderID != "d3" {
-		t.Fatalf("分片 %d 的剧目 = %+v, 期望只有 d3", shard, got)
+	want := []string{"d1", "d2"} // 按 title 升序：剧一、剧二
+	if len(got) != len(want) {
+		t.Fatalf("爱情 的剧目 = %+v, 期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i].ProviderID != want[i] {
+			t.Errorf("剧目[%d] = %q, 期望 %q（按 title 升序）", i, got[i].ProviderID, want[i])
+		}
 	}
 
-	// 分类过滤生效：拿别的分类值问同一个分片，结果里不该有 d3。
-	other, err := s.ListDramasByShard(ctx, []string{"爱情"}, shard)
+	// 兜底名对应两个 genre 值：空串与上游的「其他」并进同一目录。
+	merged, err := s.ListDramaDirsByGenre(ctx, []string{"", "其他"})
 	if err != nil {
-		t.Fatalf("ListDramasByShard(爱情): %v", err)
+		t.Fatalf("ListDramaDirsByGenre(兜底两个值): %v", err)
 	}
-	for _, d := range other {
-		if d.ProviderID == "d3" {
-			t.Errorf("分类过滤失效：爱情 的分片查询返回了 剧情 的 d3")
-		}
+	if len(merged) != 2 {
+		t.Fatalf("兜底分类的剧目 = %+v, 期望 d4 与 d5", merged)
+	}
+
+	// 空集合不查库（返回 nil，不是全表）。
+	if none, err := s.ListDramaDirsByGenre(ctx, nil); err != nil || none != nil {
+		t.Errorf("ListDramaDirsByGenre(nil) = %v, %v, 期望 nil, nil", none, err)
 	}
 }
 
@@ -267,92 +276,4 @@ func TestDramaByTitleYear(t *testing.T) {
 	if _, err := s.DramaByTitleYear(ctx, "剧二", 2024); err != ErrNotFound {
 		t.Errorf("年份不符的 err = %v, 期望 ErrNotFound", err)
 	}
-}
-
-// AC：改分片数 N 只改数据、不改 schema。
-//
-// 真实操作是「按新的 N 重算 shard 列」：数据库里没有 fnv32a，所以重算逐行 UPDATE
-// （N 是 Go 常量，不是 SQL 表达式）。要钉住的是**表结构一个字节都不变**——没有新列、
-// 没有新表、没有新索引；分片号只活在 `drama.shard` 这一列里。
-func TestShardRecountKeepsSchema(t *testing.T) {
-	db := newCRUDTestDB(t)
-	s := NewStore(db.DB)
-	seedDirectory(t, s)
-	ctx := context.Background()
-
-	schemaBefore := schemaText(t, s)
-
-	// 换 N=256 重算：一条 UPDATE 一行，但只动数据面。
-	const newN = 256
-	rows, err := s.ListDramas(ctx)
-	if err != nil {
-		t.Fatalf("ListDramas: %v", err)
-	}
-	for _, d := range rows {
-		if _, err := db.DB.ExecContext(ctx,
-			`UPDATE drama SET shard = $1 WHERE provider = $2 AND provider_id = $3`,
-			shardWith(d.ProviderID, newN), d.Provider, d.ProviderID); err != nil {
-			t.Fatalf("重算 shard: %v", err)
-		}
-	}
-
-	if got := schemaText(t, s); got != schemaBefore {
-		t.Errorf("重算后 schema 变了（改 N 不该改 schema）：\n之前：%s\n之后：%s", schemaBefore, got)
-	}
-	for _, d := range rows {
-		again, err := s.DramaByID(ctx, d.ID)
-		if err != nil {
-			t.Fatalf("DramaByID %d: %v", d.ID, err)
-		}
-		if want := shardWith(d.ProviderID, newN); again.Shard != want {
-			t.Errorf("%s 重算后 shard = %d, 期望 %d", d.ProviderID, again.Shard, want)
-		}
-	}
-}
-
-// shardWith 是「N 可变」的分片纯函数，只用于演示重算（生产用固定 ShardCount）。
-func shardWith(providerID string, n uint32) int {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(providerID))
-	return int(h.Sum32() % n)
-}
-
-// schemaText 返回当前 schema 的表、列、索引定义文本，用于断言「schema 未变」。
-//
-// 三段分开查再拼接：information_schema 给表与列，pg_indexes 给索引定义。
-func schemaText(t *testing.T, s *Store) string {
-	t.Helper()
-	ctx := context.Background()
-	queries := []string{
-		`SELECT 'table ' || table_name FROM information_schema.tables
-		 WHERE table_schema = current_schema() AND table_type = 'BASE TABLE' ORDER BY table_name`,
-		`SELECT 'column ' || table_name || '.' || column_name || ' ' || data_type || ' ' || is_nullable
-		 FROM information_schema.columns WHERE table_schema = current_schema()
-		 ORDER BY table_name, column_name`,
-		`SELECT 'index ' || indexname || ' ' || indexdef FROM pg_indexes
-		 WHERE schemaname = current_schema() ORDER BY indexname`,
-	}
-
-	var sb strings.Builder
-	for _, query := range queries {
-		rows, err := s.db.QueryContext(ctx, query)
-		if err != nil {
-			t.Fatalf("读 schema: %v", err)
-		}
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				_ = rows.Close()
-				t.Fatalf("读 schema 行: %v", err)
-			}
-			sb.WriteString(line)
-			sb.WriteString("\n")
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			t.Fatalf("遍历 schema: %v", err)
-		}
-		_ = rows.Close()
-	}
-	return sb.String()
 }

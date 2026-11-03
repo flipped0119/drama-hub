@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"net/http"
@@ -45,7 +44,6 @@ type fixture struct {
 	prefix   string
 	titleA   string
 	genre    string // 剧 A 的分类目录名
-	shard    string // 剧 A 的分片目录名（两位十六进制）
 	epIDs    []int64
 	settings *store.Settings
 
@@ -66,14 +64,6 @@ func stubID(secret, uid string) string { return "id(" + secret + ":" + uid + ")"
 
 // idFor 是可预期的 id 值（与 stubID 同规则，独立写出）。
 func idFor(secret, uid string) string { return "id(" + secret + ":" + uid + ")" }
-
-// shardOf 独立实现目录分片号 fnv32a(provider_id) % 128（不复用生产代码）：
-// 测试用它把「这个剧目录应该在哪个分片下」算出来，而不是从被测树里抄。
-func shardOf(providerID string) string {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(providerID))
-	return fmt.Sprintf("%02x", h.Sum32()%128)
-}
 
 // fakeCoverCDN 是假封面源：记请求次数，用来断言「命中不回源 / 按需回源一次」。
 type fakeCoverCDN struct {
@@ -228,7 +218,7 @@ func newFixtureWith(t *testing.T, cover *coverFixture) fixture {
 
 	f := fixture{
 		srv: srv, client: &http.Client{Timeout: requestTimeout}, user: user, pass: pass,
-		prefix: prefix, titleA: title, genre: "爱情", shard: shardOf("a1"),
+		prefix: prefix, titleA: title, genre: "爱情",
 		epIDs: epIDs, settings: settings, covers: covers, coverPath: coverPath, st: st,
 	}
 	if cover != nil {
@@ -246,16 +236,13 @@ func (f fixture) setPassword(t *testing.T, pass string) error {
 	return f.settings.Set(context.Background(), store.KeyWebDAVPass, pass)
 }
 
-// dramaPath 是 fixture 里剧 A 的剧目录在 DAV 上的路径：/<分类>/<分片>/<剧目录>。
+// dramaPath 是 fixture 里剧 A 的剧目录在 DAV 上的路径：/<分类>/<剧目录>。
 func (f fixture) dramaPath() string {
-	return "/" + f.genre + "/" + f.shard + "/" + f.titleA + " (2024)"
+	return "/" + f.genre + "/" + f.titleA + " (2024)"
 }
 
 // seasonPath 是 fixture 里剧 A 的季目录在 DAV 上的路径。
 func (f fixture) seasonPath() string { return f.dramaPath() + "/Season 01" }
-
-// shardPath 是剧 A 所在分片目录在 DAV 上的路径。
-func (f fixture) shardPath() string { return "/" + f.genre + "/" + f.shard }
 
 // request 发一个带 Basic 认证的 DAV 请求；path 相对挂载点（"/" 即挂载点根）。
 func (f fixture) request(t *testing.T, method, path string, body io.Reader, hdr map[string]string) *http.Response {
@@ -348,17 +335,8 @@ func entries(t *testing.T, ms multistatus) map[string]davEntry {
 	return out
 }
 
-// shardHrefs 返回某个分类目录下全部分片目录的 href（00–7f）。
-func shardHrefs(genre string) []string {
-	out := make([]string, 0, 128)
-	for shard := 0; shard < 128; shard++ {
-		out = append(out, "/webdav/"+genre+"/"+fmt.Sprintf("%02x", shard)+"/")
-	}
-	return out
-}
-
-// AC：<LAYER> Depth: 1 返回 207，逐层只有该层的节点——根只有分类、分类只有分片、
-// 分片只有剧目录、剧目录是 tvshow.nfo + Season 01（没有 全部/、没有额外的 短剧/ 一层）。
+// AC-1：<LAYER> Depth: 1 返回 207，逐层只有该层的节点——根只有分类、分类只有剧目录、
+// 剧目录是 tvshow.nfo + Season 01（没有 全部/、没有额外的 短剧/ 一层、没有分片层）。
 func TestPropfindDepth1_Layers(t *testing.T) {
 	f := newFixture(t)
 	const davPrefix = "/webdav"
@@ -375,13 +353,8 @@ func TestPropfindDepth1_Layers(t *testing.T) {
 			wantDirs: []string{davPrefix + "/" + f.genre + "/"},
 		},
 		{
-			name:     "分类只有分片",
+			name:     "分类只有剧目录",
 			path:     "/" + f.genre,
-			wantDirs: shardHrefs(f.genre), // 00–7f 的全部（docs/DIRECTORY-CONTRACT.md 允许）
-		},
-		{
-			name:     "分片只有剧目录",
-			path:     f.shardPath(),
 			wantDirs: []string{davPrefix + f.dramaPath() + "/"},
 		},
 		{
@@ -683,6 +656,92 @@ func TestReadOnly(t *testing.T) {
 	}
 }
 
+// `Depth` 的真实语义（MKACG-651 功能检测纠正的口径）：0 = 只有资源自己、1 = 直接子项、
+// 省略头或 infinity = 递归整棵子树、数值 ≥2 = 协议库直接 400。
+//
+// 这条测试的存在原因很具体：交付文档曾经断言「本服务只支持 Depth 0/1，不存在一次请求
+// 拉多层」，而 `x/net/webdav` 缺头时默认 infiniteDepth，实测 21.6 万剧的分类目录在
+// 省略 Depth 时是 369 MB / 116 s。文档因此写错，代码行为没变——所以用测试把真实语义
+// 钉住，避免下一次再照着文档猜。
+func TestPropfindDepthSemantics(t *testing.T) {
+	f := newFixture(t)
+	// 多状态响应里的 href 是 DAV 绝对路径（带 /webdav 挂载点前缀）。
+	const dav = "/webdav"
+	season := dav + f.seasonPath()
+	strm := season + "/" + f.episodeBase(f.epIDs[0]) + ".strm"
+
+	hrefs := func(t *testing.T, resp *http.Response) map[string]bool {
+		t.Helper()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("读 PROPFIND body: %v", err)
+		}
+		var ms multistatus
+		if err := xml.Unmarshal(body, &ms); err != nil {
+			t.Fatalf("响应不是合法 multistatus XML: %v\n%s", err, body)
+		}
+		out := make(map[string]bool, len(ms.Responses))
+		for _, r := range ms.Responses {
+			p, err := url.PathUnescape(r.Href)
+			if err != nil {
+				t.Fatalf("href 不是合法转义路径 %q: %v", r.Href, err)
+			}
+			out[p] = true
+		}
+		return out
+	}
+
+	t.Run("Depth: 0 只有资源自己", func(t *testing.T) {
+		resp := f.request(t, "PROPFIND", f.dramaPath(), nil, map[string]string{"Depth": "0"})
+		if resp.StatusCode != http.StatusMultiStatus {
+			t.Fatalf("状态码 = %d, 期望 207", resp.StatusCode)
+		}
+		got := hrefs(t, resp)
+		if len(got) != 1 || !got[dav+f.dramaPath()+"/"] {
+			t.Errorf("Depth:0 的响应 = %v, 期望只有剧目录自己 %s", got, dav+f.dramaPath()+"/")
+		}
+	})
+
+	t.Run("Depth: 1 只有直接子项", func(t *testing.T) {
+		resp := f.request(t, "PROPFIND", f.dramaPath(), nil, map[string]string{"Depth": "1"})
+		if resp.StatusCode != http.StatusMultiStatus {
+			t.Fatalf("状态码 = %d, 期望 207", resp.StatusCode)
+		}
+		got := hrefs(t, resp)
+		if got[strm] {
+			t.Errorf("Depth:1 递归到了孙级文件 %s：%v", strm, got)
+		}
+	})
+
+	t.Run("省略 Depth 等价于 infinity，递归整棵子树", func(t *testing.T) {
+		resp := f.request(t, "PROPFIND", "/"+f.genre, nil, nil)
+		if resp.StatusCode != http.StatusMultiStatus {
+			t.Fatalf("状态码 = %d, 期望 207", resp.StatusCode)
+		}
+		got := hrefs(t, resp)
+		if !got[strm] {
+			t.Errorf("省略 Depth 时没递归到孙级文件 %s（文档口径依赖这条事实）：%v", strm, got)
+		}
+	})
+
+	t.Run("显式 infinity 同样递归", func(t *testing.T) {
+		resp := f.request(t, "PROPFIND", "/"+f.genre, nil, map[string]string{"Depth": "infinity"})
+		if resp.StatusCode != http.StatusMultiStatus {
+			t.Fatalf("状态码 = %d, 期望 207", resp.StatusCode)
+		}
+		if got := hrefs(t, resp); !got[strm] {
+			t.Errorf("Depth:infinity 没递归到孙级文件 %s：%v", strm, got)
+		}
+	})
+
+	t.Run("Depth: 2 被协议库拒绝", func(t *testing.T) {
+		resp := f.request(t, "PROPFIND", "/"+f.genre, nil, map[string]string{"Depth": "2"})
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("Depth:2 状态码 = %d, 期望 400", resp.StatusCode)
+		}
+	})
+}
+
 // AC：未知路径 → 404（不是 200/207，也不泄漏别的资源）。
 func TestNotFound(t *testing.T) {
 	f := newFixture(t)
@@ -705,9 +764,8 @@ func TestPropfindNotFoundIs404(t *testing.T) {
 	f := newFixture(t)
 	for _, path := range []string{
 		"/无此分类",
-		"/" + f.genre + "/fe", // 分片号越界（N=128，最大 7f）
-		"/" + f.genre + "/" + f.shard + "/无此剧 (2024)",
-		"/" + f.genre + "/" + f.shard + "/" + f.titleA + " (2024)/Season 02",
+		"/" + f.genre + "/无此剧 (2024)",
+		f.dramaPath() + "/Season 02",
 	} {
 		resp := f.request(t, "PROPFIND", path, nil, map[string]string{"Depth": "1"})
 		if resp.StatusCode != http.StatusNotFound {
@@ -810,14 +868,14 @@ func (f fixture) propfindCtx(t *testing.T, ctx context.Context, path string) (in
 	return resp.StatusCode, ms
 }
 
-// AC：整棵目录树可被递归列举到（max-depth 5 覆盖 分类/分片/剧/Season/文件 五层），
+// AC：整棵目录树可被递归列举到（max-depth 4 覆盖 分类/剧/Season/文件 四层），
 // 且每个文件项都带 getcontentlength = GET 实际 body 长度。
 //
 // 这条替代了原先「手工跑 rclone lsf --max-depth 3」的验收方式：同一协议语义，
 // 进程内、无外部二进制、受 requestTimeout/walkTimeout 约束。
 func TestWalkTree_Complete(t *testing.T) {
 	f := newFixture(t)
-	nodes := f.walkTree(t, 5)
+	nodes := f.walkTree(t, 4)
 
 	got := make(map[string]walkNode, len(nodes))
 	for _, n := range nodes {
@@ -836,10 +894,6 @@ func TestWalkTree_Complete(t *testing.T) {
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[0]) + ".nfo":  false,
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[1]) + ".strm": false,
 		f.seasonPath() + "/" + f.episodeBase(f.epIDs[1]) + ".nfo":  false,
-	}
-	// 分片目录恒为 00–7f 的全部（空分片列出来是空目录），一并计入期望集合。
-	for shard := 0; shard < 128; shard++ {
-		want["/"+f.genre+"/"+fmt.Sprintf("%02x", shard)] = true
 	}
 	for path, isDir := range want {
 		n, ok := got[path]
@@ -867,18 +921,18 @@ func TestWalkTree_Complete(t *testing.T) {
 	}
 }
 
-// AC 的反面：遍历必须有限且在预算内结束——maxDepth 5 时不漏层、也不无限下钻。
+// AC 的反面：遍历必须有限且在预算内结束——maxDepth 4 时不漏层、也不无限下钻。
 // 这条守住「测试自己不会挂死」，避免再出现手工命令超时不退出的情况。
 func TestWalkTree_DepthBounded(t *testing.T) {
 	f := newFixture(t)
 	start := time.Now()
-	nodes := f.walkTree(t, 5)
+	nodes := f.walkTree(t, 4)
 	if elapsed := time.Since(start); elapsed > walkTimeout {
 		t.Fatalf("遍历耗时 %v 超过预算 %v", elapsed, walkTimeout)
 	}
 	for _, n := range nodes {
-		if depth := strings.Count(n.path, "/"); depth > 5 {
-			t.Errorf("max-depth 5 却出现深度 %d 的路径 %s", depth, n.path)
+		if depth := strings.Count(n.path, "/"); depth > 4 {
+			t.Errorf("max-depth 4 却出现深度 %d 的路径 %s", depth, n.path)
 		}
 	}
 }
@@ -920,7 +974,7 @@ type bulkFixture struct {
 	tree *countingTree
 }
 
-// newBulkFixture 造 n 部剧（同一分类，分片由 fnv 自动摊开）并起 httptest.Server。
+// newBulkFixture 造 n 部剧（同一分类，全部直接挂在分类目录下）并起 httptest.Server。
 func newBulkFixture(t *testing.T, n int) bulkFixture {
 	t.Helper()
 	ctx := context.Background()
@@ -1000,13 +1054,9 @@ func TestPropfindDepth1_QueryCountIndependentOfSize(t *testing.T) {
 	const small, large = 200, 12000
 	fs, fl := newBulkFixture(t, small), newBulkFixture(t, large)
 
-	// 找一个「有剧」的分片目录（两部 fixture 的 provider_id 前缀相同，分布一致）。
-	shard := shardOf("bulk-0")
-
 	for _, s := range []sample{
 		{name: "根", path: "/"},
 		{name: "分类", path: "/剧情"},
-		{name: "分片", path: "/剧情/" + shard},
 	} {
 		t.Run(s.name, func(t *testing.T) {
 			smallLists, smallRenders := measure(t, fs, s)
@@ -1019,7 +1069,7 @@ func TestPropfindDepth1_QueryCountIndependentOfSize(t *testing.T) {
 				t.Errorf("%s 的查询次数随库规模变化：%d 部 = %d 次，%d 部 = %d 次",
 					s.name, small, smallLists, large, largeLists)
 			}
-			// 常数上限：根 1 次 DISTINCT genre；分类/分片 = 父目录 + 自己。
+			// 常数上限：根 1 次 DISTINCT genre；分类 = 父目录 + 自己。
 			if largeLists > 2 {
 				t.Errorf("%s 的 List 次数 = %d, 期望 ≤ 2（每层一次）", s.name, largeLists)
 			}

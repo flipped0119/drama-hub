@@ -515,9 +515,9 @@ func columnDefaults(t *testing.T, db *sql.DB, table string) map[string]string {
 	return out
 }
 
-// AC：5 份迁移全部生效（0002 genre/tags/shard + 两索引 + source_state、
-// 0003 artifact 扩 kind、0004 删 episode.play_url / play_url_at、
-// 0006 segment 收窄成每集一行 + artifact 去掉 index kind）。
+// AC：全部迁移生效（0002 genre/tags + 两索引 + source_state、0003 artifact 扩 kind、
+// 0004 删 episode.play_url / play_url_at、0005 删合并表、0006 segment 收窄成每集一行
+// + artifact 去掉 index kind、0007 删掉已废弃的目录中间层键并建 idx_drama_genre_title）。
 func TestMigrateAllFiles(t *testing.T) {
 	db := openRaw(t)
 	ctx := context.Background()
@@ -570,9 +570,11 @@ func TestMigrateAllFiles(t *testing.T) {
 	t.Logf("二次执行 applied=%d 版本=%d", applied, userVersion(t, db))
 }
 
-// AC：drama 三列就位——只给必填列插入时取 schema 默认值（” / '[]' / 0），
-// 两条目录索引与淘汰索引必须就位（索引名是 docs/DATA-MODEL.md 的契约）。
-func TestDramaGenreTagsShardColumns(t *testing.T) {
+// AC（MKACG-651 AC-2）：drama 的列与索引与 docs/DATA-MODEL.md 逐字相符——
+// 只给必填列插入时取 schema 默认值，0005 之前的两列（分类键 + 保真标签）就位，
+// 0007 删掉的列与旧索引不再出现。用**全等**比较而不是逐个「不存在」断言：
+// 多出任何一列/一个索引都会红，不必在测试里写被删对象的名字。
+func TestDramaGenreTagsColumns(t *testing.T) {
 	db := openRaw(t)
 	ctx := context.Background()
 	if _, err := migrate(ctx, db); err != nil {
@@ -580,32 +582,42 @@ func TestDramaGenreTagsShardColumns(t *testing.T) {
 	}
 
 	defaults := columnDefaults(t, db, "drama")
-	for _, col := range []string{"genre", "tags", "shard"} {
+	for _, col := range []string{"genre", "tags"} {
 		if _, ok := defaults[col]; !ok {
 			t.Fatalf("drama 缺列 %s", col)
 		}
 	}
+	// 全等比较：列集合一个不多一个不少（0007 删掉的列因此不可能漏网）。
+	wantCols := []string{
+		"cover_url", "episode_total", "genre", "id", "plot",
+		"provider", "provider_id", "sync_at", "tags", "title", "year",
+	}
+	if got := sortedMapKeys(defaults); !reflect.DeepEqual(got, wantCols) {
+		t.Errorf("drama 列 = %v, 期望 %v", got, wantCols)
+	}
 
-	// 只给必填列 → 三列取 schema 默认值（不是 NULL，也不是空串以外的形态）。
+	// 只给必填列 → 两列取 schema 默认值（不是 NULL，也不是空串以外的形态）。
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO drama(provider, provider_id, title) VALUES('web', 'p1', '剧')`); err != nil {
 		t.Fatalf("插入 drama: %v", err)
 	}
 	var genre, tags string
-	var shard int
 	if err := db.QueryRowContext(ctx,
-		`SELECT genre, tags, shard FROM drama WHERE provider_id = 'p1'`).Scan(&genre, &tags, &shard); err != nil {
-		t.Fatalf("读三列: %v", err)
+		`SELECT genre, tags FROM drama WHERE provider_id = 'p1'`).Scan(&genre, &tags); err != nil {
+		t.Fatalf("读两列: %v", err)
 	}
-	if genre != "" || tags != "[]" || shard != 0 {
-		t.Fatalf("默认值 = (%q, %q, %d), 期望 (\"\", \"[]\", 0)", genre, tags, shard)
+	if genre != "" || tags != "[]" {
+		t.Fatalf("默认值 = (%q, %q), 期望 (\"\", \"[]\")", genre, tags)
 	}
 
 	dramaIdx := indexNames(t, db, "drama")
-	for _, name := range []string{"idx_drama_genre_shard_title", "idx_drama_title"} {
-		if !dramaIdx[name] {
-			t.Errorf("drama 缺索引 %s（现有 %v）", name, dramaIdx)
-		}
+	// 索引也全等：新索引必须在、被删的旧索引不可能残留。
+	wantIdx := []string{
+		"drama_pkey", "drama_provider_provider_id_key",
+		"idx_drama_genre_title", "idx_drama_title",
+	}
+	if got := sortedNames(dramaIdx); !reflect.DeepEqual(got, wantIdx) {
+		t.Errorf("drama 索引 = %v, 期望 %v", got, wantIdx)
 	}
 	artifactIdx := indexNames(t, db, "artifact")
 	if !artifactIdx["idx_artifact_kind_last_used"] {
@@ -613,7 +625,8 @@ func TestDramaGenreTagsShardColumns(t *testing.T) {
 	}
 	t.Logf("drama 索引: %v", sortedNames(dramaIdx))
 	t.Logf("artifact 索引: %v", sortedNames(artifactIdx))
-	t.Logf("drama 默认值: genre=%s tags=%s shard=%s", defaults["genre"], defaults["tags"], defaults["shard"])
+	t.Logf("drama 默认值: genre=%s tags=%s", defaults["genre"], defaults["tags"])
+	t.Logf("drama 列: %v", sortedMapKeys(defaults))
 }
 
 // AC：artifact 的 kind 收窄（0006）：cover 行逐字段保留，kind='index' 的旧行被清掉

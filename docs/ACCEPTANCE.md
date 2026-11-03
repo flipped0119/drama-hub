@@ -10,22 +10,28 @@
 
 ## P2（虚拟 WebDAV + NFO）
 
-> `PROPFIND` 口径：只支持 `Depth: 0` / `Depth: 1`。数值深度 ≥2 由 `x/net/webdav`
-> 直接回 `400`，这不是缺陷；验收只按逐层 `Depth: 1` 走（rclone / Emby 本来就这么扫）。
+> `PROPFIND` 口径：数值深度 ≥2 由 `x/net/webdav` 直接回 `400`（不是缺陷）；
+> **省略 `Depth` 头等价于 `Depth: infinity`，会递归整棵树**（21.6 万剧的分类目录实测
+> 369 MB / 116 s / 服务端 RSS +501 MB）。验收一律逐层 `Depth: 1`（rclone / Emby /
+> Jellyfin 本来就这么扫），手工 `curl` 也必须显式带 `-H 'Depth: 1'`，
+> 见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。
 
 - [ ] 挂载点是 `/webdav`（`rclone config create dramahub webdav url http://127.0.0.1:8080/webdav vendor other`）
-- [ ] `rclone lsf --max-depth 5 dramahub:/` 输出五级：分类 → 分片 → 剧 → Season 01 → strm/nfo
+- [ ] `rclone lsf --max-depth 4 dramahub:/` 输出四级：分类 → 剧 → Season 01 → strm/nfo
 - [ ] 顶层只有分类目录（没有 `全部/`），分类数等于库里的 `SELECT DISTINCT genre`
-- [ ] `rclone lsf --max-depth 2 dramahub:/<分类>` 只给出分片目录：`00`–`7f` 全部 128 个
-      （空分片是空目录，列它不产生查询）
+- [ ] `rclone lsf --max-depth 1 dramahub:/<分类>` 只给出剧目录（**没有**两位十六进制的
+      分片目录段；`00`–`7f` 已随 v5 下线，`grep -E '^[0-9a-f]{2}/$'` 必须零命中）
 - [ ] `rclone size dramahub:/` 不报错（读不到长度会在这里暴露）
-- [ ] `rclone cat "dramahub:/<分类>/<分片>/<剧名> (<年份>)/Season 01/<集>.strm"` 输出一行
+- [ ] `rclone cat "dramahub:/<分类>/<剧名> (<年份>)/Season 01/<集>.strm"` 输出一行
       `{strm_prefix}/video/{id}.m3u8`
 - [ ] Emby 扫描后：剧名、年份、封面、集号连续（无跳号）、nfo 标题是「第 N 集」或「第 A-B 集」
-- [ ] Emby 库配法（两种都支持，先试第一种）：
-      1. 一个「剧集」库，媒体文件夹 = DAV 根（`/mnt/dramahub`），Emby 逐层往下扫；
-      2. 若 Emby 在 DAV 根上把分类当成剧，退一步把具体分类目录（`/webdav/爱情` 等，
-         真实词表 68 个）逐个加成媒体文件夹。
+- [ ] Emby / Jellyfin 库配法（**必须**按第一种，MKACG-651 实测）：
+      1. 一个「剧集」库，媒体文件夹 = **每个分类目录各一个**（`/mnt/dramahub/爱情` 等，
+         真实词表 68 个）。这时 Series ≈ 该分类的剧数、Episode ≈ 该分类的集数，
+         不会出现「第 66 季」这类由中间目录层造成的假季。
+      2. 库根挂 DAV 根（`/mnt/dramahub`）会**把分类目录当 Series**（nas 实测：1436 部剧
+         被识别成 59 部），只用于记录行为、不作为通过条件。见
+         `docs/DIRECTORY-CONTRACT.md`「被推翻的做法」与「单目录子项上限」。
 
 ## P3（单集出流）
 
