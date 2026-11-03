@@ -19,6 +19,18 @@ var (
 	ErrBusy = errors.New("jellyfin 媒体库同步正在跑")
 )
 
+// 一轮 reconcile 的四个阶段名。页面上直接显示它们，所以是给人看的中文短句；
+// 顺序即执行顺序（创建与删除互斥：prune 时才有删除阶段）。
+const (
+	PhaseListing  = "列分类"
+	PhaseDiffing  = "比对现有库"
+	PhaseCreating = "创建媒体库"
+	PhaseRemoving = "删除孤儿库"
+	PhaseScanning = "触发扫描"
+	// PhaseFinished 是一轮收尾后的阶段名：页面靠它区分「还在某个阶段」与「已经结束」。
+	PhaseFinished = "已结束"
+)
+
 // State 是状态面要显示的现状：配置（密钥只报「已设置」）+ 上一次 reconcile 的结果。
 //
 // 只存在内存里，不落库、不加表：reconcile 本身幂等，跨重启不需要接续；重启后显示
@@ -31,12 +43,26 @@ type State struct {
 	LibraryPrefix string
 	APIKeySet     bool
 	TimeoutSec    int
+	Running       bool
+	// RunSeq 是本进程里第几轮（从 1 起）。202 不带结果：页面点之前记下这个值，等它变大
+	// 且 Running=false 就说明「刚点的那一轮收尾了」。重启归零。
+	RunSeq int
+	// StartedAt 是本轮开始时间。跑的过程中才是「这次什么时候开始的」—— LastRunAt 要等
+	// 收尾才前进，所以只看它看不出「什么时候开始的」。
+	StartedAt time.Time
+	// Phase 是当前阶段（列分类 / 比对现有库 / 创建 / 删除 / 触发扫描），PhaseDone/PhaseTotal
+	// 是该阶段已完成与总数。页面轮询读它们展示进度；收尾后停在最后一个阶段。
+	Phase      string
+	PhaseDone  int
+	PhaseTotal int
+	// DurationMS 是上一轮耗时；Failed 里的分类是 Jellyfin 明确拒掉的那些。
+	DurationMS int64
 
-	Running   bool
 	LastRunAt time.Time
 	LastOKAt  time.Time
 	LastError string
 	Created   int
+	Unchanged int
 	// Uncertain 是「请求超时、Jellyfin 那边结果未知」的次数（建库为主）。
 	// 实测 12.1 在扫库期间单次建库会 >10s：客户端先超时，但库往往已经建成了。
 	// 所以这类不能算 created（没收到 204），也不能当成「一个都没建」——它有独立的
@@ -54,7 +80,9 @@ type State struct {
 // Uncertain 与 Created 分开：一个建库请求超时时，Jellyfin 可能已经建成（实测 12.1
 // 扫库期间单次 >10s），所以既不能计入 Created（没收到 204），也不能当成「一个都没建」。
 type Result struct {
-	Created   int
+	Created int
+	// Unchanged 是已有自管库、这一轮什么都没动的分类数（幂等命中的那些）。
+	Unchanged int
 	Uncertain int
 	Failed    []string
 	Removed   int
@@ -111,7 +139,7 @@ func (m *Manager) Start(ctx context.Context, prune bool) error {
 		return fmt.Errorf("%w: 上一次还没结束", ErrBusy)
 	}
 
-	m.setRunning(true)
+	m.startProgress()
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -150,10 +178,17 @@ func (m *Manager) State(ctx context.Context) State {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out.Running = m.state.Running
+	out.RunSeq = m.state.RunSeq
+	out.StartedAt = m.state.StartedAt
+	out.Phase = m.state.Phase
+	out.PhaseDone = m.state.PhaseDone
+	out.PhaseTotal = m.state.PhaseTotal
+	out.DurationMS = m.state.DurationMS
 	out.LastRunAt = m.state.LastRunAt
 	out.LastOKAt = m.state.LastOKAt
 	out.LastError = m.state.LastError
 	out.Created = m.state.Created
+	out.Unchanged = m.state.Unchanged
 	out.Uncertain = m.state.Uncertain
 	out.Failed = m.state.Failed
 	out.Orphans = m.state.Orphans
@@ -210,6 +245,7 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 	res := Result{}
 	client := NewClient(cfg, nil)
 
+	m.setPhase(PhaseListing, 0, 0)
 	existing, err := client.ListLibraries(ctx)
 	if err != nil {
 		return m.record(res, err)
@@ -218,10 +254,15 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 	if err != nil {
 		return m.record(res, fmt.Errorf("列分类: %w", err))
 	}
+	m.setPhase(PhaseListing, 2, 2)
 
+	m.setPhase(PhaseDiffing, 0, 0)
 	plan := Diff(existing, categories, cfg.LibraryRoot, cfg.Prefix)
 	res.Orphans = plan.Orphans
 	res.Conflicts = plan.Conflicts
+	// 幂等命中的分类数 = 分类总数 - 要建的 - 冲突的。页面要报 unchanged。
+	res.Unchanged = len(categories) - len(plan.Create) - len(plan.Conflicts)
+	m.setPhase(PhaseDiffing, 1, 1)
 
 	// 剩余请求数 = 建库 + （prune 时）删库 + 1 次扫描。整轮预算按它给：固定预算
 	// 在库多的部署上必然中途放弃（58 个分类 × 实测 1.1s/次 远大于旧的 2×timeout）。
@@ -231,6 +272,7 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 	}
 	ctx, cancel := context.WithTimeout(ctx, roundBudget(pending, cfg.Timeout))
 	defer cancel()
+	m.setPhase(PhaseCreating, 0, len(plan.Create))
 	for _, action := range plan.Create {
 		err := client.CreateLibrary(ctx, action.Name, action.Path)
 		switch {
@@ -255,23 +297,28 @@ func (m *Manager) reconcile(ctx context.Context, cfg Config, prune bool) (Result
 			// 继续打只会把同一个错误复读几十次，整轮中止留一条 last_error。
 			return m.record(res, err)
 		}
+		m.reportCreate(res)
 	}
 	if prune {
+		m.setPhase(PhaseRemoving, 0, len(plan.Orphans))
 		for _, name := range plan.Orphans {
 			if err := client.DeleteLibrary(ctx, name); err != nil {
 				return m.record(res, err)
 			}
 			res.Removed++
+			m.bumpPhase()
 		}
 	}
 	// 0 变化时一个写请求都不发（这就是「再点一次」幂等的可验证点，AC-3）。
 	// Uncertain 也算「可能有变化」：超时的那次建库很可能已经在 Jellyfin 侧落成，
 	// 不扫描它就一直是个空库。
 	if res.Created > 0 || res.Removed > 0 || res.Uncertain > 0 {
+		m.setPhase(PhaseScanning, 0, 1)
 		if err := client.Refresh(ctx); err != nil {
 			return m.record(res, err)
 		}
 		res.Refreshed = true
+		m.setPhase(PhaseScanning, 1, 1)
 	}
 	return m.record(res, nil)
 }
@@ -287,9 +334,14 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 	res.Conflicts = nonNil(res.Conflicts)
 
 	m.mu.Lock()
+	m.state.Phase = PhaseFinished
 	m.state.LastRunAt = now
 	m.state.Created = res.Created
+	m.state.Unchanged = res.Unchanged
 	m.state.Uncertain = res.Uncertain
+	if !m.state.StartedAt.IsZero() {
+		m.state.DurationMS = now.Sub(m.state.StartedAt).Milliseconds()
+	}
 	m.state.Failed = nonNil(res.Failed)
 	m.state.Orphans = res.Orphans
 	m.state.Conflicts = res.Conflicts
@@ -329,6 +381,7 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 	}
 	m.logger.Log(context.Background(), level, "jellyfin 媒体库同步结束",
 		"created", res.Created,
+		"unchanged", res.Unchanged,
 		"failed", len(res.Failed),
 		"removed", res.Removed,
 		"refreshed", res.Refreshed,
@@ -342,6 +395,55 @@ func (m *Manager) record(res Result, err error) (Result, error) {
 func (m *Manager) setRunning(running bool) {
 	m.mu.Lock()
 	m.state.Running = running
+	m.mu.Unlock()
+}
+
+// startProgress 开一轮的进度：序号 +1、记开始时间、把阶段与本轮计数复位。
+//
+// 在 flight 锁内调用（Start 拿到锁之后），所以不需要额外的并发保护。
+//
+// 计数一起复位是必须的：页面在这一轮跑的时候轮询，读到的是「本轮」而不是上一轮的
+// 残留（否则「已建 58 个」会在新一轮开始时先跳成上轮的数字再跳回来）。
+func (m *Manager) startProgress() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.state.Running = true
+	m.state.RunSeq++
+	m.state.StartedAt = time.Now().UTC()
+	m.state.Phase = PhaseListing
+	m.state.PhaseDone, m.state.PhaseTotal = 0, 0
+	m.state.Created = 0
+	m.state.Unchanged = 0
+	m.state.Uncertain = 0
+	m.state.Failed = []string{}
+	m.state.DurationMS = 0
+}
+
+// setPhase 记一个阶段的进度。done/total 是「该阶段已处理/总数」，页面轮询读它。
+func (m *Manager) setPhase(phase string, done, total int) {
+	m.mu.Lock()
+	m.state.Phase = phase
+	m.state.PhaseDone, m.state.PhaseTotal = done, total
+	m.mu.Unlock()
+}
+
+// bumpPhase 只推进当前阶段的已完成数（逐项处理时用，不动 total）。
+func (m *Manager) bumpPhase() {
+	m.mu.Lock()
+	m.state.PhaseDone++
+	m.mu.Unlock()
+}
+
+// reportCreate 推进建库阶段的进度，并把实时计数写进状态。
+//
+// 实时写是为了让孩子轮询看见「已建 3 个」在动，而不是等整轮收尾才一次性出现；
+// 收尾时 record 会再写一遍（含 Unchanged 与耗时）。
+func (m *Manager) reportCreate(res Result) {
+	m.mu.Lock()
+	m.state.PhaseDone++
+	m.state.Created = res.Created
+	m.state.Uncertain = res.Uncertain
+	m.state.Failed = nonNil(append([]string{}, res.Failed...))
 	m.mu.Unlock()
 }
 

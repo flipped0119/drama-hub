@@ -109,9 +109,16 @@ func TestAPI_StatusJellyfin(t *testing.T) {
 		LibraryPrefix: "短剧 - ",
 		APIKeySet:     true,
 		Running:       false,
+		RunSeq:        3,
+		StartedAt:     lastRun.Add(-2 * time.Second),
+		Phase:         jellyfin.PhaseFinished,
+		PhaseDone:     2,
+		PhaseTotal:    2,
+		DurationMS:    2345,
 		LastRunAt:     lastRun,
 		LastOKAt:      lastRun,
 		Created:       58,
+		Unchanged:     12,
 		Uncertain:     2,
 		Failed:        []string{"不存在的分类"},
 		Orphans:       []string{"短剧 - 已下架"},
@@ -137,6 +144,31 @@ func TestAPI_StatusJellyfin(t *testing.T) {
 	}
 	if len(got.Jellyfin.Failed) != 1 || got.Jellyfin.Failed[0] != "不存在的分类" {
 		t.Errorf("failed = %v, 期望 [不存在的分类]（被 Jellyfin 拒掉的分类要点名）", got.Jellyfin.Failed)
+	}
+	// 进度字段：页面点完 202 后靠这几个轮询（MKACG-664）。run_seq 是「认领我点的那一轮」
+	// 的依据，没有它页面只能看 running 猜。
+	if got.Jellyfin.RunSeq != 3 {
+		t.Errorf("run_seq = %d, 期望 3", got.Jellyfin.RunSeq)
+	}
+	if want := lastRun.Add(-2 * time.Second).Format(time.RFC3339); got.Jellyfin.StartedAt != want {
+		t.Errorf("started_at = %q, 期望 %q", got.Jellyfin.StartedAt, want)
+	}
+	if got.Jellyfin.Phase != jellyfin.PhaseFinished || got.Jellyfin.PhaseDone != 2 || got.Jellyfin.PhaseTotal != 2 {
+		t.Errorf("phase = %q %d/%d, 期望 %q 2/2",
+			got.Jellyfin.Phase, got.Jellyfin.PhaseDone, got.Jellyfin.PhaseTotal, jellyfin.PhaseFinished)
+	}
+	if got.Jellyfin.DurationMS != 2345 {
+		t.Errorf("duration_ms = %d, 期望 2345", got.Jellyfin.DurationMS)
+	}
+	if got.Jellyfin.Unchanged != 12 {
+		t.Errorf("unchanged = %d, 期望 12", got.Jellyfin.Unchanged)
+	}
+	// 空时间写成空串（页面显示「—」），不能是 0001-01-01。
+	srvEmpty, _, _ := newTestServerWith(t, &fakeJellyfin{})
+	zero := decode[statusView](t, do(t, srvEmpty, http.MethodGet, "/api/status", ""))
+	if zero.Jellyfin.StartedAt != "" || zero.Jellyfin.Phase != "" {
+		t.Errorf("未跑过时 started_at = %q / phase = %q, 期望都是空串",
+			zero.Jellyfin.StartedAt, zero.Jellyfin.Phase)
 	}
 	if body := do(t, srv, http.MethodGet, "/api/status", "").Body.String(); strings.Contains(body, "api_key\":") {
 		t.Errorf("响应里出现了 api_key 字段：%s", body)

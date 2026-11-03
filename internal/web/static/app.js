@@ -53,7 +53,10 @@ async function api(method, path, body) {
   }
   if (!res.ok) {
     const message = payload && payload.message ? payload.message : res.status + ' ' + res.statusText;
-    throw new Error(message);
+    // status 挂在错误上：调用方要区分 409（已在运行）与其它失败，只能靠码不靠文案。
+    const err = new Error(message);
+    err.status = res.status;
+    throw err;
   }
   return payload;
 }
@@ -345,18 +348,94 @@ function initStatus() {
       : '写 PATCH /api/settings；非法值整批拒绝（400）且库里不动；密码不回显，留空表示不改。';
   }
 
-  // renderJellyfin 渲染媒体库现状：配置四项 + 上次结果。孤儿库只报告，prune 不进 UI
-  // （破坏性动作只走 API，少一个误点路径）。
+  // ---- 媒体库同步的进度轮询 ----
+  // 202 不带结果，所以点完只能轮询 /api/status 直到这一轮收尾。轮询期间每轮都把
+  // 「阶段 + 已完成/总数 + 本轮计数」重画进表格；收尾后停下并给一句结果文案。
+  // 页面刷新后如果那一轮还在跑，load() 也会接上轮询，不需要重新点。
+  const POLL_MS = 1000;
+  const POLL_MAX_MS = 30 * 60 * 1000; // 整轮预算可以很长（58 分类 × 超时），但页面不无限转
+  let pollTimer = null;
+  let pollDeadline = 0;
+  // watchingSeq 是「我点出来的那一轮」的序号：0 = 只是在显示进度，不认领结果。
+  let watchingSeq = 0;
+
+  function stopPoll() {
+    if (pollTimer !== null) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  // poll 排下一次轮询。它只是「再读一次 /api/status」，收尾判定在 afterRender 里。
+  //
+  // 上限只是防「页面无限转」：正常一轮的时长由服务端的整轮预算决定（可以到分钟级），
+  // 所以 30 分钟只是页面侧的保护，不是服务端的运行上限。
+  function poll() {
+    if (pollTimer !== null) return;
+    if (pollDeadline === 0) pollDeadline = Date.now() + POLL_MAX_MS;
+    if (Date.now() > pollDeadline) {
+      stopPoll();
+      say('同步还在跑，但页面已停止轮询（超过 ' + POLL_MAX_MS / 60000 + ' 分钟）：' +
+        '仍可看 /api/status 的 jellyfin 块', 'busy');
+      return;
+    }
+    pollTimer = setTimeout(async () => {
+      pollTimer = null;
+      try {
+        const status = await api('GET', '/api/status');
+        applyStatus(status);
+        afterRender(status.jellyfin);
+      } catch (err) {
+        fail(err);
+        stopPoll();
+      }
+    }, POLL_MS);
+  }
+
+  // resultKind 给结果文案选色调：整轮失败 / 有被拒分类 = error，其余 ok。
+  function resultKind(j) {
+    return j.last_error !== '' ? 'error' : 'ok';
+  }
+
+  // phaseText 把「当前阶段 + 已完成/总数」写成一行进度文本。
+  function phaseText(j) {
+    if (!j.phase) return '—';
+    return j.phase_total > 0 ? j.phase + ' ' + j.phase_done + '/' + j.phase_total : j.phase;
+  }
+
+  // resultText 给一句人能直接读的结果文案（成功 N 个 / 失败 M 个及原因 / 耗时）。
+  function resultText(j) {
+    if (!j.last_run_at) return '—';
+    const parts = ['新建 ' + j.created + ' 个', '已存在 ' + j.unchanged + ' 个'];
+    if (j.failed.length > 0) parts.push('被拒 ' + j.failed.length + ' 个（' + j.failed.join('、') + '）');
+    if (j.uncertain > 0) parts.push('结果未知 ' + j.uncertain + ' 个');
+    parts.push('耗时 ' + fmtDuration(j.duration_ms));
+    const text = parts.join('、');
+    // 整轮失败（Jellyfin 不可达等）时 last_error 是唯一的原因来源，别让它只出现在下面一行。
+    return j.last_error === '' ? text : text + '；' + j.last_error;
+  }
+
+  // fmtDuration 把毫秒写成「1.2 秒」/「2 分 05 秒」。
+  function fmtDuration(ms) {
+    if (!ms) return '—';
+    if (ms < 60000) return (ms / 1000).toFixed(1) + ' 秒';
+    const total = Math.round(ms / 1000);
+    const p = (n) => String(n).padStart(2, '0');
+    return Math.floor(total / 60) + ' 分 ' + p(total % 60) + ' 秒';
+  }
+
+  // renderJellyfin 渲染媒体库现状：配置四项 + 上次结果 + 跑着时的进度。
+  // 孤儿库只报告，prune 不进 UI（破坏性动作只走 API，少一个误点路径）。
   function renderJellyfin(j) {
     const orphans = j.orphans.length === 0 ? '—' : j.orphans.join('、');
     const conflicts = j.conflicts.length === 0 ? '—' : j.conflicts.join('、');
     const missing = j.missing.length === 0 ? '' : '（缺 ' + j.missing.join('、') + '）';
     const state = j.running
-      ? el('span', { class: 'tag', text: '正在同步' })
+      ? el('span', { class: 'tag', text: '正在同步 · ' + phaseText(j) })
       : j.configured
         ? el('span', { class: 'tag', text: '已启用' })
         : el('span', { class: 'tag warn', text: '未配置' });
-    jellyfinBody.replaceChildren(
+    const rows = [
       row('状态', el('span', {}, state, missing), '即时',
         '地址 / API key / 媒体库根三项都非空才启用；留空 = 整段关闭'),
       row('地址', j.url === '' ? '—' : j.url, '即时', 'jellyfin_url', true),
@@ -366,11 +445,29 @@ function initStatus() {
         'jellyfin_library_prefix，只操作带这个前缀的库'),
       row('API key', flag(j.api_key_set), '即时', 'jellyfin_api_key（只写不读，状态面不返回值）'),
       row('单次超时', j.timeout_sec + ' 秒', '即时', 'jellyfin_timeout_sec，每次出站请求一个超时'),
-      row('上次同步', fmtTime(j.last_run_at), '—', '状态只在内存里：重启后回到「未运行」'),
+    ];
+    // 跑着的时候先给进度：这是「点完之后看见发生了什么」的主路径。
+    if (j.running) {
+      rows.push(row('本次进度', phaseText(j), '—',
+        '当前阶段：列分类 → 比对现有库 → 创建媒体库 →（prune 时）删除孤儿库 → 触发扫描'));
+      rows.push(row('本次已处理', '新建 ' + j.created + ' 个' +
+        (j.uncertain > 0 ? '、结果未知 ' + j.uncertain + ' 个' : '') +
+        (j.failed.length > 0 ? '、被拒 ' + j.failed.length + ' 个' : ''), '—',
+        '开始于 ' + fmtTime(j.started_at) + '，计数随轮询实时变化'));
+    }
+    rows.push(
+      row('上次同步', fmtTime(j.last_run_at), '—',
+        '页面上常驻，不需要点开或刷新；状态在内存里，重启后回到「未运行」'),
+      row('上次结果', resultText(j), '—',
+        'created / unchanged / failed / uncertain 与耗时',
+        true),
+      row('上次耗时', fmtDuration(j.duration_ms), '—', 'duration_ms'),
       row('上次成功', fmtTime(j.last_ok_at), '—', '孤儿与同名冲突不算失败，也会推进这一项'),
       row('上次错误', j.last_error === '' ? '—' : el('span', { class: 'mono', text: j.last_error }), '—',
         'Jellyfin 不可用只影响这一段：同步、WebDAV、播放都不受影响'),
       row('上次新建', String(j.created), '—', '这一轮建了几个库；0 = 幂等命中'),
+      row('上次已存在', String(j.unchanged), '—',
+        '已有自管库、这一轮什么都没动的分类数（幂等命中）'),
       row('结果未知', String(j.uncertain), '—',
         '建库请求超时、Jellyfin 侧是否建成不确定的条数（不计入新建）。下一轮同步会以列库结果收口'),
       row('被拒分类', j.failed.length === 0 ? '—' : el('span', { class: 'mono', text: j.failed.join('、') }), '—',
@@ -378,6 +475,7 @@ function initStatus() {
       row('孤儿库', orphans, '—',
         '分类已消失的自管库。默认不删，删除走 POST /api/jellyfin/libraries {"prune":true}'),
       row('冲突库', conflicts, '—', '同名库不是本服务建的：不建、不删、不接管'));
+    jellyfinBody.replaceChildren(...rows);
   }
 
   // fillJellyfin 把媒体库配置填进表单并记基线；api key 永远留空（只写不读）。
@@ -398,23 +496,49 @@ function initStatus() {
   }
 
   // syncJellyfin 手动触发一轮媒体库同步：202 = 已派出去，409 = 上一轮还在跑，
-  // 400 = 三项没配齐（响应体点名缺哪个键）。结果一律回读 /api/status，不猜结局。
+  // 400 = 三项没配齐（响应体点名缺哪个键）。
+  //
+  // 202 不带结果，所以派出去之后立刻回读一次 /api/status，记下这一轮的 run_seq，
+  // 之后靠轮询等它收尾（见 afterRender）：run_seq 够大且 running=false 才算「这一轮跑完了」。
   async function syncJellyfin() {
     jellyfinBtn.disabled = true;
     say('已请求同步 Jellyfin 媒体库 …', 'busy');
     try {
       await api('POST', '/api/jellyfin/libraries', {});
-      say('已派出一轮媒体库同步，结果看「上次同步」与「上次错误」', 'ok');
+    } catch (err) {
+      if (err.status !== 409) {
+        fail(err);
+        syncHint();
+        return;
+      }
+      // 409 不是失败：单飞锁挡住了第二次派发，页面转为盯正在跑的那一轮。
+      say('已有一轮媒体库同步在跑，没有重复派发（下面显示它的进度）', 'busy');
+    }
+    // 202 不带结果：回读一次 /api/status 认领这一轮的 run_seq，之后靠 poll 等它收尾。
+    // 极短的一轮（0 变化）可能已经结束了，afterRender 会直接把结果报出来。
+    try {
+      const status = await api('GET', '/api/status');
+      watchingSeq = status.jellyfin.run_seq;
+      pollDeadline = 0;
+      applyStatus(status);
+      afterRender(status.jellyfin);
     } catch (err) {
       fail(err);
     } finally {
-      await load().catch(fail);
       syncHint();
     }
   }
 
   async function load() {
     const status = await api('GET', '/api/status');
+    applyStatus(status);
+    afterRender(status.jellyfin);
+    syncHint();
+  }
+
+  // applyStatus 把一份 /api/status 画到页面上。轮询与 load 共用它：
+  // 一次轮询就是一次 load，两者渲染路径只有一条。
+  function applyStatus(status) {
     const t = status.totals;
     totalsBox.replaceChildren(
       stat('剧目', String(t.dramas)),
@@ -434,7 +558,25 @@ function initStatus() {
       setCredentialPlaceholders(status.config);
       setJellyfinKeyPlaceholder(status.jellyfin);
     }
-    syncHint();
+  }
+
+  // afterRender 决定「还要不要继续轮询」：等的那一轮收尾了 → 停下并给一句结果；
+  // 还在跑 → 1 秒后再来一次；既没在等、也没在跑 → 停。页面刷新后接着轮询
+  // （那时 watchingSeq 为 0，只显示进度、不替用户宣布别人的结果）。
+  function afterRender(j) {
+    if (watchingSeq !== 0 && j.run_seq >= watchingSeq && !j.running) {
+      watchingSeq = 0;
+      pollDeadline = 0;
+      stopPoll();
+      say(resultText(j), resultKind(j));
+      return;
+    }
+    if (j.running) {
+      poll();
+      return;
+    }
+    stopPoll();
+    pollDeadline = 0;
   }
 
   form.addEventListener('submit', async (event) => {

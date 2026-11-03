@@ -102,6 +102,9 @@
       普通目录（ADR-0012 的实测依据）。库根必须是 <strong>Jellyfin 容器内</strong>看到的路径。
       三项（地址 / API key / 媒体库根）都填上才启用；只增不删：分类消失只报告「孤儿库」，删除必须走
       <code>POST /api/jellyfin/libraries</code> 带 <code>{"prune":true}</code>。
+      点「同步媒体库」后端点只回 202，所以页面每秒轮询 <code>/api/status</code>：跑着时显示
+      <strong>当前阶段与已处理数</strong>，收尾时给一句结果（新建 / 已存在 / 被拒 / 结果未知 + 耗时）；
+      「上次同步」与「上次结果」常驻，刷新页面不用重新点，运行中再点会被服务端单飞锁挡住（409）。
     </p>
   </div>
   <p class="hint" id="jellyfin-hint"></p>

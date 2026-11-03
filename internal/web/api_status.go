@@ -97,15 +97,25 @@ type jellyfinView struct {
 	APIKeySet     bool     `json:"api_key_set"`
 	TimeoutSec    int      `json:"timeout_sec"`
 
-	Running   bool     `json:"running"`
-	LastRunAt string   `json:"last_run_at"`
-	LastOkAt  string   `json:"last_ok_at"`
-	LastError string   `json:"last_error"`
-	Created   int      `json:"created"`
-	Uncertain int      `json:"uncertain"`
-	Failed    []string `json:"failed"`
-	Orphans   []string `json:"orphans"`
-	Conflicts []string `json:"conflicts"`
+	Running bool `json:"running"`
+	// run_seq / started_at / phase / phase_done / phase_total 是「这一轮跑到哪了」：
+	// 页面点完 202 后轮询它们，run_seq 变大且 running=false 就说明刚点的那一轮收尾了。
+	// duration_ms 是上一轮耗时。这些都是内存状态，重启后归零。
+	RunSeq     int      `json:"run_seq"`
+	StartedAt  string   `json:"started_at"`
+	Phase      string   `json:"phase"`
+	PhaseDone  int      `json:"phase_done"`
+	PhaseTotal int      `json:"phase_total"`
+	DurationMS int64    `json:"duration_ms"`
+	LastRunAt  string   `json:"last_run_at"`
+	LastOkAt   string   `json:"last_ok_at"`
+	LastError  string   `json:"last_error"`
+	Created    int      `json:"created"`
+	Unchanged  int      `json:"unchanged"`
+	Uncertain  int      `json:"uncertain"`
+	Failed     []string `json:"failed"`
+	Orphans    []string `json:"orphans"`
+	Conflicts  []string `json:"conflicts"`
 }
 
 // statusView 是 GET /api/status 的响应体：同步计数 + 运行配置 + 播放源 + 媒体库。
@@ -131,10 +141,17 @@ func jellyfinViewOf(state jellyfin.State) jellyfinView {
 		APIKeySet:     state.APIKeySet,
 		TimeoutSec:    state.TimeoutSec,
 		Running:       state.Running,
+		RunSeq:        state.RunSeq,
+		StartedAt:     formatTime(state.StartedAt),
+		Phase:         state.Phase,
+		PhaseDone:     state.PhaseDone,
+		PhaseTotal:    state.PhaseTotal,
+		DurationMS:    state.DurationMS,
 		LastRunAt:     formatTime(state.LastRunAt),
 		LastOkAt:      formatTime(state.LastOKAt),
 		LastError:     state.LastError,
 		Created:       state.Created,
+		Unchanged:     state.Unchanged,
 		Uncertain:     state.Uncertain,
 		Failed:        nonNilStrings(state.Failed),
 		Orphans:       nonNilStrings(state.Orphans),

@@ -246,14 +246,24 @@ func TestManagerBusy(t *testing.T) {
 	if err := h.manager.Start(context.Background(), false); err != nil {
 		t.Fatalf("第一次 Start: %v", err)
 	}
+	mid := h.state()
 	if err := h.manager.Start(context.Background(), false); !errors.Is(err, ErrBusy) {
 		t.Fatalf("撞车时 Start = %v, 期望 ErrBusy", err)
 	}
 	close(block)
 	h.manager.Wait()
 
-	if state := h.state(); state.Running {
+	state := h.state()
+	if state.Running {
 		t.Error("收尾后 Running 应为 false")
+	}
+	// 「不产生第二轮」看这两条：序号只前进了一次，写请求也还只有第一轮那份。
+	if state.RunSeq != mid.RunSeq || state.RunSeq != 1 {
+		t.Errorf("RunSeq = %d（撞车时读到 %d）, 期望都是 1：被拒的那次不该另起一轮",
+			state.RunSeq, mid.RunSeq)
+	}
+	if writes := h.ff.writes(); len(writes) != 2 { // 1 建库 + 1 扫描
+		t.Errorf("写请求 = %d, 期望 2（1 次建库 + 1 次扫描）：被拒的那次没有产生额外请求", len(writes))
 	}
 }
 
@@ -477,5 +487,126 @@ func TestManagerBadPathDoesNotAbort(t *testing.T) {
 	}
 	if state := h.state(); len(state.Failed) != 0 || state.LastError != "" {
 		t.Errorf("补上后 Failed = %v / LastError = %q, 期望空", state.Failed, state.LastError)
+	}
+}
+
+// TestManagerProgressVisible 锁定进度面（MKACG-664 AC-1）：202 之后页面能读到
+// 「正在跑 / 跑到哪一步 / 已处理多少」，而不是只有一句「已派出」。
+//
+// 断言用的是「跑到中途时的状态」：建库请求故意慢（writeDelay），在它卡住时读一次
+// State —— 那一刻必须 Running=true、阶段是「创建媒体库」、总数是待建库数。
+func TestManagerProgressVisible(t *testing.T) {
+	h := newHarness(t, nil, []string{"都市", "爱情"})
+	h.ff.writeDelay = 150 * time.Millisecond
+
+	if err := h.manager.Start(context.Background(), false); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// 等到建库阶段真的开始（列库 + 列分类先跑完），再读进度。
+	deadline := time.Now().Add(2 * time.Second)
+	var mid State
+	for {
+		mid = h.state()
+		if mid.Phase == PhaseCreating && mid.PhaseTotal > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("2 秒内没进到建库阶段：%+v", mid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	h.manager.Wait()
+
+	if !mid.Running {
+		t.Error("一次进行中的运行应该 Running=true")
+	}
+	if mid.RunSeq != 1 {
+		t.Errorf("RunSeq = %d, 期望 1（本进程第一轮）", mid.RunSeq)
+	}
+	if mid.StartedAt.IsZero() {
+		t.Error("进行中的运行应该有 StartedAt（页面要显示「这次什么时候开始的」）")
+	}
+	if mid.PhaseTotal != 2 {
+		t.Errorf("建库阶段 PhaseTotal = %d, 期望 2（待建库数）", mid.PhaseTotal)
+	}
+
+	final := h.state()
+	if final.Running {
+		t.Error("收尾后 Running 应为 false")
+	}
+	if final.Phase != PhaseFinished {
+		t.Errorf("Phase = %q, 期望 %q（页面靠它区分「还在某个阶段」与「已结束」）",
+			final.Phase, PhaseFinished)
+	}
+	if final.Created != 2 || final.Unchanged != 0 {
+		t.Errorf("Created=%d Unchanged=%d, 期望 2 / 0", final.Created, final.Unchanged)
+	}
+	if final.DurationMS <= 0 {
+		t.Errorf("DurationMS = %d, 期望 > 0（页面要显示本轮耗时）", final.DurationMS)
+	}
+}
+
+// TestManagerUnchangedCounted 锁定 AC-2 的 unchanged：已有自管库的分类数在幂等命中时
+// 计进 unchanged，而不是只报 created=0 让人看不出「比对过、确实是 0 变化」。
+func TestManagerUnchangedCounted(t *testing.T) {
+	root := "/data/video/dramahub"
+	h := newHarness(t, []Library{
+		{Name: "短剧 - 都市", Locations: []string{root + "/都市"}},
+		{Name: "短剧 - 爱情", Locations: []string{root + "/爱情"}},
+	}, []string{"都市", "爱情", "科幻"})
+	h.run(false)
+
+	state := h.state()
+	if state.Created != 1 {
+		t.Errorf("Created = %d, 期望 1（只有科幻要建）", state.Created)
+	}
+	if state.Unchanged != 2 {
+		t.Errorf("Unchanged = %d, 期望 2（都市与爱情幂等命中）", state.Unchanged)
+	}
+}
+
+// TestManagerSecondRoundResetsCounters 锁定「新一轮的计数从 0 开始」：不然页面在
+// 第二轮跑到一半时会读到上一轮的 created，看起来像「怎么一开始就建好了 58 个」。
+func TestManagerSecondRoundResetsCounters(t *testing.T) {
+	h := newHarness(t, nil, []string{"都市"})
+	h.run(false)
+	if first := h.state(); first.Created != 1 {
+		t.Fatalf("第一轮 Created = %d, 期望 1", first.Created)
+	}
+
+	// 第二轮：库已存在 → 0 变化。跑之前先把计数复位，跑完 unchanged=1。
+	h.ff.libraries = []Library{
+		{Name: "短剧 - 都市", Locations: []string{h.cfg.LibraryRoot + "/都市"}},
+	}
+	h.run(false)
+	state := h.state()
+	if state.Created != 0 {
+		t.Errorf("第二轮 Created = %d, 期望 0", state.Created)
+	}
+	if state.Unchanged != 1 {
+		t.Errorf("第二轮 Unchanged = %d, 期望 1", state.Unchanged)
+	}
+	if state.RunSeq != 2 {
+		t.Errorf("RunSeq = %d, 期望 2（页面靠它认领「我点的那一轮」）", state.RunSeq)
+	}
+}
+
+// TestManagerFailureKeepsPhaseFinished 锁定 AC-3 的失败路径：Jellyfin 不可达时页面
+// 也要能看见「结束了 + 原因」，而不是停在某个阶段上转圈。
+func TestManagerFailureKeepsPhaseFinished(t *testing.T) {
+	h := newHarness(t, nil, []string{"都市"})
+	h.ff.status = http.StatusInternalServerError
+	h.ff.failList = true
+	h.run(false)
+
+	state := h.state()
+	if state.Running {
+		t.Error("失败也要收尾：Running 应为 false")
+	}
+	if state.Phase != PhaseFinished {
+		t.Errorf("Phase = %q, 期望 %q", state.Phase, PhaseFinished)
+	}
+	if state.LastError == "" {
+		t.Error("失败必须留下原因（页面显示「失败原因」，不是静默 202）")
 	}
 }

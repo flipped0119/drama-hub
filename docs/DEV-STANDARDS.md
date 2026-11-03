@@ -852,9 +852,9 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | `/api/dramas/{id}` | DELETE | 删剧目（级联删集与对外集号），204；不存在 404 |
 | `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
-| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」）+ `jellyfin` 块 = 媒体库维护现状（`configured` / `missing[]` / `url` / `library_root` / `library_prefix` / `api_key_set` / `timeout_sec` / `running` / `last_run_at` / `last_ok_at` / `last_error` / `created` / `orphans[]` / `conflicts[]`；**api key 永不出现在响应里**，只给 `api_key_set`） |
+| `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」）+ `jellyfin` 块 = 媒体库维护现状（`configured` / `missing[]` / `url` / `library_root` / `library_prefix` / `api_key_set` / `timeout_sec` / `running` / `run_seq` / `started_at` / `phase` / `phase_done` / `phase_total` / `duration_ms` / `last_run_at` / `last_ok_at` / `last_error` / `created` / `unchanged` / `uncertain` / `failed[]` / `orphans[]` / `conflicts[]`；**api key 永不出现在响应里**，只给 `api_key_set`） |
 | `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
-| `/api/jellyfin/libraries` | POST | 手动跑一轮媒体库同步（一分类一库，ADR-0012）：body 可省或 `{"prune":true}` → 202 `{"started":true}` 已派出 / 409 上一轮还在跑（与同步轮末钩子共用单飞锁）/ 400 三项配置没配齐（body 点名缺哪个键）。`prune` 只在显式给 `true` 时删自管孤儿库，默认只报告；结果看 `/api/status` 的 `jellyfin` 块 |
+| `/api/jellyfin/libraries` | POST | 手动跑一轮媒体库同步（一分类一库，ADR-0012）：body 可省或 `{"prune":true}` → 202 `{"started":true}` 已派出 / 409 上一轮还在跑（与同步轮末钩子共用单飞锁）/ 400 三项配置没配齐（body 点名缺哪个键）。`prune` 只在显式给 `true` 时删自管孤儿库，默认只报告；结果看 `/api/status` 的 `jellyfin` 块。202 只是「派出去了」：页面靠轮询 `run_seq` / `phase` / `phase_done` / `phase_total` / `created` 追进度，`run_seq` 变大且 `running=false` 即这一轮收尾 |
 
 - **「增剧目」的唯一入口是数据源同步**：剧目与集的真值在上游，手工插空剧只会得到一条
   永远没有集的记录。`series_id` 只接受纯数字或 `/player/<id>` 链接 —— 归一后的值会拼进
@@ -908,12 +908,22 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
   （`failed`，实测 12.1 库路径不存在回 400 `The specified path does not exist`）都只记账
   跳过，继续建其余分类；只有连不上 / 5xx / 认证失败这类系统性错误才整轮中止。一个坏分类
   不该让另外几十个都建不出来。
+- **进度面**：一轮的四个阶段（`PhaseListing` 列分类 → `PhaseDiffing` 比对现有库 →
+  `PhaseCreating` 创建 → [`PhaseRemoving` 删除孤儿库，仅 prune] → `PhaseScanning` 触发扫描）
+  逐阶段写进内存状态，收尾置 `PhaseFinished`。页面点完 202 每秒轮询 `/api/status`，读
+  `phase` / `phase_done` / `phase_total` 展示「跑到哪一步、已处理多少」，读 `created` /
+  `unchanged` / `uncertain` / `failed` 展示本轮计数，`run_seq` 变大且 `running=false` 即收尾，
+  随后给一句结果文案（新建 / 已存在 / 被拒 / 结果未知 + `duration_ms`）。每轮开始
+  `startProgress` 复位上一轮的计数与耗时 —— 不复位会让页面在新一轮开头读到旧数字。
+  不做 WebSocket / SSE：轮询足够（MKACG-664）。
 - **失败隔离**：Jellyfin 的任何失败只写内存里的 `last_error`，不写 `source_state`、不影响
   `/healthz`、WebDAV 与播放。
 - **扫描**：`created > 0 || removed > 0 || uncertain > 0` 才在末尾调一次
   `POST /Library/Refresh`；0 变化时一个写请求都不发（幂等的可验证点）。
-- **状态只在内存**：`created` / `uncertain` / `failed` / `last_*` / 孤儿库不落库，重启后
-  回到「未运行」；不加表也不加迁移。
+- **状态只在内存**：`created` / `unchanged` / `uncertain` / `failed` / `last_*` / 进度字段 /
+  孤儿库不落库，重启后回到「未运行」；不加表也不加迁移。刷新页面不会丢「上次同步」——
+  `last_run_at` / `last_error` 这些就在 `/api/status` 里，页面每次加载都读得到；只有进程
+  重启才清零。
 - **与 MKACG-651 的合入顺序**：库内「剧目录成为 Series」以 651（去掉分片层）为前提 ——
   分片层还在时库根的直接子目录是分片目录，Jellyfin 会把 `00` 认成 Series、真剧目录仍是
   普通目录（12.1 实测复现）。654 对 `internal/vfs` 的增量只有 `categories.go` 一个文件，
