@@ -168,13 +168,23 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 	defer func() { _ = resp.Body.Close() }()
 
 	payload, readErr := io.ReadAll(io.LimitReader(resp.Body, maxAppResponseBytes+1))
+	// 200 + 空体与 200 + 非 JSON 是最需要排障的两格：线上可能把日志级别调到 warn，
+	// 这两格必须在过滤之后仍留下现场，不能只记在 Info（MKACG-673）。
 	level := slog.LevelInfo
-	if readErr != nil || resp.StatusCode != http.StatusOK {
+	switch {
+	case readErr != nil,
+		resp.StatusCode != http.StatusOK,
+		len(payload) == 0,
+		int64(len(payload)) > maxAppResponseBytes,
+		!json.Valid(payload):
 		level = slog.LevelWarn
 	}
+	// content_type 是区分「真没返回」与「返回了别的东西」的唯一线索，不含内容本身。
+	contentType := resp.Header.Get("Content-Type")
 	p.logger.Log(ctx, level, "App 取流",
 		"plugin", Name, "channel", "app", "path", logPath,
-		"upstream_status", resp.StatusCode, "bytes", len(payload))
+		"upstream_status", resp.StatusCode, "bytes", len(payload),
+		"content_type", contentType)
 
 	if readErr != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -188,8 +198,7 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 	}
 	// 判定顺序（MKACG-635）：状态码先判，响应体后判。空体不是「身份被挡」的证据——
 	// 404 + 空体正是「这集没有片源」的形态，先判空体会把它误归 ErrRejected，于是多换
-	// 一轮身份、多打一次上游。只有 200 这一格会带着空体走到下面：那时它落进
-	// appStream，按「不是 JSON」归 ErrSchema（结构不符，重试无用）。
+	// 一轮身份、多打一次上游。
 	switch {
 	case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden ||
 		resp.StatusCode == statusDropped:
@@ -199,8 +208,16 @@ func (p *Plugin) appPlayback(ctx context.Context, id deviceIdentity, vid string)
 	case resp.StatusCode != http.StatusOK:
 		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 %d", plugin.ErrUpstream, logPath, resp.StatusCode)
 	}
+	// 200 + 空体（MKACG-673）：这个 agw 拒绝请求时回 200 但不写响应体，不是契约结构
+	// 变了。归 ErrRejected 才能走 resolveApp 的换身份重试；按结构不符归类会把本来
+	// 可自愈的故障变成不可恢复，错误文案也误导。
+	if len(payload) == 0 {
+		return plugin.Stream{}, fmt.Errorf("%w: POST %s 返回 200 但响应体为空", plugin.ErrRejected, logPath)
+	}
 
-	st, err := appStream(payload, vid)
+	st, err := appStream(payload, vid, appReply{
+		status: resp.StatusCode, contentType: contentType, bytes: len(payload),
+	})
 	if err != nil {
 		return plugin.Stream{}, err
 	}
@@ -259,11 +276,21 @@ func appDeviceParams() url.Values {
 	}
 }
 
+// appReply 是一次取流响应的元信息，只用来给「不是 JSON」补事实。
+// 不含响应体内容，也不含查询串（里面有设备身份）。
+type appReply struct {
+	status      int
+	contentType string
+	bytes       int
+}
+
 // appStream 把取流响应的原始字节翻成 plugin.Stream。
-func appStream(payload []byte, vid string) (plugin.Stream, error) {
+func appStream(payload []byte, vid string, reply appReply) (plugin.Stream, error) {
 	var env appEnvelope
 	if err := json.Unmarshal(payload, &env); err != nil {
-		return plugin.Stream{}, fmt.Errorf("%w: App 取流响应不是 JSON", plugin.ErrSchema)
+		// 非空但不是 JSON：确实不是契约结构。带上是哪次响应，排障才有依据。
+		return plugin.Stream{}, fmt.Errorf("%w: App 取流响应不是 JSON（status=%d content_type=%q bytes=%d）",
+			plugin.ErrSchema, reply.status, reply.contentType, reply.bytes)
 	}
 	code := rawText(env.Code)
 	if code == "" {

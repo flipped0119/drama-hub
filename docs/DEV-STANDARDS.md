@@ -425,7 +425,8 @@ DISCONTINUITY 表达，不再需要 `-output_ts_offset` 平移 PTS。分片端�
 - 判定顺序 MUST 是**状态码先、响应体后**（MKACG-635）：404 + 空体曾因「空体 → 身份被挡」
   被判成 `ErrRejected`，多换一轮设备身份、多打一次上游。App 通道每一格：403/429/444 →
   `ErrRejected`（换一次身份，仍失败即 502）、404（带体或不带体）→ `ErrNoStream`、其余非
-  200 → `ErrUpstream`、200 + 空体或非 JSON → `ErrSchema`、200 + `code != 0` → `ErrRejected`。
+  200 → `ErrUpstream`、200 + 空体 → `ErrRejected`（换身份可自愈，MKACG-673）、
+  200 + 非空但不是 JSON → `ErrSchema`、200 + `code != 0` → `ErrRejected`。
   网页通道同一顺序，200 + 空体按 `ErrUpstream`。
 - 框架校验（`internal/sync`）：集表非空、`Episodes[i].No == i+1`、源侧集标识数量与集数一致，
   违反即 `ErrSchema` 且**不写库**（这是插件实现 bug，不是上游问题）。

@@ -49,9 +49,12 @@ type fakeApp struct {
 	videoCalls     int
 	registerStatus int
 	videoReply     func(call int) (int, string)
-	lastQuery      url.Values
-	lastBody       string
-	lastHeaders    http.Header
+	// videoContentType 非空时给取流应答加 Content-Type 头（真实上游回空体时也带
+	// application/json，200 + 空体那类缺陷靠这个头与「真没返回」区分）。
+	videoContentType string
+	lastQuery        url.Values
+	lastBody         string
+	lastHeaders      http.Header
 }
 
 // newFakeApp 起一个假 App 上游：注册端点每次回一条新的身份（真实上游也是
@@ -80,11 +83,15 @@ func newFakeApp(t *testing.T) (*fakeApp, *httptest.Server) {
 			f.videoCalls++
 			call := f.videoCalls
 			reply := f.videoReply
+			contentType := f.videoContentType
 			f.lastQuery = r.URL.Query()
 			f.lastBody = string(body)
 			f.lastHeaders = r.Header.Clone()
 			f.mu.Unlock()
 			status, resp := reply(call)
+			if contentType != "" {
+				w.Header().Set("Content-Type", contentType)
+			}
 			w.WriteHeader(status)
 			_, _ = io.WriteString(w, resp)
 			return
@@ -115,6 +122,13 @@ func (f *fakeApp) replyVideo(fn func(call int) (int, string)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.videoReply = fn
+}
+
+// setVideoContentType 设置取流端点的应答 Content-Type。
+func (f *fakeApp) setVideoContentType(ct string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.videoContentType = ct
 }
 
 // count 返回（注册次数, 取流次数）。
@@ -517,7 +531,7 @@ func TestAppResolveRenewsDeviceOnce(t *testing.T) {
 }
 
 // TestAppResolveStatusAndBodyClassification 覆盖 app.go 的「状态码 × 响应体」判定
-// 顺序（MKACG-635）：状态码先判，空体后判。每一格都断言错误类别与上游请求次数——
+// 顺序（MKACG-635）：状态码先判，空体后判；200 + 空体归被拒（MKACG-673）。每一格都断言错误类别与上游请求次数——
 // 归类错了的代价不是日志措辞，而是多走一轮换身份、多打一次取流。
 func TestAppResolveStatusAndBodyClassification(t *testing.T) {
 	// 非 200 时上游带的 JSON 体只有诊断价值：判定不该看它。
@@ -550,9 +564,10 @@ func TestAppResolveStatusAndBodyClassification(t *testing.T) {
 			want: plugin.ErrUpstream, wantReg: 1, wantVideos: 1},
 		{name: "503 + JSON 体 → 上游故障", status: http.StatusServiceUnavailable, body: upstreamErrorBody,
 			want: plugin.ErrUpstream, wantReg: 1, wantVideos: 1},
-		// 200 + 空体是结构不符，不是身份被挡：同样不重试。
-		{name: "200 + 空体 → 结构不符", status: http.StatusOK, body: "",
-			want: plugin.ErrSchema, wantReg: 1, wantVideos: 1},
+		// 200 + 空体（MKACG-673）是上游拒绝请求的形态，不是结构变了：判被拒才换身份。
+		{name: "200 + 空体 → 被拒，换一次身份", status: http.StatusOK, body: "",
+			want: plugin.ErrRejected, wantReg: 2, wantVideos: 2},
+		// 200 + 非空但不是 JSON：确实不是契约结构，重试无用。
 		{name: "200 + 非 JSON 体 → 结构不符", status: http.StatusOK, body: "not json",
 			want: plugin.ErrSchema, wantReg: 1, wantVideos: 1},
 		{name: "200 + 非零 code → 被拒", status: http.StatusOK, body: bizRejectedBody,
@@ -575,6 +590,141 @@ func TestAppResolveStatusAndBodyClassification(t *testing.T) {
 			if reg, videos := app.count(); reg != tc.wantReg || videos != tc.wantVideos {
 				t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望 %d / %d",
 					reg, videos, tc.wantReg, tc.wantVideos)
+			}
+		})
+	}
+}
+
+// TestAppResolveEmptyBodyRenewsDevice 覆盖 MKACG-673：200 + 空体归被拒之后确实会换一次
+// 身份，换身份后拿到的正常响应就能出流——这是「可自愈」的证据，不是文案证据。
+func TestAppResolveEmptyBodyRenewsDevice(t *testing.T) {
+	spade := buildSpadeA(t, appTestKey)
+	encrypted := buildEncryptedURL(t, appTestMediaURL, appTestSeed)
+	ok := appResponse(t, fixtureVID, appModelFixture(t, map[string]any{
+		"360p": appRow("h264", encrypted, spade, 640, 360, 640_000),
+	}))
+	logs := &logSink{}
+	_, webSrv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series-protected.html"))
+	app, appSrv := newFakeApp(t)
+	// 真实上游拒绝时就长这样：200 + application/json + 空体。
+	app.setVideoContentType("application/json")
+	app.replyVideo(func(call int) (int, string) {
+		if call == 1 {
+			return http.StatusOK, ""
+		}
+		return http.StatusOK, ok
+	})
+	p := newAppTestPlugin(t, webSrv, appSrv, slog.New(slog.NewTextHandler(logs, nil)))
+
+	st, err := p.Resolve(context.Background(), testRef(), 1)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if st.URL != appTestMediaURL || !bytes.Equal(st.Key, appTestKey) {
+		t.Fatalf("Stream = %+v, 期望续期后出流", st)
+	}
+	if reg, videos := app.count(); reg != 2 || videos != 2 {
+		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望 2 / 2", reg, videos)
+	}
+	if got := app.lastQueryDeviceID(); got != "1002" {
+		t.Fatalf("重试用的 device_id = %q, 期望续期后的 1002", got)
+	}
+	// 日志必须能看出「这次是空体」，否则排障还是只能猜。
+	if text := logs.text(); !strings.Contains(text, "content_type=application/json") ||
+		!strings.Contains(text, "bytes=0") {
+		t.Fatalf("App 取流日志缺空体事实:\n%s", text)
+	}
+}
+
+// TestAppResolveNonJSONErrorHasFacts 覆盖 MKACG-673：200 + 非空但不是 JSON 仍归结构
+// 不符（不换身份），但错误文本要带上是哪次响应，且不含查询串与设备身份。
+func TestAppResolveNonJSONErrorHasFacts(t *testing.T) {
+	const body = "<html>bad gateway</html>"
+	_, webSrv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series-protected.html"))
+	app, appSrv := newFakeApp(t)
+	app.setVideoContentType("text/html")
+	app.replyVideo(func(int) (int, string) { return http.StatusOK, body })
+	p := newAppTestPlugin(t, webSrv, appSrv, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	_, err := p.Resolve(context.Background(), testRef(), 1)
+	if !errors.Is(err, plugin.ErrSchema) {
+		t.Fatalf("err = %v, 期望 ErrSchema", err)
+	}
+	msg := err.Error()
+	for _, want := range []string{"status=200", "text/html", "bytes=" + strconv.Itoa(len(body))} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("错误文本缺 %q: %s", want, msg)
+		}
+	}
+	for _, leak := range []string{"device_id", "spade_a", "key_seed", "?"} {
+		if strings.Contains(msg, leak) {
+			t.Errorf("错误文本出现了不该有的 %q: %s", leak, msg)
+		}
+	}
+	if reg, videos := app.count(); reg != 1 || videos != 1 {
+		t.Fatalf("App 请求 = 注册 %d / 取流 %d, 期望 1 / 1（结构不符不换身份）", reg, videos)
+	}
+}
+
+// TestAppResolveFailureEvidenceSurvivesWarnLevel 覆盖 MKACG-673 的日志侧要求：线上把
+// 日志级别调到 warn 时，「200 + 空体」与「200 + 非 JSON」这两条 App 取流日志仍要落盘，
+// 否则 bytes / content_type 这些排障现场会被级别过滤掉。
+func TestAppResolveFailureEvidenceSurvivesWarnLevel(t *testing.T) {
+	const html = "<html>bad gateway</html>"
+	cases := []struct {
+		name        string
+		body        string
+		contentType string
+		wantErr     error
+		wantFacts   []string
+	}{
+		{
+			name:        "200 + 空体",
+			body:        "",
+			contentType: "application/json",
+			wantErr:     plugin.ErrRejected,
+			wantFacts:   []string{"upstream_status=200", "bytes=0", "content_type=application/json"},
+		},
+		{
+			name:        "200 + 非 JSON",
+			body:        html,
+			contentType: "text/html",
+			wantErr:     plugin.ErrSchema,
+			wantFacts:   []string{"upstream_status=200", "bytes=" + strconv.Itoa(len(html)), "content_type=text/html"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &logSink{}
+			_, webSrv := newFakeSite(t, http.StatusOK, readFixture(t, "page-series-protected.html"))
+			app, appSrv := newFakeApp(t)
+			app.setVideoContentType(tc.contentType)
+			app.replyVideo(func(int) (int, string) { return http.StatusOK, tc.body })
+			logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+			p := newAppTestPlugin(t, webSrv, appSrv, logger)
+
+			if _, err := p.Resolve(context.Background(), testRef(), 1); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, 期望 %v", err, tc.wantErr)
+			}
+
+			seen := false
+			for _, line := range strings.Split(logs.text(), "\n") {
+				if !strings.Contains(line, `msg="App 取流"`) || !strings.Contains(line, "level=WARN") {
+					continue
+				}
+				missing := false
+				for _, want := range tc.wantFacts {
+					if !strings.Contains(line, want) {
+						missing = true
+						break
+					}
+				}
+				if !missing {
+					seen = true
+				}
+			}
+			if !seen {
+				t.Fatalf("warn 级别下 App 取流日志缺现场 %v:\n%s", tc.wantFacts, logs.text())
 			}
 		})
 	}
