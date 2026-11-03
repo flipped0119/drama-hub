@@ -45,9 +45,8 @@
   - 写事务的锁序必须全仓统一为「drama → 子表」：两条事务以相反顺序请求同两行就是
     PostgreSQL 的 40P01 死锁（内嵌库单写者时不存在这条失败路径）。`lockDrama`
     （`internal/store/lock.go`）是唯一加锁点：同步事务的第一步 `UpsertDrama` 就已
-    锁住 drama 行，首播回填因此先锁 drama 再 `UPDATE episode`；合并编排、派生表
-    重建同理。派生表重建的「先删后插」也靠这把锁串行（READ COMMITTED 下两个并发
-    重建各自按快照删、再插入同一批行，否则撞唯一约束）。
+    锁住 drama 行，首播回填因此先锁 drama 再 `UPDATE episode`。ADR-0014 之后对外
+    剧集改为运行时派生，不再有 `emby_item` 派生表，锁序只覆盖 `drama → episode`。
   - 已接受的失败模式：并发删剧与「按剧写入子表」相遇时，后拿到锁的事务可能因
     外键（23503）或以死锁检测（40P01）失败。两者都是「整笔回滚、数据不脏、重试
     即可」；这是显式取舍，不是遗漏（见 `docs/DEV-STANDARDS.md`「数据库」的锁序条款）。

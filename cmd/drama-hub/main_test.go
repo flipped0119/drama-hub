@@ -291,10 +291,7 @@ func TestHandler_WebDAV(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpsertEpisode: %v", err)
 	}
-	// vfs 树只认 emby_item 派生表（硬约束 6），等价于生产里同步完成后的重建。
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
+	// vfs 树的对外形态按当前分块规则现算（硬约束 6，docs/adr/0014）。
 	h := newAssembly(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources(), nil)
 
 	// 无认证 → 401（不是 501：说明 /webdav/ 已接上真实 handler）。
@@ -386,7 +383,7 @@ func TestHandler_SettingsWrite(t *testing.T) {
 		t.Fatalf("401 之后库被写了：refresh_batch found=%v err=%v", found, err)
 	}
 
-	// 造一部剧 + 一集，供 `.strm` 断言用（vfs 只认 emby_item 派生表）。
+	// 造一部剧 + 一集，供 `.strm` 断言用（vfs 按当前分块规则派生对外剧集）。
 	dramaID, err := st.UpsertDrama(ctx, store.Drama{Provider: "web", ProviderID: "p1", Title: "测试剧", Year: 2024, Genre: "爱情"})
 	if err != nil {
 		t.Fatalf("UpsertDrama: %v", err)
@@ -394,9 +391,6 @@ func TestHandler_SettingsWrite(t *testing.T) {
 	epID, err := st.UpsertEpisode(ctx, store.Episode{DramaID: dramaID, EpNo: 1, Title: "开局", Source: "web", Vid: "v1"})
 	if err != nil {
 		t.Fatalf("UpsertEpisode: %v", err)
-	}
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
 	}
 	const secret = "0123456789abcdef0123456789abcdef"
 
@@ -525,10 +519,7 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 			t.Fatalf("UpsertSegment: %v", err)
 		}
 	}
-	// 播放单元只认派生表：N=2 把第 1-2 集并成一块，第 3 集自成一集。
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
+	// 播放单元按当前 N 现算：N=2 把第 1-2 集并成一块，第 3 集自成一集。
 
 	buf := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -612,7 +603,7 @@ func TestHandler_PlaybackSurface(t *testing.T) {
 }
 
 // TestIDStability 覆盖契约的「{id} 不飘移」四条：
-// 1. 重复取一致；2. 全量刷新（UpsertEpisode + RebuildEmbyItems）后一致；
+// 1. 重复取一致；2. 全量刷新（同一批 UpsertEpisode）后一致；
 // 3. 改 merge_chunk_size 只让受影响那一集的 id 变化（旧 id 404、其它集 id 不变）；
 // 4. 重启进程（settings 不变）后一致。
 func TestIDStability(t *testing.T) {
@@ -646,11 +637,8 @@ func TestIDStability(t *testing.T) {
 		}
 		ids = append(ids, id)
 	}
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
 
-	// idsOf 把派生表的 uid 翻成对外 id（生产方与校验方共用 stream.ID）。
+	// idsOf 把对外剧集的 uid 翻成对外 id（生产方与校验方共用 stream.ID）。
 	idsOf := func(st *store.Store) map[string]string {
 		t.Helper()
 		items, err := st.ListEmbyItems(ctx, dramaID)
@@ -682,14 +670,11 @@ func TestIDStability(t *testing.T) {
 		t.Fatalf("对外剧集数 = %d, 期望 3", len(before))
 	}
 
-	// 2. 全量刷新（同一批 UpsertEpisode + RebuildEmbyItems）后一致。
+	// 2. 全量刷新（同一批 UpsertEpisode）后一致。
 	for i, id := range ids {
 		if _, err := st.UpsertEpisode(ctx, store.Episode{ID: id, DramaID: dramaID, EpNo: i + 1, Source: "web", Vid: "v"}); err != nil {
 			t.Fatalf("再次 UpsertEpisode: %v", err)
 		}
-	}
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("再次 RebuildEmbyItems: %v", err)
 	}
 	assertSame("全量刷新后", idsOf(st), before)
 
@@ -705,9 +690,6 @@ func TestIDStability(t *testing.T) {
 	if err := settings.Set(ctx, store.KeyMergeChunkSize, "2"); err != nil {
 		t.Fatalf("Set merge_chunk_size=2: %v", err)
 	}
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems(N=2): %v", err)
-	}
 	merged := idsOf(st)
 	lastUID := "e" + strconv.FormatInt(ids[2], 10)
 	mergedUID := fmt.Sprintf("m%d_1_2", dramaID)
@@ -718,7 +700,7 @@ func TestIDStability(t *testing.T) {
 		t.Fatalf("改 N 后对外剧集数 = %d, 期望 2（合并块 + 单集）：%v", len(merged), merged)
 	}
 	if _, ok := merged[mergedUID]; !ok {
-		t.Fatalf("合并块 uid %s 不在派生表里：%v", mergedUID, merged)
+		t.Fatalf("合并块 uid %s 不在对外剧集里：%v", mergedUID, merged)
 	}
 	// 旧 id 仍合法签名，但对应 uid 已不在库里 → 404（与 401 区分开）。
 	h := newAssembly(slog.New(slog.DiscardHandler), st, settings, testSyncer(), fakeSchedule{}, testSources(), nil)
@@ -729,9 +711,6 @@ func TestIDStability(t *testing.T) {
 	// 改回 N=1 后回到 3 条单集，id 与改 N 前逐个相同（旧 id 复活而不是换新值）。
 	if err := settings.Set(ctx, store.KeyMergeChunkSize, "1"); err != nil {
 		t.Fatalf("Set merge_chunk_size=1: %v", err)
-	}
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems(N=1): %v", err)
 	}
 	assertSame("改回 N=1 后", idsOf(st), before)
 }
@@ -908,7 +887,7 @@ func g4Source(t *testing.T, seconds int) (string, float64) {
 }
 
 // TestFirstPlay_BackfillsDurationIntoNFO 覆盖 G4（MKACG-621）：首播触发建索引时把
-// ffprobe 实测时长回填 episode.duration_sec，同事务重建派生表后重新取该集 .nfo，
+// ffprobe 实测时长回填 episode.duration_sec，下一次读取派生结果时 .nfo 就跟着变，
 // <runtime>（分钟）与实测时长一致；没播过的集仍是 0，它的 .nfo 照常出、不阻断。
 func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	ctx := context.Background()
@@ -953,10 +932,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	}
 	playedID, playedDur := addEpisode(1, 65)
 	unplayedID, _ := addEpisode(2, 12)
-	// vfs 树与播放面都只认 emby_item 派生表（硬约束 6），等价于同步完成后的重建。
-	if _, err := st.RebuildEmbyItems(ctx, dramaID); err != nil {
-		t.Fatalf("RebuildEmbyItems: %v", err)
-	}
+	// vfs 树与播放面的对外形态都按当前分块规则现算（硬约束 6，docs/adr/0014）。
 
 	logger := slog.New(slog.DiscardHandler)
 	cutter := segment.NewCutter(st, settings, logger, cache.New(st, settings, logger),
@@ -1015,7 +991,7 @@ func TestFirstPlay_BackfillsDurationIntoNFO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListEmbyItems: %v", err)
 	}
-	t.Logf("回填后：episode.duration_sec=%d, emby_item.runtime_sec=%d, .nfo=%s",
+	t.Logf("回填后：episode.duration_sec=%d, 派生 runtime_sec=%d, .nfo=%s",
 		got.DurationSec, items[0].RuntimeSec, strings.TrimSpace(string(body)))
 
 	// 没播过的集：库里仍是 0，.nfo 照常出、仍是 0（不报错、不阻断）。

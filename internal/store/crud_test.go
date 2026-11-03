@@ -760,7 +760,7 @@ func TestBackfillLocksDramaBeforeEpisode(t *testing.T) {
 	}
 }
 
-// AC：同步（UpsertDrama → 逐集 UpsertEpisode → 重建派生表）与首播回填并发，
+// AC：同步（UpsertDrama → 逐集 UpsertEpisode）与首播回填并发，
 // 无死锁（40P01）、无重复行、每集都拿到实测时长。
 func TestConcurrentBackfillAndSync(t *testing.T) {
 	db := newCRUDTestDB(t)
@@ -786,7 +786,7 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 
 	const rounds = 10
 	errCh := make(chan error, 2)
-	// 写路径 A：与 sync.SyncSeries 同序的同步事务（先锁 drama，再逐集写，最后重建）。
+	// 写路径 A：与 sync.SyncSeries 同序的同步事务（先锁 drama，再逐集写）。
 	go func() {
 		for r := 0; r < rounds; r++ {
 			err := st.InTx(ctx, func(tx *Store) error {
@@ -802,8 +802,7 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 						return err
 					}
 				}
-				_, err := tx.RebuildEmbyItems(ctx, dramaID)
-				return err
+				return nil
 			})
 			if err != nil {
 				errCh <- fmt.Errorf("同步第 %d 轮: %w", r, err)
@@ -812,7 +811,7 @@ func TestConcurrentBackfillAndSync(t *testing.T) {
 		}
 		errCh <- nil
 	}()
-	// 写路径 B：首播回填（先锁 drama，再改集、重建）。
+	// 写路径 B：首播回填（先锁 drama，再改集）。
 	go func() {
 		for r := 0; r < rounds; r++ {
 			for _, id := range ids {

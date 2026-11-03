@@ -102,7 +102,7 @@ func TestMigrateToLatest(t *testing.T) {
 	}
 
 	want := []string{
-		"artifact", "drama", "emby_item", "episode",
+		"artifact", "drama", "episode",
 		"schema_migrations", "segment", "settings", "source_state",
 	}
 	if got := tableNames(t, db); !reflect.DeepEqual(got, want) {
@@ -140,8 +140,9 @@ func TestMigrate0005DropsLegacyMergedRows(t *testing.T) {
 		t.Fatalf("插入 emby_item: %v", err)
 	}
 
-	if _, err := migrateFiles(ctx, db, files); err != nil {
-		t.Fatalf("迁移到最新: %v", err)
+	// 只跑到 0005：0008 之后该表已被删除（见 TestMigrate0008DropsEmbyItem）。
+	if _, err := migrateFiles(ctx, db, files[:5]); err != nil {
+		t.Fatalf("迁移到 0005: %v", err)
 	}
 
 	rows, err := db.QueryContext(ctx,
@@ -165,6 +166,53 @@ func TestMigrate0005DropsLegacyMergedRows(t *testing.T) {
 	want := []string{"e1", "m1_1_2"}
 	if !reflect.DeepEqual(uids, want) {
 		t.Fatalf("迁移后 uid = %v, 期望 %v（旧合并行必须清掉）", uids, want)
+	}
+}
+
+// AC（MKACG-666）：0008 删掉 emby_item 派生表——库里只留原始集，对外形态运行时派生。
+func TestMigrate0008DropsEmbyItem(t *testing.T) {
+	db := openRaw(t)
+	ctx := context.Background()
+	files, err := migrations()
+	if err != nil {
+		t.Fatalf("读取迁移清单: %v", err)
+	}
+	// 停在 0007：emby_item 还在，表里可以放行。
+	if _, err := migrateFiles(ctx, db, files[:7]); err != nil {
+		t.Fatalf("迁移到 0007: %v", err)
+	}
+	var dramaID int64
+	if err := db.QueryRowContext(ctx,
+		`INSERT INTO drama(provider, provider_id, title) VALUES('web','m2','旧库') RETURNING id`,
+	).Scan(&dramaID); err != nil {
+		t.Fatalf("插入 drama: %v", err)
+	}
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO emby_item(drama_id, season, ep_no, kind, uid, runtime_sec)
+		 VALUES($1, 1, 1, 'single', 'e1', 60)`, dramaID); err != nil {
+		t.Fatalf("插入 emby_item: %v", err)
+	}
+
+	if _, err := migrateFiles(ctx, db, files); err != nil {
+		t.Fatalf("迁移到最新: %v", err)
+	}
+
+	var n int
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM information_schema.tables
+		 WHERE table_schema = current_schema() AND table_name = 'emby_item'`).Scan(&n); err != nil {
+		t.Fatalf("查 information_schema.tables: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("emby_item 表仍在（%d 行）：0008 未删除派生表", n)
+	}
+	// 原始数据不受影响。
+	if err := db.QueryRowContext(ctx,
+		`SELECT count(*) FROM drama WHERE id = $1`, dramaID).Scan(&n); err != nil {
+		t.Fatalf("查 drama: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("迁移后 drama 行数 = %d, 期望 1（删派生表不得动原始数据）", n)
 	}
 }
 

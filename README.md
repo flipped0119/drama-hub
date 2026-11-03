@@ -74,7 +74,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 对外 id 是 HMAC 常量签名（ADR-0003）：`id = uid + "-" + hex(HMAC-SHA256(secret,
 uid))[:12]`，`uid` 是 `e<episode.id>`（单集）或 `m<dramaID>_<epFrom>_<epTo>`（合并集），secret 取
 `settings.stream_secret`。一个 id 同时给 playlist 与分片用，无过期、无 token 表、不落库；
-签名错 → 401，`uid` 不在派生表里 → 404，解析不到直链或上游失败 → 502。
+签名错 → 401，`uid` 不是当前派生规则下的播放单元 → 404，解析不到直链或上游失败 → 502。
 
 **直链只在请求时解析**：`episode.play_url` / `play_url_at` 已由 `0004` 迁移删除（直链是
 短时凭据，落库就是过期链接），每次播放请求现调插件 `Resolve`，换链后下一次请求自然拿到
@@ -98,8 +98,9 @@ ffmpeg 失败 → 502 且不写缓存。详见 `docs/adr/0011-episode-per-segmen
 PTS（ADR-0011）。
 
 **合并是自动的**（ADR-0010）：每部剧的集按 `settings.merge_chunk_size`（默认 10）切连续
-块，第 i 块占对外集号 i，块内 1 集走单集规则、≥2 集是合并集。改这个值后，下一次重建
-`emby_item`（同步完成 / 首播回填）即生效，旧 id 随即 404；不需要人工编排。
+块，第 i 块占对外集号 i，块内 1 集走单集规则、≥2 集是合并集。库里只存原始集，分块在
+每次读取时按当前 N 现算：改这个值后**不需要同步、不需要重建**，下一次列举 / 播放就是新
+分块，旧 id 随即 404（ADR-0014）；不需要人工编排。
 
 ## 管理界面
 
@@ -253,10 +254,11 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
   - `docs/adr/0010-auto-merge-chunking.md` — 合并集自动分块、手工编排移除
   - `docs/adr/0012-jellyfin-libraries.md` — Jellyfin 一分类一库、自管判定、只增不删
   - `docs/adr/0013-drop-directory-shard-layer.md` — 去掉分片目录层、单目录子项上限实测
+  - `docs/adr/0014-runtime-derived-emby-items.md` — 合并集只在运行时派生、删除 `emby_item` 表
   - `docs/adr/0008-image-publish.md` — 镜像发布口径：ghcr、双架构、ci 绿才发、`latest` 跟 main
 
 ## 状态
 
-实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、按 `merge_chunk_size` 自动分块与派生表重建齐备。R1（管理界面两页）已实现：剧目增删、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
+实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、按 `merge_chunk_size` 的运行时自动分块齐备（ADR-0014）。R1（管理界面两页）已实现：剧目增删、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
 
 设计基线见 MKACG-580 附件 `DESIGN-drama-hub.md`。
