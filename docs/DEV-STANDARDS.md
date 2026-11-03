@@ -72,7 +72,7 @@ application/json; charset=utf-8`，body 固定为 `{"code":"<kind>","message":"<
 - 时间统一存 UTC 的 RFC3339 文本（列类型是不透明 `TEXT`，`空串 = 还没发生过`）；展示时区转换在 Web 层做。只有 `schema_migrations.applied_at` 是 `TIMESTAMPTZ`（runner 自己的时间）。
 - store 用哨兵错误表达结果：查询/删除无行返回 `ErrNotFound`，唯一/主键约束冲突（SQLSTATE `23505`）由 `wrapWriteErr` 统一映射为 `ErrConflict`（均可 `errors.Is` 判断），不向调用方泄漏裸 `*pgconn.PgError`。
 - `drama` / `episode` 的写入一律 upsert：`drama` 以 `(provider, provider_id)`、`episode` 以 `(drama_id, ep_no)` 为幂等身份，冲突时只更新可变业务列，身份列与入参 `id` 被忽略，返回行 id。其中 `episode.duration_sec` 只在插件给了非零值时覆盖，否则保留库里已有的值 —— 上游批量拿不到时长（恒 0），首播建索引回填的实测值不能被下一轮刷新清零。
-- 删剧走 `drama → episode` 的 `ON DELETE CASCADE` 连带删集（PostgreSQL 外键默认强制，不需要连接参数），不影响其它剧目；`segment` 经 `episode` 级联一并删除。
+- `drama → episode` 与 `episode → segment` 都是 `ON DELETE CASCADE`（PostgreSQL 外键默认强制，不需要连接参数）；服务不提供删剧入口，该约束只保证库内引用完整性。
 - `segment` 表是「每集的分片索引」，由 `internal/segment` 索引任务整体重建：`ReplaceSegments` 一事务内先删后插（重复索引幂等、失败整体回滚），`ListSegments` 按 `start_sec` 升序（即片内序）；无行返回空切片而非 `ErrNotFound`（「还没索引」是正常状态，由分片端点按 503 处理）。
 - 跨行写入用 `Store.InTx`：同一事务内执行、失败整体回滚。事务内 `Store` 复用同一批读写方法；取数/网络请求必须在事务之外完成（长事务持行锁，会挡住同剧的其它写者）。
 - **写事务的锁序固定为「drama → 子表」**：任何按剧写入子表的事务，第一条写语句之前先 `lockDrama`（`SELECT … FOR UPDATE`，`internal/store/lock.go`），再动 `episode`。两条事务以相反顺序请求同两行即 40P01 死锁（一方被中止）：同步事务先锁 `drama`（`UpsertDrama`）再逐集锁 `episode`，所以首播回填必须先锁 `drama` 再 `UPDATE episode`。新增按剧写入的入口必须遵守，并用「外部持锁 + `FOR UPDATE NOWAIT` 探针」的测试钉住（`internal/store/crud_test.go` 的 `TestBackfillLocksDramaBeforeEpisode`）。
@@ -826,7 +826,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 ## 管理界面（internal/web）
 
-挂载点 `/`（装配根注册）。两页界面与管理 API 是同一个 handler：完整路径原样传入
+挂载点 `/`（装配根注册）。管理界面与管理 API 是同一个 handler：完整路径原样传入
 本包（ServeMux 不剥前缀），未登记路径由本包 mux 返回 404 —— 「未知路径 → 404」
 的语义不变，只是兜底者从顶层 mux 换成 web 的 mux。`/webdav/`、`/s/` 的 pattern 比
 `/` 更具体，不受影响。
@@ -835,8 +835,11 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 
 | 路径 | 页面 | 能干的事 |
 |---|---|---|
-| `/` | 剧目 | 按上游剧 id 或 `/player/<id>` 链接同步入库；删剧目（级联删集、对外集号） |
-| `/status` | 同步与缓存 | 同步计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / `strm_prefix` / 缓存上限与保留期 / 刷新间隔 → `PATCH /api/settings`，每项标签写着生效时机）、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、**Jellyfin 媒体库**（5 个配置输入 + 「同步媒体库」按钮 + 现状表：状态/地址/库根/前缀/API key 是否已设置/上次同步与错误/孤儿库/冲突库）、运行配置现状（密钥只报「是否已设置」，**每行带「生效时机」列**）。缓存面字段（`mode` / `max_size` / …）是 ADR-0004 遗留，已在 MKACG-616 删除 |
+| `/`、`/status` | 同步与缓存 | 同步计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / `strm_prefix` / 缓存上限与保留期 / 刷新间隔 → `PATCH /api/settings`，每项标签写着生效时机）、各播放源状态（是否启用、正在刷新、上次运行/上次成功/上次错误/下次计划、生效的 `base_url` 与超时、停用原因）、手动「立即刷新」、**Jellyfin 媒体库**（5 个配置输入 + 「同步媒体库」按钮 + 现状表：状态/地址/库根/前缀/API key 是否已设置/上次同步与错误/孤儿库/冲突库）、运行配置现状（密钥只报「是否已设置」，**每行带「生效时机」列**）。缓存面字段（`mode` / `max_size` / …）是 ADR-0004 遗留，已在 MKACG-616 删除 |
+
+剧目页已在 MKACG-665 删除（人工按剧查看/删除不再需要，对外集号由 `emby_item` 派生并
+按 `merge_chunk_size` 自动切块）：`/` 直接就是这一页，`/status` 保留为稳定链接；单剧补录
+走 `POST /api/dramas`。
 
 模板 `templates/*.html` 与 `static/app.css`、`static/app.js` 用 `//go:embed` 进二进制：
 界面没有构建步骤、没有 `package.json`（ADR-0002）。页面 JS 只调下面这些 API，渲染结果
@@ -848,8 +851,6 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 |---|---|---|
 | `/api/dramas` | GET | 剧目列表：drama 行 + `episodes` / `emby_items`（对外集数，运行时派生）计数 |
 | `/api/dramas` | POST | 新增剧目：`{"series_id":"<上游剧 id 或 /player/ 链接>"}`，同步入库后返回整份列表：**库里新建了行 → 201，这部剧已存在（这次只更新）→ 200** |
-| `/api/dramas/{id}` | DELETE | 删剧目（级联删集与对外集号），204；不存在 404 |
-| `/api/dramas/{id}/episodes` | GET | 该剧全部集（`ep_no` 升序）；只回库里的字段（直链不落库，没有 `has_play_url`） |
 | `/api/refresh` | POST | 手动跑一轮：`{"source":"web"}` → 202 已启动 / 404 无此源或未启用 / 409 该源正在跑（与定时共用单飞锁） |
 | `/api/status` | GET | 同步计数 + 运行配置（`strm_prefix` / `cache_dir` / `merge_chunk_size` / `cache_max_mb` / `cache_lru_days` / `refresh_interval_sec` / `refresh_batch` / `refresh_timeout_sec` 现读；密钥只报 `*_set`；`admin_token_set` 报写操作能不能用）+ 各播放源状态（含调度字段 `running` / `last_run_at` / `last_ok_at` / `last_error` / `interval_sec` / `next_due_at`；构造期项旁的 `base_url_effective` / `request_timeout_sec_effective` 是启动时注入、正在生效的值，`restart_required` 标出「改了还没重启」）+ `jellyfin` 块 = 媒体库维护现状（`configured` / `missing[]` / `url` / `library_root` / `library_prefix` / `api_key_set` / `timeout_sec` / `running` / `last_run_at` / `last_ok_at` / `last_error` / `created` / `unchanged` / `removed` / `duration_ms` / `uncertain` / `orphans[]` / `conflicts[]`，运行中另有 `started_at` / `phase` / `phase_label` / `processed` / `total` 进度字段；**api key 永不出现在响应里**，只给 `api_key_set`） |
 | `/api/settings` | PATCH | 按 key 批量写配置：`{"settings":{"<key>":"<原始值>",…}}` → 200 + **归一化后的值**（`strm_prefix` 去尾 `/`；`webdav_pass` / `stream_secret` 回 `null`，不回显）。未知键 / 非法值 → 400 且**整批一行不写**；`{"settings":{}}` → 400。值一律写成字符串（数字/布尔也写成 `"4096"` / `"false"`），校验只有服务端那一份。写操作要令牌，见下「写操作鉴权」 |
@@ -866,16 +867,16 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 - **同步失败统一 502**（数据源在远端，失败几乎总是上游/页面结构问题），错误原因进响应体；
   provider 的错误文本不含直链与签名。
 - **业务规则不复制到本包**：分块规则（连续切片、单集/合并集判定、uid 形态）全部在
-  `internal/store/merge.go`，本包只做 `store.ErrNotFound` → 404 的映射（settings
-  的非法值走 `store.ErrInvalidSetting`，由 `mapSettingErr` → 400）。
+  `internal/store/merge.go`；settings 的非法值走 `store.ErrInvalidSetting`，由
+  `mapSettingErr` → 400。
 - **计数不做 N+1**：`store.ListDramaStats` 一条聚合查询取全库（标量子查询，不用多表
   JOIN，避免行数相乘）。
 
 ### 写操作鉴权（MKACG-622）
 
 `/api/` 的**读**操作维持无鉴权（单用户本机管理面；Emby 与页面都靠 GET 浏览），**写**操作
-（非 `GET` / `HEAD` / `OPTIONS` 即算写，含 `PUT`）一律要令牌 —— 在此之前 `POST /api/dramas` 能触发同步、
-`DELETE` 能删库，加写配置端点会同时放大这个风险。
+（非 `GET` / `HEAD` / `OPTIONS` 即算写，含 `PUT`）一律要令牌 —— 在此之前 `POST /api/dramas` 能触发同步，
+加写配置端点会同时放大这个风险。
 
 | 项 | 口径 |
 |---|---|
@@ -884,7 +885,7 @@ DEV-STANDARDS「代码组织」），生产实现是 `*vfs.Tree`，单测注入 
 | 未设令牌 | 所有写端点 **401（fail closed）**：没配 ≠ 不设防，否则新部署会悄悄裸奔。状态页显示「未设置 `DRAMA_HUB_ADMIN_TOKEN`，后台改配置不可用」并禁用保存；`/api/status` 的 `admin_token_set` 报有没有配（不报值） |
 | 令牌不符 / 缺失 | 401，`message` 说明缺哪个请求头 |
 | 范围 | 按「方法 + `/api/` 前缀」判定（`Server.ServeHTTP` 里的闸门）：新增写端点默认受保护，不需要逐个登记 |
-| 不受影响 | `GET /api/*`、两页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
+| 不受影响 | `GET /api/*`、单页界面、`/webdav/`（Basic 认证）、`/video/`（HMAC 签名）各按自己的口径 |
 | 页面怎么带 | 顶栏「管理令牌」输入框 → `sessionStorage`（关掉标签页就没了）；`app.js` 对非 GET 请求自动加这个头。令牌不进任何页面响应、不进日志 |
 
 ### Jellyfin 媒体库（ADR-0012）

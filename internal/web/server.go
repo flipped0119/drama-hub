@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -45,7 +44,7 @@ type Source struct {
 	BootRequestTimeoutSec int    // 启动时注入插件的出站超时（秒）
 }
 
-// Server 汇总管理 API 与两页管理界面。它实现 http.Handler，由 cmd 挂到 `/` 上；
+// Server 汇总管理 API 与管理界面。它实现 http.Handler，由 cmd 挂到 `/` 上；
 // 完整路径（含 `/api` 前缀）原样传到本包，ServeMux 不剥前缀。
 type Server struct {
 	st       *store.Store
@@ -83,7 +82,7 @@ type Schedule interface {
 // （装配根按注册表给，空表示没有源）；adminToken 是写操作的令牌
 // （`DRAMA_HUB_ADMIN_TOKEN`，空 = 没配 = 写操作一律 401）；logger 用于请求与同步日志。
 //
-// 路由分两类：两页界面（`/`、`/status` 与内嵌的 `/static/`）与管理 API
+// 路由分两类：管理界面（`/`、`/status` 与内嵌的 `/static/`）与管理 API
 // （`/api/` 子树）。不注册 catch-all：未登记路径由 ServeMux 兜底 404，
 // 这是「未知路径 → 404」的前提（cmd 的装配注释同此约定）。
 //
@@ -103,15 +102,14 @@ func NewServer(st *store.Store, settings *store.Settings, syncer SeriesSyncer, s
 	}
 
 	// 页面与静态资源：模板与 CSS/JS 随二进制嵌入（ADR-0002，无构建步骤）。
-	s.mux.HandleFunc("GET /{$}", s.handleDramasPage)
+	// 剧目页删除后 `/` 就是同步与缓存页（MKACG-665）；`/status` 是稳定链接。
+	s.mux.HandleFunc("GET /{$}", s.handleStatusPage)
 	s.mux.HandleFunc("GET /status", s.handleStatusPage)
 	s.mux.HandleFunc("GET /static/{file}", s.handleStatic)
 
-	// 管理 API：路径即契约，页面 JS 只调这些端点（见 docs/DEV-STANDARDS.md）。
+	// 管理 API：路径即契约，页面 JS 与脚本只调这些端点（见 docs/DEV-STANDARDS.md）。
 	s.mux.HandleFunc("GET /api/dramas", s.handleListDramas)
 	s.mux.HandleFunc("POST /api/dramas", s.handleCreateDrama)
-	s.mux.HandleFunc("DELETE /api/dramas/{id}", s.handleDeleteDrama)
-	s.mux.HandleFunc("GET /api/dramas/{id}/episodes", s.handleListEpisodes)
 	s.mux.HandleFunc("POST /api/refresh", s.handleRefresh)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
 	s.mux.HandleFunc("PATCH /api/settings", s.handlePatchSettings)
@@ -131,7 +129,7 @@ const AdminTokenHeader = "X-Admin-Token"
 // ServeHTTP 实现 http.Handler。
 //
 // 写操作（非 GET/HEAD/OPTIONS）在分派前先验管理令牌：`/api/` 原本完全无鉴权，
-// `POST /api/dramas` 能触发同步、`DELETE` 能删库，加写配置端点会同时放大它。
+// `POST /api/dramas` 能触发同步，加写配置端点会同时放大它。
 // 读操作维持现状（单用户本机管理面，Emby 与页面都靠 GET 浏览）。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isAdminWrite(r.Method, r.URL.Path) && !s.adminAuthorized(r) {
@@ -202,26 +200,4 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return fmt.Errorf("%w: 请求体不是合法 JSON: %v", httpx.ErrInvalid, err)
 	}
 	return nil
-}
-
-// pathID 解析路径里的数字主键，非正整数归为 httpx.ErrInvalid（400）。
-func pathID(r *http.Request, name string) (int64, error) {
-	raw := r.PathValue(name)
-	id, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || id <= 0 {
-		return 0, fmt.Errorf("%w: %s=%q 不是正整数", httpx.ErrInvalid, name, raw)
-	}
-	return id, nil
-}
-
-// mapStoreErr 把 store 的哨兵接到 httpx 的传输层类别：ErrNotFound → 404，
-// 其余原样返回（StatusCode 兜底 500）。
-//
-// store 的入参校验哨兵是 ErrInvalidSetting（settings 自己的那一套），由
-// mapSettingErr 处理，不经过这里。
-func mapStoreErr(err error) error {
-	if errors.Is(err, store.ErrNotFound) {
-		return fmt.Errorf("%w: %v", httpx.ErrNotFound, err)
-	}
-	return err
 }

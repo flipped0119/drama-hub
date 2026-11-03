@@ -242,9 +242,6 @@ input:hover, select:hover { border-color: var(--ink-faint); }
 
 .mono { font-family: var(--mono); font-size: 12.5px; color: var(--ink-soft); }
 
-.title-cell { display: flex; flex-direction: column; gap: 2px; }
-.title-cell .sub { font-family: var(--mono); font-size: 11.5px; color: var(--ink-faint); }
-
 .tag {
   display: inline-block;
   font: 11px/1.6 var(--mono);

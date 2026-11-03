@@ -27,9 +27,9 @@
 6. **settings**：非法值（越界、非数字）→ `400` 且不写入；合法值生效且下次读回一致。
    `PATCH /api/settings` 的批量写入（MKACG-622）：整批里有未知键或非法值时**一行都不写**；
    写进去的值返回归一化后的形态（`strm_prefix` 去尾 `/`）、密码与密钥回 `null` 不回显。
-6b. **写操作令牌**（MKACG-622）：`POST` / `DELETE` / `PATCH /api/*` 无令牌、错令牌都 `401`
+6b. **写操作令牌**（MKACG-622）：`POST` / `PATCH /api/*`（含未登记的写方法，如 `PUT`）无令牌、错令牌都 `401`
    且不产生副作用（没触发同步、没写库）；没配 `DRAMA_HUB_ADMIN_TOKEN` 时同样 `401`（fail
-   closed）；`GET /api/*` 与两页界面不受影响；令牌本身不出现在任何响应体里。
+   closed）；`GET /api/*` 与单页界面不受影响；令牌本身不出现在任何响应体里。
 7. **env 引导配置**（MKACG-616）：空库 + `DRAMA_HUB_STREAM_SECRET` / `DRAMA_HUB_CACHE_DIR`
    写入 settings；再跑一次不覆盖手改值；env 缺省不写空值；非法值（短 secret）不落库、
    不 panic；WebDAV 两个凭据 env **不写库**，并按未知变量 warn 列出支持的键。

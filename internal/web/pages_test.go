@@ -64,17 +64,19 @@ func isElement(n *html.Node, tag string) bool {
 	return n.Type == html.ElementNode && n.Data == tag
 }
 
-// TestPages 覆盖两页界面的契约：200 + text/html + 精确 Content-Length，
-// body[data-page] 与页面一致（JS 靠它分派），导航两个链接齐全且只有当前页带
-// aria-current。
+// TestPages 覆盖管理界面的契约：200 + text/html + 精确 Content-Length，
+// body[data-page] 与页面一致（JS 靠它分派），导航只剩实际存在的页面且带 aria-current。
+//
+// 剧目页已删除（MKACG-665）：`/` 与 `/status` 都是同步与缓存页，页面上不该再残留
+// 剧目列表的表单与表格元素。
 func TestPages(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 	cases := []struct{ path, page string }{
-		{"/", "dramas"},
+		{"/", "status"},
 		{"/status", "status"},
 	}
 	for _, c := range cases {
-		t.Run(c.page, func(t *testing.T) {
+		t.Run(c.path, func(t *testing.T) {
 			rec := do(t, srv, http.MethodGet, c.path, "")
 			if rec.Code != http.StatusOK {
 				t.Fatalf("GET %s 状态码 = %d, 期望 200", c.path, rec.Code)
@@ -95,6 +97,13 @@ func TestPages(t *testing.T) {
 				t.Errorf("body[data-page] = %q, 期望 %q", got, c.page)
 			}
 
+			// 剧目页的列表与表单元素一个都不该留下（AC1）。
+			for _, id := range []string{"drama-form", "dramas", "dramas-empty"} {
+				if findNode(doc, func(n *html.Node) bool { return attrOf(n, "id") == id }) != nil {
+					t.Errorf("页面残留剧目页元素 #%s", id)
+				}
+			}
+
 			nav := findNode(doc, func(n *html.Node) bool { return isElement(n, "nav") && hasClass(n, "tabs") })
 			if nav == nil {
 				t.Fatal("页面没有导航")
@@ -111,7 +120,7 @@ func TestPages(t *testing.T) {
 					current = href
 				}
 			}
-			want := []string{"/", "/status"}
+			want := []string{"/status"}
 			if len(hrefs) != len(want) {
 				t.Fatalf("导航链接 = %v, 期望 %v", hrefs, want)
 			}
@@ -120,8 +129,8 @@ func TestPages(t *testing.T) {
 					t.Errorf("导航第 %d 项 = %q, 期望 %q", i, hrefs[i], want[i])
 				}
 			}
-			if current != c.path {
-				t.Errorf("当前页高亮 = %q, 期望 %q", current, c.path)
+			if current != "/status" {
+				t.Errorf("当前页高亮 = %q, 期望 %q", current, "/status")
 			}
 		})
 	}
@@ -175,7 +184,7 @@ func TestUnknownPaths(t *testing.T) {
 func TestStatusPageSettingsForm(t *testing.T) {
 	srv, _, _ := newTestServer(t)
 
-	// 顶栏令牌框在两页都有（写操作不止发生在 /status）。
+	// 顶栏令牌框在 `/` 与 `/status` 两个入口都有（写操作不止发生在 /status）。
 	for _, path := range []string{"/", "/status"} {
 		doc := parseDoc(t, do(t, srv, http.MethodGet, path, "").Body.Bytes())
 		if findNode(doc, func(n *html.Node) bool {

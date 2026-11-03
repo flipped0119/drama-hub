@@ -386,24 +386,6 @@ func TestParseMergedUID(t *testing.T) {
 	}
 }
 
-// AC：删剧级联清掉原始集（外键 ON DELETE CASCADE）；派生读不再有残留可查。
-func TestDeleteDrama_CascadesEpisodes(t *testing.T) {
-	ctx := context.Background()
-	db := newCRUDTestDB(t)
-	st := NewStore(db.DB)
-	did, _ := seedMergeDrama(t, st, 3)
-
-	if err := st.DeleteDrama(ctx, did); err != nil {
-		t.Fatalf("DeleteDrama: %v", err)
-	}
-	if n := countRows(t, db.DB, "episode"); n != 0 {
-		t.Errorf("删剧后 episode 残留 %d 行, 期望 0", n)
-	}
-	if items, err := st.ListEmbyItems(ctx, did); err != nil || len(items) != 0 {
-		t.Errorf("删剧后 ListEmbyItems = (%d 条, %v), 期望（0, nil）", len(items), err)
-	}
-}
-
 // AC：并发刷新与并发读取不产生重复对外集号。
 //
 // 读出路径只读、不写库：它必须能在 upsert 事务提交的任意时刻给出「当前」派生结果，

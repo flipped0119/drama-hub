@@ -61,11 +61,9 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/404/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/404/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
-| `/`、`/status` | GET | 200 | 管理界面两页：剧目 / 同步与缓存看板 |
+| `/`、`/status` | GET | 200 | 管理界面：同步与缓存看板（`/` 与 `/status` 是同一页的两个入口） |
 | `/static/app.css`、`/static/app.js` | GET | 200 | 内嵌样式与脚本（随二进制，无构建步骤） |
 | `/api/dramas` | GET / POST | 200 / 200·201 | 剧目列表（含计数）/ 按上游剧 id 同步入库：**新建 201、已存在（只更新）200** |
-| `/api/dramas/{id}` | DELETE | 204 | 删剧目（级联删集与对外集号） |
-| `/api/dramas/{id}/episodes` | GET | 200 | 该剧全部集（按 `ep_no` 升序） |
 | `/api/status` | GET | 200 | 同步计数、运行配置现状（含各键的现读值；密钥只报「是否已设置」）、各源调度状态、`jellyfin` 块（媒体库同步现状：配置、上次结果、运行中进度、孤儿库；API key 只报 `api_key_set`）、`admin_token_set`（写操作能不能用） |
 | `/api/jellyfin/libraries` | GET / POST | 200 / 202 / 400 / 401 / 409 | GET = 一轮媒体库同步的现状与进度（`running` / `phase_label` / `processed` / `total` / `started_at`；收尾后 `created` / `unchanged` / `removed` / `duration_ms`），页面每秒轮询它、不碰 drama 表；POST = 手动跑一轮：body 可省或 `{"prune":true}`（显式删自管孤儿库）；400 = 三项配置没配齐（点名缺哪个键），409 = 上一轮还在跑（接着 GET 看那一轮进度） |
 | `/api/settings` | PATCH | 200 / 400 / 401 | 按 key 批量写配置：`{"settings":{"<key>":"<值>"}}` → 归一化后的值；未知键 / 非法值 400 且整批不落库；写操作要 `X-Admin-Token` |
@@ -104,16 +102,15 @@ PTS（ADR-0011）。
 
 ## 管理界面
 
-两页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
+一页，纯 Go 模板 + 原生 JS，随二进制嵌入（没有 `package.json`、没有构建步骤）：
 
 | 页面 | 能干的事 |
 |---|---|
-| `/` 剧目 | 粘贴上游剧 id 或 `https://hongguoduanju.com/player/<id>` 链接同步入库；删剧目（连带集、对外集号） |
-| `/status` 同步与缓存 | 剧目/集/对外集计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / strm 前缀 / 缓存上限与保留期 / 合并分块集数 / 刷新间隔，直接写 `PATCH /api/settings`）、运行配置现状（密钥只显示是否已设置，每行标「生效时机」）、各源调度状态 |
+| `/`、`/status` 同步与缓存 | 剧目/集/对外集计数与最近同步时间、**后台配置表单**（WebDAV 账号密码 / strm 前缀 / 缓存上限与保留期 / 合并分块集数 / 刷新间隔，直接写 `PATCH /api/settings`）、运行配置现状（密钥只显示是否已设置，每行标「生效时机」）、各源调度状态 |
 
-页面里的每个操作都直接落到上面的 `/api/` 端点，渲染结果与 API 返回一致。写操作（同步 /
-删除 / 改配置）要先用顶栏的「管理令牌」填上 `DRAMA_HUB_ADMIN_TOKEN`，令牌只存在
-本标签页（`sessionStorage`）。
+单剧补录走 `POST /api/dramas`（curl，见下）。页面里的每个操作都直接落到上面的 `/api/`
+端点，渲染结果与 API 返回一致。写操作（同步 / 改配置）要先用顶栏的「管理令牌」填上
+`DRAMA_HUB_ADMIN_TOKEN`，令牌只存在本标签页（`sessionStorage`）。
 
 缓存由本服务自己负责（ADR-0007）：海报与分片落 `<cache_dir>`，按
 `cache_max_mb` / `cache_lru_days` 淘汰，规则见 `docs/CACHE-MODEL.md`；播放字节一律经本
@@ -122,7 +119,7 @@ PTS（ADR-0011）。
 状态页只展示真正参与运行的配置，缓存目录/上限/保留天数都在「运行配置」里。）
 
 ```bash
-open http://127.0.0.1:8080/            # 剧目（顶栏填管理令牌后才能同步/删除）
+open http://127.0.0.1:8080/            # 状态页（顶栏填管理令牌后才能同步/改配置）
 curl -i -X POST -H 'Content-Type: application/json' \
   -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
   -d '{"series_id":"7503745441910017049"}' http://127.0.0.1:8080/api/dramas
@@ -265,6 +262,6 @@ podman 6 会把短名当远程仓库去解析，因此镜像名一律用全限�
 
 ## 状态
 
-实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、按 `merge_chunk_size` 的运行时自动分块齐备（ADR-0014）。R1（管理界面两页）已实现：剧目增删、同步与缓存看板都接真实 API。真机验收（P2–P5）待跑。
+实现中，分阶段推进：P1 数据与管理面 → P2 WebDAV+NFO → P3 单集出流 → P4 缓存 → P5 合并集 → P6 App 回退 → P7 缓存观测。M7（合并集）已实现：playlist 生成、跨集时间轴、按 `merge_chunk_size` 的运行时自动分块齐备（ADR-0014）。R1（管理界面）已实现：同步与缓存看板接真实 API。真机验收（P2–P5）待跑。
 
 设计基线见 MKACG-580 附件 `DESIGN-drama-hub.md`。

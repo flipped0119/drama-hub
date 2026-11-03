@@ -14,7 +14,7 @@ import (
 // dramaView 是一部剧在管理面上的视图：drama 行 + 派生计数。
 //
 // episode_total 是上游声明的集数，episodes 是库里真实落库的集数（两者不等说明
-// 上一次同步不完整，列表页直接并排显示）。
+// 上一次同步不完整，管理 API 直接并排返回）。
 type dramaView struct {
 	ID           int64  `json:"id"`
 	Title        string `json:"title"`
@@ -27,24 +27,9 @@ type dramaView struct {
 	SyncAt       string `json:"sync_at"`
 }
 
-// dramaList 是剧目列表的响应体；GET 与 POST 返回同一形态，页面直接套用。
+// dramaList 是剧目列表的响应体；GET 与 POST 返回同一形态，调用方直接套用。
 type dramaList struct {
 	Dramas []dramaView `json:"dramas"`
-}
-
-// episodeView 是一集的视图。只剩库里的字段：直链不落库（0004 已删 play_url），
-// 「能不能播」由 /video 请求时向插件解析，管理面不冒充知道。
-type episodeView struct {
-	ID          int64  `json:"id"`
-	EpNo        int    `json:"ep_no"`
-	Title       string `json:"title"`
-	DurationSec int    `json:"duration_sec"`
-	Vid         string `json:"vid"`
-}
-
-// episodeList 是某剧集列表的响应体。
-type episodeList struct {
-	Episodes []episodeView `json:"episodes"`
 }
 
 // dramaViews 拼装剧目列表：一次 ListDramas + 一次 ListDramaStats，不做 N+1。
@@ -101,7 +86,7 @@ func (s *Server) handleListDramas(w http.ResponseWriter, r *http.Request) {
 // 调用方说了假话 —— 所以先查一次是否存在，再决定同步后回哪个码。判断留在本包，
 // 不下沉到 store（那层随后要整体重写）。
 //
-// 成功返回整份剧目列表，页面直接套用。
+// 成功返回整份剧目列表。
 func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		SeriesID string `json:"series_id"`
@@ -136,51 +121,6 @@ func (s *Server) handleCreateDrama(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	writeJSON(w, status, dramaList{Dramas: views})
-}
-
-// handleDeleteDrama 处理 DELETE /api/dramas/{id}：删剧连带删集与派生表
-// （schema 的 ON DELETE CASCADE）。不存在返回 404。
-func (s *Server) handleDeleteDrama(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r, "id")
-	if err != nil {
-		httpx.WriteError(w, err)
-		return
-	}
-	if err := s.st.DeleteDrama(r.Context(), id); err != nil {
-		httpx.WriteError(w, mapStoreErr(err))
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// handleListEpisodes 处理 GET /api/dramas/{id}/episodes：返回该剧的全部集
-// （按 ep_no 升序）。剧不存在返回 404。
-func (s *Server) handleListEpisodes(w http.ResponseWriter, r *http.Request) {
-	id, err := pathID(r, "id")
-	if err != nil {
-		httpx.WriteError(w, err)
-		return
-	}
-	if _, err := s.st.DramaByID(r.Context(), id); err != nil {
-		httpx.WriteError(w, mapStoreErr(err))
-		return
-	}
-	eps, err := s.st.ListEpisodes(r.Context(), id)
-	if err != nil {
-		httpx.WriteError(w, err)
-		return
-	}
-	out := make([]episodeView, 0, len(eps))
-	for _, ep := range eps {
-		out = append(out, episodeView{
-			ID:          ep.ID,
-			EpNo:        ep.EpNo,
-			Title:       ep.Title,
-			DurationSec: ep.DurationSec,
-			Vid:         ep.Vid,
-		})
-	}
-	writeJSON(w, http.StatusOK, episodeList{Episodes: out})
 }
 
 // normalizeSeriesID 把管理面的输入归一为上游剧 id：裸 id（纯数字）或
