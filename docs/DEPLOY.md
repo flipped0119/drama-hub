@@ -148,6 +148,62 @@ Emby 库路径指到 `/mnt/dramahub`，类型「电视节目」。
 `PROPFIND` 只支持 `Depth: 0/1`（数值深度 ≥2 由 `x/net/webdav` 回 400），rclone 与 Emby
 本来都是逐层扫，不是缺陷。
 
+## 5b. 接 Jellyfin：一分类一媒体库（ADR-0012）
+
+Jellyfin 只把**库根的直接子目录**当剧集。库根挂在挂载根上时，分类目录会变成 Series、
+剧目录退化成普通目录（本部署实测：59 个分类成了 59 部 Series、1436 个剧目录失效）。
+所以库根必须收窄到 `<挂载根>/<分类>`，由本服务一个分类建一个库。
+
+三步，缺一步库就是空的：
+
+1. **网络可达**：本服务容器要能连到 Jellyfin 的 HTTP 面。两者不在同一个 docker 网络时
+   `jellyfin_url` 只能填两者都可达的地址（本部署实测 `http://jellyfin:8096` 在
+   drama-hub 容器内解析失败，`https://jellyfin.<域名>` 可用）；要么把 drama-hub 接进
+   Jellyfin 所在的网络。
+2. **建 API key**：Jellyfin 控制台 → 管理 → API 密钥 → 新建。12.1 只认
+   `Authorization: MediaBrowser Token="…"`（`X-Emby-Token` 已停用），本服务自动用它。
+3. **库根填 Jellyfin 容器内的路径**（看挂载，不看宿主）：本部署是
+   `/data/video/dramahub`（宿主 `/vol1/1000/Media/dramahub`）。填成宿主路径或本服务的
+   挂载点时，Jellyfin 建出来的库是空的。
+
+```bash
+TOKEN=<DRAMA_HUB_ADMIN_TOKEN>
+curl -sS -X PATCH -H "X-Admin-Token: $TOKEN" -H 'Content-Type: application/json' -d '{
+  "settings": {
+    "jellyfin_url": "https://jellyfin.example.com",
+    "jellyfin_api_key": "<Jellyfin API key>",
+    "jellyfin_library_root": "/data/video/dramahub"
+  }}' http://127.0.0.1:8080/api/settings
+
+# 手动跑一轮（同步轮末也会自动跑一次，幂等）
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H "X-Admin-Token: $TOKEN" \
+  http://127.0.0.1:8080/api/jellyfin/libraries      # 202 已派出 / 409 上一轮还在跑 / 400 没配齐
+
+# 结果：库数、上次新建、孤儿库、错误原因
+curl -sS http://127.0.0.1:8080/api/status | python3 -c \
+  'import json,sys; print(json.dumps(json.load(sys.stdin)["jellyfin"], ensure_ascii=False, indent=2))'
+
+# Jellyfin 侧直接核对（不需要 scanner 跑完）
+curl -sS -H "Authorization: MediaBrowser Token=\"<Jellyfin API key>\"" \
+  'http://<jellyfin>/Library/VirtualFolders' | python3 -c \
+  'import json,sys; [print(l["Name"], l["Locations"], l["CollectionType"]) for l in json.load(sys.stdin)]'
+```
+
+- **幂等**：再点一次是 0 新增、0 写请求（`created` 回到 0）。
+- **只增不删**：分类消失只列在 `orphans[]`，不删库。确认要删时显式带 `prune`：
+  `curl -X POST -H "X-Admin-Token: $TOKEN" -d '{"prune":true}' …/api/jellyfin/libraries`。
+  只删「名字带前缀 + 路径在库根下一层 + 分类已不存在」的库。
+- **失败隔离**：Jellyfin 停机时同步、WebDAV、播放都不受影响，原因只出现在
+  `/api/status` 的 `jellyfin.last_error` 与日志里。
+- **API key 不外泄**：`/api/status` 只给 `api_key_set`，日志与错误文本里没有 key。
+- **`failed[]` 是路径问题**：分类列在 `jellyfin.failed` 里 = Jellyfin 拒绝建这个库，实测
+  12.1 的原文是 `The specified path does not exist: <path>`。三个常见原因：目录还没被
+  rclone 刷出来（`--dir-cache-time`）、分类只存在于数据库而挂载上没有对应目录、
+  `jellyfin_library_root` 填错了一层。修好后下次同步会自动补上，不用清状态。
+- **库内是剧目录而不是分片目录**：这依赖**去掉分片层**（MKACG-651）先合入。分片层还在时
+  库根的直接子目录是 `00`–`7f`，Jellyfin 会把分片目录认成 Series、真剧目录退化成普通
+  目录 —— 本服务建库正确也照样如此（12.1 实测复现）。所以 651 必须先合并。
+
 ## 6. 播放面自检
 
 ```bash

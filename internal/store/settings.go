@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"path"
 	"slices"
 	"strconv"
 	"strings"
@@ -51,6 +52,14 @@ const (
 	KeyRefreshIntervalSec SettingKey = "refresh_interval_sec"
 	KeyRefreshBatch       SettingKey = "refresh_batch"
 	KeyRefreshTimeoutSec  SettingKey = "refresh_timeout_sec"
+	// Jellyfin 媒体库维护的五项（一分类一库，docs/adr/0012）：url / library_root /
+	// api_key 三项都非空即启用，没有单独的开关（多一个状态就多一种「显示已配置但不跑」）。
+	// 全部即时生效：每次触发都现读，改完点一次「同步媒体库」就是新配置在跑。
+	KeyJellyfinURL           SettingKey = "jellyfin_url"
+	KeyJellyfinAPIKey        SettingKey = "jellyfin_api_key"
+	KeyJellyfinLibraryRoot   SettingKey = "jellyfin_library_root"
+	KeyJellyfinLibraryPrefix SettingKey = "jellyfin_library_prefix"
+	KeyJellyfinTimeoutSec    SettingKey = "jellyfin_timeout_sec"
 )
 
 // 插件配置的项名（docs/PLUGIN-CONTRACT.md「配置」）。
@@ -357,6 +366,12 @@ const (
 	kindSecret                    // 至少 minSecretBytes 字节
 	kindInt                       // [min, max] 闭区间整数
 	kindBool                      // true / false
+	// kindToken 是「空 = 未配置，非空按原样存」的凭据（启用条件由消费方判三键非空）。
+	// 与 kindString 的差别只有一个：空串合法；与 kindSecret 的差别是长度不设下限
+	// （Jellyfin 的 key 是上游发的，长度不由本服务规定）。
+	kindToken // 空或非空字符串，属密钥（不回显）
+	// kindPath 是容器内绝对路径（以 `/` 开头、非 `/`、写入时去尾 `/`）；空 = 未配置。
+	kindPath
 )
 
 // settingSpec 是一个 key 的注册表条目。
@@ -409,6 +424,22 @@ func specFor(key SettingKey) (settingSpec, bool) {
 	case KeyRefreshTimeoutSec:
 		// 单轮预算（context.WithTimeout）。
 		return settingSpec{kind: kindInt, def: "900", min: 60, max: 86400}, true
+	case KeyJellyfinURL:
+		// Jellyfin 基址；空 = 关闭这一整段（它是三项启用条件之一）。
+		return settingSpec{kind: kindURL}, true
+	case KeyJellyfinAPIKey:
+		// 空 = 未配置。密钥只写不读：PATCH 回 null，/api/status 只给 api_key_set。
+		return settingSpec{kind: kindToken}, true
+	case KeyJellyfinLibraryRoot:
+		// Jellyfin 容器内看到的挂载根（不是宿主路径，也不是本服务的挂载点）。
+		return settingSpec{kind: kindPath}, true
+	case KeyJellyfinLibraryPrefix:
+		// 库名前缀：既用于命名，也是「哪些库归本服务管」的第一条判定。不接受空串 ——
+		// 空前缀会让所有库都算自管，prune 时可能删到别人的库。
+		return settingSpec{kind: kindString, def: "短剧 - "}, true
+	case KeyJellyfinTimeoutSec:
+		// 单次出站超时。http.Client 不设全局 Timeout，超时靠每次请求的 ctx（internal/jellyfin）。
+		return settingSpec{kind: kindInt, def: "10", min: 1, max: 60}, true
 	}
 	return pluginSpecFor(string(key))
 }
@@ -500,6 +531,23 @@ func parseSetting(key SettingKey, raw string) (any, error) {
 			return nil, fmt.Errorf("%w: %s 至少 %d 字节，实际 %d", ErrInvalidSetting, key, minSecretBytes, len(raw))
 		}
 		return raw, nil
+	case kindToken:
+		// 空串是合法值（= 未配置）。非空值去掉首尾空白后原样存：手抄 key 时最常见的
+		// 错误是带一个尾空格，那会让 Jellyfin 一直回 401，而现象看起来像「key 填对了」。
+		return strings.TrimSpace(raw), nil
+	case kindPath:
+		// 空 = 未配置。非空必须是绝对路径且不是根：`/` 当库根等于把整个挂载点建成一个库。
+		trimmed := strings.TrimRight(raw, "/")
+		if trimmed == "" {
+			if raw == "" {
+				return "", nil
+			}
+			return nil, fmt.Errorf("%w: %s 不能是根目录 /", ErrInvalidSetting, key)
+		}
+		if !path.IsAbs(trimmed) {
+			return nil, fmt.Errorf("%w: %s 必须是容器内绝对路径（以 / 开头）: %q", ErrInvalidSetting, key, raw)
+		}
+		return trimmed, nil
 	case kindString:
 		if raw == "" {
 			return nil, fmt.Errorf("%w: %s 不能为空", ErrInvalidSetting, key)

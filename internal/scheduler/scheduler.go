@@ -73,6 +73,11 @@ type Scheduler struct {
 
 	now  func() time.Time
 	poll time.Duration
+
+	// afterRound 是一轮收尾后的钩子（Jellyfin 建库），nil 表示没有。它在 saveState
+	// 之后调用，自己管上下文与超时，不延长这一轮的寿命、不改变 source_state；
+	// 钩子里的失败只在它自己的状态面可见（失败隔离，AC-6 / AC-10）。
+	afterRound func(context.Context)
 }
 
 // New 构造调度器。sources 决定调度的对象与顺序；每个源都必须在 syncers 里有对应
@@ -80,17 +85,21 @@ type Scheduler struct {
 // 起不来）。
 //
 // 不持有任何外部可变状态：配置每轮从 settings 现读，进度每轮写 source_state。
-func New(st *store.Store, settings *store.Settings, sources []plugin.Plugin, syncers map[string]Syncer, logger *slog.Logger) *Scheduler {
+//
+// afterRound 是一轮收尾后的钩子（可为 nil）：装配根用它挂 Jellyfin 建库，本包不认识
+// 那个包（领域包之间不互相 import）。
+func New(st *store.Store, settings *store.Settings, sources []plugin.Plugin, syncers map[string]Syncer, logger *slog.Logger, afterRound func(context.Context)) *Scheduler {
 	s := &Scheduler{
-		st:       st,
-		settings: settings,
-		sources:  sources,
-		syncers:  syncers,
-		logger:   logger,
-		locks:    make(map[string]*sync.Mutex, len(sources)),
-		running:  make(map[string]bool, len(sources)),
-		now:      time.Now,
-		poll:     maxPollInterval,
+		st:         st,
+		settings:   settings,
+		sources:    sources,
+		syncers:    syncers,
+		logger:     logger,
+		afterRound: afterRound,
+		locks:      make(map[string]*sync.Mutex, len(sources)),
+		running:    make(map[string]bool, len(sources)),
+		now:        time.Now,
+		poll:       maxPollInterval,
 	}
 	for _, p := range sources {
 		s.locks[p.Name()] = &sync.Mutex{}

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/justforlxz/drama-hub/internal/cache"
+	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/pgtest"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
@@ -63,9 +64,18 @@ func newAssembly(logger *slog.Logger, st *store.Store, settings *store.Settings,
 	if reg == nil {
 		reg = plugin.NewRegistry()
 	}
-	return newHandler(logger, st, settings, syncer, schedule, sources,
+	// 媒体库维护用一条与生产同形的装配：真 Manager + 未配置的 settings（三项都空）。
+	// 装配测试不触发它，只验证接线；触发路径与差异算法由 internal/jellyfin 覆盖。
+	// 树与 CoverCache 都只造一份：WebDAV 与 Jellyfin 建库共用同一棵树（分类口径只有一处）。
+	tree := vfs.NewTree(st, settings, signID, cache.NewCoverCache(st, settings, &http.Client{}, logger), logger)
+	jellyfinMgr := jellyfin.New(
+		func(ctx context.Context) (jellyfin.Config, error) { return readJellyfinConfig(ctx, settings) },
+		tree.CategoryDirs,
+		logger,
+	)
+	return newHandler(logger, st, settings, syncer, schedule, jellyfinMgr, sources,
 		cache.New(st, settings, logger), cache.NewCoverCache(st, settings, &http.Client{}, logger),
-		stream.NewResolver(st, reg), playbackHeaders(map[string]pluginBoot{}), testAdminToken)
+		stream.NewResolver(st, reg), tree, playbackHeaders(map[string]pluginBoot{}), testAdminToken)
 }
 
 // testAdminToken 是装配测试用的管理令牌：生产里来自 DRAMA_HUB_ADMIN_TOKEN。

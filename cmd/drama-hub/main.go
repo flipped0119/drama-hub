@@ -15,6 +15,7 @@ import (
 
 	"github.com/justforlxz/drama-hub/internal/cache"
 	"github.com/justforlxz/drama-hub/internal/httpx"
+	"github.com/justforlxz/drama-hub/internal/jellyfin"
 	"github.com/justforlxz/drama-hub/internal/plugin"
 	"github.com/justforlxz/drama-hub/internal/plugin/hongguo"
 	"github.com/justforlxz/drama-hub/internal/scheduler"
@@ -68,7 +69,23 @@ func main() {
 	sourcePlugins := pluginList(plugins)
 	syncers := newSyncers(sourcePlugins, covers, logger)
 	syncer := syncers[hongguo.Name]
-	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger)
+	// 虚拟文件树：WebDAV 面与 Jellyfin 建库共用同一份（无状态，构造一次即可）。分类
+	// 口径只有 vfs 根目录这一处，Jellyfin 不自己读 drama.genre。
+	tree := vfs.NewTree(st, settings, signID, covers, logger)
+
+	// Jellyfin 媒体库维护（一分类一库，ADR-0012）：配置走 settings，三项非空才启用；
+	// 不配就整段关闭（手动端点回 400，同步轮末钩子静默跳过）。它的失败只进自己的状态面，
+	// 不影响同步、WebDAV 与播放。
+	jellyfinMgr := jellyfin.New(
+		func(ctx context.Context) (jellyfin.Config, error) { return readJellyfinConfig(ctx, settings) },
+		tree.CategoryDirs,
+		logger,
+	)
+	// 轮末钩子：每轮同步收尾后跑一次 reconcile（幂等）。Start 只派 goroutine，不延长这一轮；
+	// 撞车（上一轮还在跑）或未配置时静默跳过。
+	sched := scheduler.New(st, settings, sourcePlugins, syncers, logger, func(ctx context.Context) {
+		_ = jellyfinMgr.Start(ctx, false)
+	})
 
 	// 本地缓存（海报/分片/索引）与播放面的直链解析都只有一份实例：请求路径与
 	// 淘汰循环共用同一个 *cache.Cache，直链解析共用同一个 *stream.Resolver。
@@ -89,8 +106,8 @@ func main() {
 	addr := envOr("DRAMA_HUB_ADDR", ":8080")
 	srv := &http.Server{
 		Addr: addr,
-		Handler: newHandler(logger, st, settings, syncer, sched, sourceList(plugins, boots), caches, covers, resolver,
-			playbackHeaders(boots), adminToken),
+		Handler: newHandler(logger, st, settings, syncer, sched, jellyfinMgr, sourceList(plugins, boots), caches, covers, resolver,
+			tree, playbackHeaders(boots), adminToken),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -114,6 +131,18 @@ func main() {
 		case <-schedulerDone:
 		case <-time.After(schedulerStopTimeout):
 			logger.Warn("调度器未在时限内退出", "timeout", schedulerStopTimeout)
+		}
+		// Jellyfin 的 reconcile goroutine 也归进程所有：等它把手上的建库发完再退出，
+		// 但不为它拖延关机（它的请求都有超时，进程退出也不会留下半截状态）。
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			jellyfinMgr.Wait()
+		}()
+		select {
+		case <-done:
+		case <-time.After(schedulerStopTimeout):
+			logger.Warn("jellyfin 媒体库同步未在时限内退出", "timeout", schedulerStopTimeout)
 		}
 	}()
 
@@ -174,17 +203,52 @@ func openDB(ctx context.Context, logger *slog.Logger) (*store.DB, error) {
 // playbackHeaders 是播放面取直链时 ffmpeg / ffprobe 要带的出站身份，两个通道各一份
 // （`名称: 值` 每项一行），由 main 从 pluginBoot 派生后传入（MKACG-624 / MKACG-638）：
 // 本函数不认识具体源。
-func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, playbackHeaders segment.Headers, adminToken string) http.Handler {
+func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, syncer web.SeriesSyncer, schedule web.Schedule, jellyfinMgr web.Jellyfin, sources []web.Source, caches *cache.Cache, covers *cache.CoverCache, resolver *stream.Resolver, tree *vfs.Tree, playbackHeaders segment.Headers, adminToken string) http.Handler {
 	cutter := segment.NewCutter(st, settings, logger, caches, resolver.Direct, playbackHeaders)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.Handle(webdav.MountPath, webdav.NewHandler(vfs.NewTree(st, settings, signID, covers, logger), settings, logger))
+	mux.Handle(webdav.MountPath, webdav.NewHandler(tree, settings, logger))
 	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)
-	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, sources, adminToken, logger))
+	mux.Handle("/", web.NewServer(st, settings, syncer, schedule, jellyfinMgr, sources, adminToken, logger))
 	return httpx.RequestLogger(logger, mux)
+}
+
+// readJellyfinConfig 现读 Jellyfin 的五项配置（键名与校验的真值都在 store 的注册表）。
+//
+// 三项启用条件（url / api_key / library_root）留空即关闭整段功能；前缀与超时有默认值。
+// 这里只做「读出来拼成 Config」，缺哪个键由 jellyfin.Config.Missing 判断 —— 装配根不
+// 复制一份「哪些键是必填」的规则。
+func readJellyfinConfig(ctx context.Context, settings *store.Settings) (jellyfin.Config, error) {
+	url, err := settings.String(ctx, store.KeyJellyfinURL)
+	if err != nil {
+		return jellyfin.Config{}, err
+	}
+	apiKey, err := settings.String(ctx, store.KeyJellyfinAPIKey)
+	if err != nil {
+		return jellyfin.Config{}, err
+	}
+	libraryRoot, err := settings.String(ctx, store.KeyJellyfinLibraryRoot)
+	if err != nil {
+		return jellyfin.Config{}, err
+	}
+	prefix, err := settings.String(ctx, store.KeyJellyfinLibraryPrefix)
+	if err != nil {
+		return jellyfin.Config{}, err
+	}
+	timeoutSec, err := settings.Int(ctx, store.KeyJellyfinTimeoutSec)
+	if err != nil {
+		return jellyfin.Config{}, err
+	}
+	return jellyfin.Config{
+		URL:         url,
+		APIKey:      apiKey,
+		LibraryRoot: libraryRoot,
+		Prefix:      prefix,
+		Timeout:     time.Duration(timeoutSec) * time.Second,
+	}, nil
 }
 
 // schedulerStopTimeout 是关闭时等调度器收尾的上限：手上的轮收到 ctx 取消后只剩
@@ -209,6 +273,7 @@ func pluginList(reg *plugin.Registry) []plugin.Plugin {
 // 封面出站的超时不在这里定型：cache 每次下载现读 settings 的 cover_timeout_sec
 // （MKACG-620）。它不跟插件超时走 —— 封面 URL 是上游页面里的三方 CDN 绝对地址
 // （`p3-novel.byteimg.com`），插件 base_url 与 request_timeout_sec 管不到这条出站；
+
 // client 因此不带 Timeout，超时由每次请求的 ctx 决定（DEV-STANDARDS「错误处理」）。
 func newSyncers(sources []plugin.Plugin, covers *cache.CoverCache, logger *slog.Logger) map[string]scheduler.Syncer {
 	out := make(map[string]scheduler.Syncer, len(sources))
