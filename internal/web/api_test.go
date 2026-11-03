@@ -304,53 +304,20 @@ func TestAPI_CreateDrama_SyncFails(t *testing.T) {
 	}
 }
 
-// TestAPI_DeleteDrama 覆盖删剧目：204、列表清空、级联删集、重复删除 404、坏 id 400。
-func TestAPI_DeleteDrama(t *testing.T) {
+// TestAPI_RemovedDramaEndpoints 覆盖「删剧目」与「集列表」两个端点随剧目页一起移除
+// （MKACG-665）：它们只服务已删除的页面，没有其它使用场景，于是退化成未登记路径（404）。
+func TestAPI_RemovedDramaEndpoints(t *testing.T) {
 	srv, st, _ := newTestServer(t)
-	id := seedDrama(t, st, "2002", "带删除的剧", []string{"a", "b"})
+	dramaID := seedDrama(t, st, "5005", "已删端点的剧", []string{"a", "b"})
+	base := "/api/dramas/" + strconv.Itoa(int(dramaID))
 
-	rec := do(t, srv, http.MethodDelete, "/api/dramas/"+strconv.Itoa(int(id)), "")
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("状态码 = %d, 期望 204", rec.Code)
-	}
-	eps, err := st.ListEpisodes(context.Background(), id)
-	if err != nil {
-		t.Fatalf("ListEpisodes: %v", err)
-	}
-	if len(eps) != 0 {
-		t.Errorf("删除后仍有 %d 集, 期望级联清空", len(eps))
-	}
-	if got := decode[dramaList](t, do(t, srv, http.MethodGet, "/api/dramas", "")); len(got.Dramas) != 0 {
-		t.Errorf("列表仍有 %d 部剧", len(got.Dramas))
-	}
-
-	if rec := do(t, srv, http.MethodDelete, "/api/dramas/"+strconv.Itoa(int(id)), ""); rec.Code != http.StatusNotFound {
-		t.Errorf("重复删除状态码 = %d, 期望 404", rec.Code)
-	}
-	if rec := do(t, srv, http.MethodDelete, "/api/dramas/abc", ""); rec.Code != http.StatusBadRequest {
-		t.Errorf("坏 id 状态码 = %d, 期望 400", rec.Code)
-	}
-}
-
-// TestAPI_Episodes 覆盖集列表：按 ep_no 升序、只回库里的字段。
-func TestAPI_Episodes(t *testing.T) {
-	srv, st, _ := newTestServer(t)
-	id := seedDrama(t, st, "3003", "选集的剧", []string{"a", "b", "c"})
-
-	got := decode[episodeList](t, do(t, srv, http.MethodGet, "/api/dramas/"+strconv.Itoa(int(id))+"/episodes", ""))
-	if len(got.Episodes) != 3 {
-		t.Fatalf("集数 = %d, 期望 3", len(got.Episodes))
-	}
-	for i, ep := range got.Episodes {
-		if ep.EpNo != i+1 {
-			t.Errorf("第 %d 项 ep_no = %d", i, ep.EpNo)
+	for _, c := range []struct{ method, path, body string }{
+		{http.MethodDelete, base, ""},
+		{http.MethodGet, base + "/episodes", ""},
+	} {
+		if rec := do(t, srv, c.method, c.path, c.body); rec.Code != http.StatusNotFound {
+			t.Errorf("%s %s 状态码 = %d, 期望 404（端点已移除）", c.method, c.path, rec.Code)
 		}
-		if ep.Vid != []string{"a", "b", "c"}[i] {
-			t.Errorf("ep_no=%d vid = %q", ep.EpNo, ep.Vid)
-		}
-	}
-	if rec := do(t, srv, http.MethodGet, "/api/dramas/99999/episodes", ""); rec.Code != http.StatusNotFound {
-		t.Errorf("不存在的剧状态码 = %d, 期望 404", rec.Code)
 	}
 }
 

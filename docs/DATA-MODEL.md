@@ -304,9 +304,9 @@ CREATE INDEX IF NOT EXISTS idx_drama_genre_title ON drama (genre, title);
 | 源里剧目标题/简介/封面/标签变化 | 覆盖 | 上游是真值 |
 | 源里集数变少 | **不删任何 `episode` 行**，只更新 `episode_total` | 删集会让分块边界前移、把已看过的集重新编号（旧 id 全失效）；少集的剧在 Emby 里多出几集，比整部重排轻 |
 | 源里剧目消失（下架） | **不删 `drama` 行**，只在 `source_state.last_error` / 日志里留痕 | 同上；且 sitemap 会滞后（实测最新 53 部缺失），把「枚举不到」当「下架」会误删正在上架的剧 |
-| 用户显式删剧 | `DELETE FROM drama`（现有 `DeleteDrama`，级联删集与对外集号） | 唯一删除入口 |
 
-一句话：**自动流程只增改，删除只能由人发起。**
+一句话：**自动流程只增改，不删除；服务也不提供删剧入口（MKACG-665 移除了
+`DELETE /api/dramas/{id}` 与 `store.DeleteDrama`）。**
 
 ## 0002 的 dry-run 验证（历史记录，SQLite 时代）
 

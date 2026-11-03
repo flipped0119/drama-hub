@@ -54,7 +54,7 @@ type dbtx interface {
 // Store 是 drama / episode 两张表的读写入口。
 //
 // 与 Settings 同构：构造注入 *sql.DB、不缓存。drama 与 episode 的读写天生跨表
-// （删剧级联、M2 批量入库、M3 一次枚举剧与集），因此共用一个 receiver。
+// （M2 批量入库、M3 一次枚举剧与集），因此共用一个 receiver。
 type Store struct {
 	db   dbtx
 	root *sql.DB // 只有根 Store 非 nil；InTx 用它开事务
@@ -193,24 +193,6 @@ func (s *Store) ListDramas(ctx context.Context) ([]Drama, error) {
 		return nil, fmt.Errorf("遍历剧目: %w", err)
 	}
 	return out, nil
-}
-
-// DeleteDrama 删除一部剧，其 episode 由 schema 的 ON DELETE CASCADE 一并删除。
-//
-// 级联依赖 foreign_keys=ON，由 Open 的 DSN 施加。无行受影响返回 ErrNotFound。
-func (s *Store) DeleteDrama(ctx context.Context, id int64) error {
-	res, err := s.db.ExecContext(ctx, `DELETE FROM drama WHERE id = $1`, id)
-	if err != nil {
-		return wrapWriteErr("删除剧目", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("删除剧目 id=%d: %w", id, err)
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
 }
 
 // ExistingProviderIDs 返回某个源已在库的 provider_id 集合。

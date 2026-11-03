@@ -14,7 +14,6 @@ import (
 //
 //	同步完成    UpsertDrama（锁 drama）→ 逐集 UpsertEpisode
 //	首播回填    lockDrama → UPDATE episode
-//	删剧        DELETE drama（锁 drama）→ 级联删子表
 //
 // 新增任何「按剧写入子表」的事务都必须先调用它。文档见 docs/DEV-STANDARDS.md
 // 「数据库」；锁序由外部持锁 + NOWAIT 探针的测试钉住

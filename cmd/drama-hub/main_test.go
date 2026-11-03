@@ -166,7 +166,7 @@ func TestHandler_RetiredPlaybackPaths(t *testing.T) {
 	}
 }
 
-// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理面的两页与 `/api/` 都挂在
+// TestHandler_ManagementSurface 覆盖 R1 的装配面：管理界面（`/` 与 `/status`）与 `/api/` 都挂在
 // 装配根的 `/` 上（不是 404、不是 501），未登记路径仍由 web 的 mux 兜底 404。
 func TestHandler_ManagementSurface(t *testing.T) {
 	h := newTestHandler(t)

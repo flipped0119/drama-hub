@@ -314,43 +314,6 @@ func TestListEpisodesOrder(t *testing.T) {
 	}
 }
 
-// AC7：删剧级联删集、不影响其它剧；重复删报 ErrNotFound。
-func TestDeleteDramaCascades(t *testing.T) {
-	s := NewStore(newCRUDTestDB(t).DB)
-	ctx := context.Background()
-
-	idA, err := s.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "a", Title: "剧A"})
-	if err != nil {
-		t.Fatalf("UpsertDrama A: %v", err)
-	}
-	_, err = s.UpsertDrama(ctx, Drama{Provider: "web", ProviderID: "b", Title: "剧B"})
-	if err != nil {
-		t.Fatalf("UpsertDrama B: %v", err)
-	}
-	for _, n := range []int{1, 2, 3} {
-		if _, err := s.UpsertEpisode(ctx, Episode{DramaID: idA, EpNo: n, Source: "web", Vid: "v"}); err != nil {
-			t.Fatalf("UpsertEpisode A:%d: %v", n, err)
-		}
-	}
-	if n := countRows(t, s.db, "episode"); n != 3 {
-		t.Fatalf("删除前 episode 行数 = %d, 期望 3", n)
-	}
-
-	if err := s.DeleteDrama(ctx, idA); err != nil {
-		t.Fatalf("DeleteDrama: %v", err)
-	}
-	if n := countRows(t, s.db, "episode"); n != 0 {
-		t.Fatalf("删除 A 后 episode 行数 = %d, 期望 0（级联）", n)
-	}
-	if n := countRows(t, s.db, "drama"); n != 1 {
-		t.Fatalf("删除 A 后 drama 行数 = %d, 期望 1", n)
-	}
-
-	if err := s.DeleteDrama(ctx, idA); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("重复删除错误 = %v, 期望 ErrNotFound", err)
-	}
-}
-
 // AC8：全字段往返（含空串、0、中文标题）。
 func TestFullFieldRoundtrip(t *testing.T) {
 	s := NewStore(newCRUDTestDB(t).DB)
@@ -603,9 +566,10 @@ func TestInTxCommitAndRollback(t *testing.T) {
 	}
 	// 事务内的方法与根 Store 同语义：缺行仍返回 ErrNotFound，不因事务包装而漂移。
 	if err := s.InTx(ctx, func(tx *Store) error {
-		return tx.DeleteDrama(ctx, 99999)
+		_, err := tx.DramaByID(ctx, 99999)
+		return err
 	}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("事务内 DeleteDrama 缺行 = %v, 期望 ErrNotFound", err)
+		t.Fatalf("事务内 DramaByID 缺行 = %v, 期望 ErrNotFound", err)
 	}
 }
 

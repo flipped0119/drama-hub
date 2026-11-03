@@ -10,11 +10,10 @@
 <header class="topbar">
   <span class="wordmark">drama-hub</span>
   <nav class="tabs" aria-label="管理页">
-    <a href="/"{{if eq .Page "dramas"}} aria-current="page"{{end}}>剧目</a>
-    <a href="/status"{{if eq .Page "status"}} aria-current="page"{{end}}>同步与缓存</a>
+    <a href="/status" aria-current="page">同步与缓存</a>
   </nav>
-  <!-- 写操作（同步/删除/改配置）要带 X-Admin-Token；令牌只存在本标签页的 sessionStorage。 -->
-  <label class="field inline token-field" title="DRAMA_HUB_ADMIN_TOKEN：写操作（同步 / 删除 / 改配置）要带上它">
+  <!-- 写操作（同步/改配置）要带 X-Admin-Token；令牌只存在本标签页的 sessionStorage。 -->
+  <label class="field inline token-field" title="DRAMA_HUB_ADMIN_TOKEN：写操作（同步 / 改配置）要带上它">
     <span>管理令牌</span>
     <input type="password" id="admin-token" autocomplete="off" spellcheck="false"
            placeholder="DRAMA_HUB_ADMIN_TOKEN">

@@ -188,7 +188,8 @@ worker 数不复用 `ffmpeg` 那个常量（`internal/segment` 的闸），但�
 | 手动触发 | 单飞锁 | 撞车时第二次返回 409，不重复执行 |
 
 **刷新只增改，不删。** 源里消失的剧/集不会被删除（`ErrNotFound` 只记日志），
-理由与后果见 `docs/DATA-MODEL.md`「增删改语义」。删剧只走管理 API 的显式删除。
+理由与后果见 `docs/DATA-MODEL.md`「增删改语义」。服务不提供删剧入口
+（MKACG-665 移除了 `DELETE /api/dramas/{id}` 与 `store.DeleteDrama`）。
 
 ## 手动触发
 

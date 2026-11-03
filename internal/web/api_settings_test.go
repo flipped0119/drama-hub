@@ -14,12 +14,11 @@ import (
 )
 
 // TestAPI_WriteEndpointsRequireToken 覆盖写操作的令牌闸门：`/api/` 原本完全无鉴权，
-// POST /api/dramas 能触发同步、DELETE 能删库。没配令牌一律 401（fail closed），
+// POST /api/dramas 能触发同步。没配令牌一律 401（fail closed），
 // 带错也 401，读操作不受影响。
 func TestAPI_WriteEndpointsRequireToken(t *testing.T) {
 	writes := []struct{ method, path, body string }{
 		{http.MethodPost, "/api/dramas", `{"series_id":"1"}`},
-		{http.MethodDelete, "/api/dramas/1", ""},
 		{http.MethodPost, "/api/refresh", `{"source":"web"}`},
 		{http.MethodPatch, "/api/settings", `{"settings":{"webdav_user":"alice"}}`},
 		// PUT 现在没有注册端点，但闸门按「非读即写」判定：日后加了 PUT 也默认受保护，

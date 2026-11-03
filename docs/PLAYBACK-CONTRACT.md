@@ -195,7 +195,7 @@ uid ∈ { "e<episode.id>", "m<dramaID>_<epFrom>_<epTo>" }   （合并集是自�
 | `/webdav/…` | PROPFIND / GET | 只读虚拟文件系统 |
 | `/video/{id}.m3u8` | GET / HEAD | 播放列表 |
 | `/video/{id}/{seq}.m4s` | GET / HEAD | 分片（整集 fMP4） |
-| `/api/dramas` / `/api/dramas/{id}/…` | — | 管理 API |
+| `/api/dramas` | — | 管理 API |
 | `/api/refresh` | POST | 手动触发一轮刷新（`docs/SCHEDULER-MODEL.md`） |
 | `/api/status` | GET | 含各源调度状态（同上） |
 | `/healthz` | GET | 存活探测（不变） |

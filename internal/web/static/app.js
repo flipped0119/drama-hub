@@ -1,7 +1,7 @@
 'use strict';
 /* drama-hub 管理面脚本。
  *
- * 一套通用请求/渲染小工具 + 两个页面的 init，靠 body[data-page] 分派。
+ * 一套通用请求/渲染小工具 + 单个页面的 init，靠 body[data-page] 分派。
  * 只用原生 DOM API、不引框架、没有构建步骤（ADR-0002）；页面数据一律来自
  * /api/ 下的 JSON 端点，渲染结果与 API 返回一一对应。 */
 
@@ -112,74 +112,6 @@ function fmtDuration(ms) {
 /** 等一会儿（轮询间隔用）。 */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// ---- 剧目页 ----
-
-function initDramas() {
-  const form = document.getElementById('drama-form');
-  const input = document.getElementById('series-id');
-  const syncBtn = document.getElementById('sync-btn');
-  const tbody = document.getElementById('dramas');
-  const empty = document.getElementById('dramas-empty');
-
-  function render(dramas) {
-    tbody.replaceChildren();
-    for (const drama of dramas) {
-      const deleteBtn = el('button', {
-        type: 'button', class: 'btn ghost', text: '删除',
-        onclick: () => removeDrama(drama),
-      });
-      tbody.append(el('tr', {},
-        el('td', {}, el('div', { class: 'title-cell' },
-          el('span', { text: drama.title }),
-          el('span', { class: 'sub', text: drama.provider + ':' + drama.provider_id }))),
-        el('td', { class: 'num', text: drama.year === 0 ? '—' : String(drama.year) }),
-        el('td', { class: 'num', text: drama.episodes + ' / ' + drama.episode_total }),
-        el('td', { class: 'num', text: String(drama.emby_items) }),
-        el('td', { class: 'mono', text: fmtTime(drama.sync_at) }),
-        el('td', { class: 'num' }, deleteBtn)));
-    }
-    empty.hidden = dramas.length !== 0;
-  }
-
-  async function reload() {
-    const data = await api('GET', '/api/dramas');
-    render(data.dramas);
-  }
-
-  async function removeDrama(drama) {
-    const ok = window.confirm('删除《' + drama.title + '》？它的 ' + drama.episodes +
-      ' 集会一并删除。');
-    if (!ok) return;
-    try {
-      await api('DELETE', '/api/dramas/' + drama.id);
-      await reload();
-      say('已删除《' + drama.title + '》', 'ok');
-    } catch (err) {
-      fail(err);
-    }
-  }
-
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const seriesId = input.value.trim();
-    if (seriesId === '') return;
-    syncBtn.disabled = true;
-    say('正在同步 ' + seriesId + ' …', 'busy');
-    try {
-      const data = await api('POST', '/api/dramas', { series_id: seriesId });
-      render(data.dramas);
-      input.value = '';
-      say('同步完成，库里共 ' + data.dramas.length + ' 部剧', 'ok');
-    } catch (err) {
-      fail(err);
-    } finally {
-      syncBtn.disabled = false;
-    }
-  });
-
-  reload().catch(fail);
 }
 
 // ---- 同步与缓存看板 ----
@@ -596,6 +528,4 @@ function initStatus() {
 // ---- 分派 ----
 
 initAdminToken();
-const page = document.body.dataset.page;
-if (page === 'dramas') initDramas();
-else if (page === 'status') initStatus();
+if (document.body.dataset.page === 'status') initStatus();
