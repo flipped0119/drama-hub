@@ -144,15 +144,16 @@ WebDAV 的 `PROPFIND` **没有分页**。客户端说「列出这个目录」，
 | 请求 | 行为 | 成本 |
 |---|---|---|
 | `Depth: 0` | 只回资源自己 | O(1) |
-| `Depth: 1` | 回直接子项 | O(该目录子项数) |
-| `Depth: infinity` **或省略 `Depth` 头** | **递归整棵子树** | O(子树里全部节点) |
+| `Depth: 1` | 回直接子项（**唯一应该用的形状**） | O(该目录子项数) |
+| `Depth: infinity` **或省略 `Depth` 头** | `403` + `<D:propfind-finite-depth/>`（MKACG-678 起拒绝，不再递归） | O(1) |
 | `Depth: 2`（任何数值 ≥2） | `x/net/webdav` 直接回 `400` | — |
 
-**注意第三行**：RFC 4918 §9.1 规定省略 `Depth` 等价于 `infinity`，`x/net/webdav` 的实现
-就是这样（`handlePropfind` 里 `depth := infiniteDepth` 是缺头时的默认值）。所以
-`curl -X PROPFIND <url>` 这种最省事的试法会递归整棵树——实测数字见下面「不带 `Depth` /
-`Depth: infinity`」。rclone mount 与 Emby/Jellyfin 都逐层发 `Depth: 1`，日常挂载不受这条
-影响，但这**必须**写进上限结论：它是本服务目前最贵的请求形状。
+RFC 4918 §9.1 规定省略 `Depth` 等价于 `infinity`，`x/net/webdav` 的实现就是这样
+（`handlePropfind` 里 `depth := infiniteDepth` 是缺头时的默认值）。本服务在认证之后、协议层
+之前把这两种请求一起拦成 `403` + `<D:propfind-finite-depth/>`（ADR-0017）：客户端收到该错误
+后按 RFC 改回递归 `Depth: 1`，不会再落到「一次请求拉整棵树」的挂死上。数值深度 ≥2 不在拦截
+范围，仍由协议层回 `400`。rclone mount 与 Emby/Jellyfin 都逐层发 `Depth: 1`，日常挂载不受
+影响。下面保留拦截前的实测数字——那是这个形状曾经的真实代价，也是不能放开它的依据。
 
 ### 实测环境与复现方式
 
@@ -203,7 +204,7 @@ WebDAV 的 `PROPFIND` **没有分页**。客户端说「列出这个目录」，
 | 100,000 | 52.9 MB | 1.99 s | **68.0 MB** |
 | 216,000（L1 最大分类外推） | 114.7 MB | 4.06 s | **136.9 MB** |
 
-**不带 `Depth` 头 / `Depth: infinity`（= 递归整棵子树）**
+**不带 `Depth` 头 / `Depth: infinity`（拦截前的实测；MKACG-678 起直接 403）**
 
 | 场景 | 响应体 | 墙钟 | VmHWM 增量 |
 |---|---|---|---|
@@ -257,18 +258,20 @@ WebDAV 的 `PROPFIND` **没有分页**。客户端说「列出这个目录」，
 2. **整树递归（省略 `Depth` 或 `infinity`）三项全越线，且量级不同**：21.6 万剧时
    369 MB / 116 s / +501 MB。它不是「慢一点」，是「不能用」——任何省略 `Depth` 的
    WebDAV 客户端（`curl -X PROPFIND` 是最常见的一种）都会落到这个形状上。
+   **MKACG-678 起这个形状在协议层之前被 `403` + `<D:propfind-finite-depth/>` 拦下
+   （ADR-0017）；以下是拦截前的实测，留下作为不能放开它的依据。**
 3. 服务端能控的只有「别为同一份响应多花内存」——已做（窄列 + 请求内快照）；
    响应体大小是 `PROPFIND` 协议本身的下限（无分页），改不动。
-4. **超线后的应对路径（不恢复分片层、不在本任务内改 `Depth` 支持）**，按证据强度排序：
+4. **超线后的应对路径（不恢复分片层；`Depth: infinity` 已于 MKACG-678 被拒）**，按证据强度排序：
    - **客户端必须带 `Depth: 1`**：rclone mount / Emby / Jellyfin 本来就这么扫，实测
      `rclone lsf -R` 正常；`curl` 之类的排障请求也要显式带 `-H 'Depth: 1'`。
    - **Emby/Jellyfin 一个库挂多个 media folder，每个分类一个**（68 个目录）：每个分类
      目录的子项数就是该分类的剧数，21.6 万这种规模只出现在「剧情」这一类上，而它本身
      就是 L1 最坏的假设。纯客户端配置，**不需要本服务改任何东西**。
    - 次选：给单个超大分类单独限库（同上，只是把「剧情」挪进一个独立库）。
-   - **若要真的挡住整树递归**（缺头/`infinity` 一律 `400` 或按 1 处理），必须改
-     `internal/webdav` 的 `Depth` 处理——那超出本任务的契约（Planner 明确 MUST NOT
-     「不改 `Depth` 支持」），需要 PL 另开任务决策。本任务只把它**测出来并写进上限**。
+   - **整树递归已挡住**（MKACG-678 / ADR-0017）：认证之后、协议层之前对 `infinity` 与
+     省略 `Depth` 回 `403` + `<D:propfind-finite-depth/>`，客户端按 RFC 改回 `Depth: 1`。
+     数值深度 ≥2 仍由协议层回 `400`（不在拦截范围）。
    - 不建议：恢复分片层——Jellyfin 会把分片目录当 Season（见「被推翻的做法」）。
 5. 脏标题的单文件 `Render`（`locateDrama` 点查不中 → 分类内比对）实测：
    21.6 万部规模下 **0.77–1.41 s/文件**（10 万部规模 0.36–0.39 s）。这类剧
@@ -309,9 +312,11 @@ MethodNotAllowed），浏览器与文件管理器因此打不开目录、只能�
 - **字节不从这里走**（硬约束 7）：目录页只出 HTML；`.strm` 的链接是它自身内容里的播放地址
   （`{strm_prefix}/video/{id}.m3u8`），非绝对 URL 时退回 WebDAV 自身路径。媒体字节只从
   `/video/…` 流出。
-- **其它行为不变**：PROPFIND 的 207 与 `Depth` 语义、文件 GET、写意图被拒的
-  状态码都由协议层决定，一字不改；所有 405 补
-  `Allow: OPTIONS, GET, HEAD, PROPFIND, LOCK, UNLOCK`（协议层自己产生的 405 也补）。
+- **其它行为不变**：PROPFIND 的 207、`Depth: 0/1` 语义、文件 GET、写意图被拒的
+  状态码都由协议层决定，一字不改（`Depth: infinity` / 省略 `Depth` 的 `403` 拦截在
+  MKACG-678 单独落地，见 ADR-0017）；所有 405 补
+  `Allow: OPTIONS, GET, HEAD, PROPFIND, LOCK, UNLOCK`（协议层自己产生的 405 也补），
+  OPTIONS 的 `Allow` 含 `GET, HEAD`（MKACG-678）。
 
 ## Emby / Jellyfin 侧影响（逐条回答）
 

@@ -695,7 +695,7 @@ App 通道退为兜底（MKACG-626/630）——同一集换通道就是另一条
 本包只提供两件事：`x/net/webdav.FileSystem` 适配（`fs.go`）与 Basic 认证（`handler.go`）。
 路径与目录形状见 `docs/DIRECTORY-CONTRACT.md`。
 
-### `Depth` 的三档取值与整树递归（MKACG-623 / MKACG-651 实测修正）
+### `Depth` 的三档取值与整树递归（MKACG-623 / 651 / 678）
 
 `PROPFIND` 的 `Depth` 由协议库解析（`x/net/webdav` 的 `parseDepth`）：**只认 `0`、`1`、
 `infinity` 三个字面量**，任何数值 ≥2 一律 `400 Bad Request`（协议库实现限制，不是本服务
@@ -703,32 +703,40 @@ App 通道退为兜底（MKACG-626/630）——同一集换通道就是另一条
 
 **关键的一条（旧版本节写错过，2026-11-02 功能检测实测纠正）**：**省略 `Depth` 头等于
 `infinity`**——RFC 4918 §9.1 就是这么规定的，`x/net/webdav` 的 `handlePropfind` 里
-`depth := infiniteDepth` 正是缺头时的默认值。`infinity` 会**递归整棵子树**：
+`depth := infiniteDepth` 正是缺头时的默认值。整树递归的实测代价是 369 MB / 116 s
+（21.6 万剧的分类目录），所以 MKACG-678 起本服务**在认证之后、协议层之前直接拒绝这个形状**：
 
 | 请求 | 行为 |
 |---|---|
-| `Depth: 0` | 只回资源自己 |
-| `Depth: 1` | 回直接子项（**唯一应该用的形状**） |
-| `Depth: infinity` / 省略 `Depth` 头 | 递归整棵子树（最贵的形状） |
+| `Depth: 0` | 只回资源自己（207） |
+| `Depth: 1` | 回直接子项（207，**唯一应该用的形状**） |
+| `Depth: infinity` / 省略 `Depth` 头 | `403` + `<D:error><D:propfind-finite-depth/></D:error>`（`application/xml`） |
 | `Depth: 2` 及以上 | `400` |
 
-所以「一次请求拉多层」在本服务上**是存在的**，代价实测（MKACG-651，冷启动真服务）：
-
-| 场景 | `Depth: 1` | 省略 `Depth`（= infinity） |
-|---|---|---|
-| 分类目录 21.6 万剧 | 114.7 MB / 4.06 s / RSS +137 MB | **369.0 MB / 116 s / RSS +501 MB** |
-| 一个分类 5,000 剧 × 10 集（50k item） | 2.6 MB / 0.10 s | **83.3 MB / 58.2 s** |
-
-口径与判据见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。
+拦截点在 `Handler.ServeHTTP` 里、认证与 308 之后、`servePropfind` / 协议层之前：请求不进入
+响应缓存、不查树、不渲染，所以根目录也是一次 O(1) 返回。`infiniteDepth()` 把「显式 infinity」
+与「缺头」当同一个形状处理——只拦前者会留下同一条挂死路径。决策与保留的实测数字见
+ADR-0017 与 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」。
 
 客户端与排障口径：
 
 - rclone mount / Emby / Jellyfin **逐层 `Depth: 1`**，不受影响；`rclone lsf -R` 实测正常。
-- 手工排障一律带 `-H 'Depth: 1'`：`curl -X PROPFIND <url>`（不带 `Depth`）会打整棵树，
-  在 20 万级目录上就是几分钟、几百 MB 响应 + 服务端 RSS 涨 0.5 GB。
+- 手工排障带 `-H 'Depth: 1'`：`curl -X PROPFIND <url>`（不带 `Depth`）现在直接拿到
+  `403` + `propfind-finite-depth`，按提示补 `Depth: 1` 即可，不再等几分钟。
 - 看到 `400` 先去查请求头（数值深度 ≥2），而不是查 vfs 树。
-- 本服务**没有**拦截 `infinity` 的逻辑，这是刻意的：拦截要改 `Depth` 支持，属另一件决策
-  （本任务的 Planner 契约明确 MUST NOT 动它）。要改先走 ADR。
+- 看到 `403` + `propfind-finite-depth` 是**协议的正常回复**，不是权限问题：改请求头，不要
+  去查基本认证或 settings。
+- `PROPFIND` 的响应缓存（ADR-0015）只缓存 `Depth: 0/1` 的 207；`403` 在进入缓存之前
+  返回，不会把「拒绝」缓存成后续请求的结果。
+
+### OPTIONS 的 Allow
+
+`OPTIONS` 仍交协议层生成（`DAV: 1, 2`、`MS-Author-Via`），但 `x/net/webdav` 的集合分支只列
+`OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND`，漏了本服务自
+MKACG-671 起真的支持的 `GET, HEAD`（集合 GET/HEAD 出目录页）。`serveOptions` 在协议层返回后
+补上这两个方法：`handleOptions` 只写响应头、不写状态码与正文（返回 `status 0`），响应在它
+返回后仍未提交，所以这次改写是安全的；`TestOptionsAllowIncludesGetHead` 钉住「集合与文件都
+含 GET/HEAD、`DAV` 头不变」。
 
 ### 路径映射
 

@@ -28,6 +28,11 @@ const MountPathNoSlash = "/webdav"
 // 405 响应本身不带，客户端因此看不出「这里能用哪些方法」。
 const allowMethods = "OPTIONS, GET, HEAD, PROPFIND, LOCK, UNLOCK"
 
+// propfindFiniteDepthBody 是拒绝 `Depth: infinity` 时的响应体（RFC 4918 §9.1）：
+// 客户端据此知道「这个服务只支持有限深度」，改回递归 Depth: 1。
+const propfindFiniteDepthBody = `<?xml version="1.0" encoding="utf-8"?>` +
+	`<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>`
+
 // Handler 是只读 WebDAV 端点的 http.Handler：Basic 认证 → x/net/webdav → vfs.Tree。
 //
 // 认证用 settings 的 webdav_user / webdav_pass，每请求现读（硬约束 5：改值即时生效，
@@ -81,6 +86,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 		return
 	}
+	// `Depth: infinity` 的 PROPFIND 会让协议层递归整棵子树：线上根目录实测
+	// 超过 120 秒仍未返回（分类 4.5 s、剧 0.06 s，成本与子树规模线性），客户端只会看到
+	// 连接超时、挂载失败。RFC 4918 §9.1 允许服务端拒绝这个形状：403 +
+	// <D:propfind-finite-depth/>，客户端收到后改回递归 Depth: 1（MKACG-678）。
+	if r.Method == methodPropfind && infiniteDepth(r) {
+		writeFiniteDepthError(w)
+		return
+	}
+	// OPTIONS 的 Allow 由协议层按「集合 / 文件」两种形状写，但集合分支漏了本服务实际
+	// 支持的 GET/HEAD（集合 GET/HEAD 出目录页，MKACG-671）。补上，避免客户端据此
+	// 判断「这里不能列目录」（MKACG-678）。
+	if r.Method == http.MethodOptions {
+		h.serveOptions(w, r)
+		return
+	}
 	// B1：.strm 在 strm_prefix 为空时要写出绝对地址，基地址只能从请求里来。
 	ctx := vfs.WithBaseURL(r.Context(), requestBaseURL(r))
 	r = r.WithContext(withSnapshot(ctx))
@@ -103,6 +123,53 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// 包装只为给协议层自己产生的 405 补 Allow。
 	h.inner.ServeHTTP(allowHeader{w}, r)
+}
+
+// serveOptions 交协议层写 OPTIONS 的头，再把它的 Allow 补上 GET/HEAD。
+//
+// x/net/webdav 的 handleOptions 只写响应头、不写状态码与正文（返回 status 0），响应在它
+// 返回后仍未提交，所以此时改 Allow 是安全的；测试锁住这个前提（Allow 必须含 GET/HEAD）。
+func (h *Handler) serveOptions(w http.ResponseWriter, r *http.Request) {
+	h.inner.ServeHTTP(w, r)
+	allow := w.Header().Get("Allow")
+	if allow == "" || allowHasMethod(allow, http.MethodGet) {
+		return
+	}
+	w.Header().Set("Allow", allow+", "+http.MethodGet+", "+http.MethodHead)
+}
+
+// infiniteDepth 判断这次 PROPFIND 是否会递归整棵子树。
+//
+// 显式 `infinity` 与省略 Depth 在 x/net/webdav 里是同一个值（infiniteDepth），所以两者
+// 一起拦：只拦显式 infinity 会给「curl -X PROPFIND 不带 Depth」留下同一条
+// 上百秒的挂死路径。数值深度不在此列，仍由协议层回 400。
+func infiniteDepth(r *http.Request) bool {
+	switch r.Header.Get("Depth") {
+	case "", "infinity":
+		return true
+	}
+	return false
+}
+
+// writeFiniteDepthError 按 RFC 4918 §9.1 回 403 + DAV:error。
+//
+// 错误体是常量，显式写 Content-Length：客户端与代理不必猜长度。
+func writeFiniteDepthError(w http.ResponseWriter) {
+	header := w.Header()
+	header.Set("Content-Type", "application/xml; charset=utf-8")
+	header.Set("Content-Length", strconv.Itoa(len(propfindFiniteDepthBody)))
+	w.WriteHeader(http.StatusForbidden)
+	_, _ = w.Write([]byte(propfindFiniteDepthBody))
+}
+
+// allowHasMethod 判断 Allow 头里是否已含某个方法（逗号分隔、可能带空格）。
+func allowHasMethod(allow, method string) bool {
+	for _, m := range strings.Split(allow, ",") {
+		if strings.EqualFold(strings.TrimSpace(m), method) {
+			return true
+		}
+	}
+	return false
 }
 
 // serveListing 在目标是集合时渲染目录页。handled=false 表示「不是集合」，
