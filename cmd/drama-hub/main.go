@@ -209,7 +209,11 @@ func newHandler(logger *slog.Logger, st *store.Store, settings *store.Settings, 
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz)
-	mux.Handle(webdav.MountPath, webdav.NewHandler(tree, settings, logger))
+	dav := webdav.NewHandler(tree, settings, logger)
+	mux.Handle(webdav.MountPath, dav)
+	// 无尾斜杠的同一个挂载点也必须进 handler：ServeMux 自己的跳转发生在认证之前，
+	// 跨跳转会丢掉 Authorization（MKACG-671）；handler 认证后 308 到 MountPath。
+	mux.Handle(webdav.MountPathNoSlash, dav)
 	// 播放面两条路由由 internal/segment 自己提供（领域包只提供 handler，挂载点在此）。
 	mux.HandleFunc(segment.PlaylistRoute, cutter.ServePlaylist)
 	mux.HandleFunc(segment.SegmentRoute, cutter.ServeSegment)

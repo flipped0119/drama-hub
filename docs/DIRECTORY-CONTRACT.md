@@ -289,6 +289,30 @@ v3 曾定「分类目录下加一层纯函数分片目录（`00`–`7f`，N=128�
 （每个分类一个 media folder）才是正确配法。分片层是否存在于这个结论无关，所以去掉它
 不损失任何能力。
 
+## 集合 GET（2026-11-04，MKACG-671）
+
+`x/net/webdav` 对集合的 GET/HEAD 一律 405（`handleGetHeadPost` 里 `fi.IsDir()` 直接返回
+MethodNotAllowed），浏览器与文件管理器因此打不开目录、只能靠 rclone 这类 WebDAV 客户端。
+本服务在协议层之前接管**只**「GET/HEAD 且目标是集合」的请求，渲染一页 HTML 目录；其余方法与
+文件仍原样交给协议层。
+
+- **认证在前**：未认证仍 401 + `WWW-Authenticate`，页面里一个条目都不渲染。`/webdav`（无尾
+  斜杠）的跳转也挪到认证之后，用 **308** 到 `/webdav/`（保留 query）：跳转发生在认证之前时
+  会丢掉 `Authorization`，客户端要重新弹一次认证。
+- **四层都可浏览**：`/webdav/`（分类）→ `/webdav/<分类>/`（剧）→
+  `/webdav/<分类>/<剧名> (<年份>)/`（Season）→ 文件。条目列名称、大小、修改时间；库里没有
+  可靠修改时间，未知一律写 `—` 而不是 1970。
+- **单页上限**：`settings.webdav_page_size`（默认 1000，范围 1–100000，每请求现读）。超出
+  只渲染前 N 条，页面写「共 M 项，已显示前 N」。这是硬要求而不是调优：整页铺 21.8 万行会生成
+  百 MB 级 HTML；实测 1,000 行的页面 ≈ 150 KB、生成 P50 ≈ 11 ms（`internal/webdav/listing_test.go`
+  的 `TestListingRenderBudget`，`DRAMA_HUB_BENCH=1` 打开）。
+- **字节不从这里走**（硬约束 7）：目录页只出 HTML；`.strm` 的链接是它自身内容里的播放地址
+  （`{strm_prefix}/video/{id}.m3u8`），非绝对 URL 时退回 WebDAV 自身路径。媒体字节只从
+  `/video/…` 流出。
+- **其它行为不变**：PROPFIND 的 207 与 `Depth` 语义、文件 GET、写意图被拒的
+  状态码都由协议层决定，一字不改；所有 405 补
+  `Allow: OPTIONS, GET, HEAD, PROPFIND, LOCK, UNLOCK`（协议层自己产生的 405 也补）。
+
 ## Emby / Jellyfin 侧影响（逐条回答）
 
 | 问题 | 答案 |

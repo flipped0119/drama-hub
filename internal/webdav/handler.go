@@ -2,8 +2,10 @@ package webdav
 
 import (
 	"crypto/subtle"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 
 	xwebdav "golang.org/x/net/webdav"
@@ -17,6 +19,15 @@ import (
 // （RFC 4918 要求 href 是绝对路径；Prefix 交给 x/net/webdav 处理，不做 StripPrefix）。
 const MountPath = "/webdav/"
 
+// MountPathNoSlash 是同一挂载点的无尾斜杠形式。它也注册到同一个 Handler：
+// http.ServeMux 自己的跳转发生在认证之前，跨跳转会丢掉 Authorization，
+// 客户端要重新弹一次认证（MKACG-671）。
+const MountPathNoSlash = "/webdav"
+
+// allowMethods 是 405 的 Allow 头。x/net/webdav 只在 OPTIONS 里写 Allow，
+// 405 响应本身不带，客户端因此看不出「这里能用哪些方法」。
+const allowMethods = "OPTIONS, GET, HEAD, PROPFIND, LOCK, UNLOCK"
+
 // Handler 是只读 WebDAV 端点的 http.Handler：Basic 认证 → x/net/webdav → vfs.Tree。
 //
 // 认证用 settings 的 webdav_user / webdav_pass，每请求现读（硬约束 5：改值即时生效，
@@ -25,16 +36,20 @@ type Handler struct {
 	settings *store.Settings
 	inner    *xwebdav.Handler
 	tree     Tree
+	// fs 是协议层用的同一份 FileSystem：目录页要用它判断目标是否为集合、
+	// 取文件大小与 .strm 的播放地址。
+	fs       *FS
 	propfind *propfindCache
 }
 
 // NewHandler 装配 WebDAV 端点。settings 不可为 nil；logger 只用于协议层错误
 // （正常请求不产生第二条日志——访问日志归装配根的 httpx.RequestLogger）。
 func NewHandler(tree Tree, settings *store.Settings, logger *slog.Logger) *Handler {
-	h := &Handler{settings: settings, tree: tree, propfind: newPropfindCache()}
+	fsys := NewFS(tree)
+	h := &Handler{settings: settings, tree: tree, fs: fsys, propfind: newPropfindCache()}
 	h.inner = &xwebdav.Handler{
 		Prefix:     MountPath,
-		FileSystem: NewFS(tree),
+		FileSystem: fsys,
 		// 锁定是协议层要求（rclone 会发 LOCK/UNLOCK）；本服务只读，内存锁足够，
 		// 不落盘、也无跨进程语义（硬约束 4：单二进制单实例）。
 		LockSystem: xwebdav.NewMemLS(),
@@ -57,6 +72,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, httpx.ErrUnauthorized)
 		return
 	}
+	// 无尾斜杠的挂载点在这里补跳转：认证之后才跳，凭据不会丢；308 保住方法与 body。
+	if r.URL.Path == MountPathNoSlash {
+		target := MountPath
+		if r.URL.RawQuery != "" {
+			target += "?" + r.URL.RawQuery
+		}
+		http.Redirect(w, r, target, http.StatusPermanentRedirect)
+		return
+	}
 	// B1：.strm 在 strm_prefix 为空时要写出绝对地址，基地址只能从请求里来。
 	ctx := vfs.WithBaseURL(r.Context(), requestBaseURL(r))
 	r = r.WithContext(withSnapshot(ctx))
@@ -66,7 +90,71 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.servePropfind(w, r)
 		return
 	}
-	h.inner.ServeHTTP(w, r)
+	// 集合的 GET/HEAD 渲染目录页；文件与其它方法原样交给协议层（MKACG-671）。
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		handled, err := h.serveListing(w, r)
+		if err != nil {
+			httpx.WriteError(w, err)
+			return
+		}
+		if handled {
+			return
+		}
+	}
+	// 包装只为给协议层自己产生的 405 补 Allow。
+	h.inner.ServeHTTP(allowHeader{w}, r)
+}
+
+// serveListing 在目标是集合时渲染目录页。handled=false 表示「不是集合」，
+// 交回协议层处理（文件 200、不存在 404 的语义都不变）。
+func (h *Handler) serveListing(w http.ResponseWriter, r *http.Request) (bool, error) {
+	ctx := r.Context()
+	// FileSystem 收的是「相对挂载点根」的路径（x/net/webdav 已剥 Prefix，这里自己剥）。
+	fsPath := strings.TrimPrefix(r.URL.Path, MountPathNoSlash)
+	fi, err := h.fs.Stat(ctx, fsPath)
+	if err != nil || !fi.IsDir() {
+		return false, nil
+	}
+	limit, err := h.settings.Int(ctx, store.KeyWebDAVPageSize)
+	if err != nil {
+		return false, fmt.Errorf("读取 %s: %w", store.KeyWebDAVPageSize, err)
+	}
+	dir := vfsDir(strings.Trim(fsPath, "/"))
+	nodes, err := h.tree.List(ctx, dir)
+	if err != nil {
+		return false, err
+	}
+	view, err := buildListing(ctx, h.fs, r.URL.EscapedPath(), nodes, limit)
+	if err != nil {
+		return false, err
+	}
+	body, err := renderListing(view)
+	if err != nil {
+		return false, err
+	}
+
+	header := w.Header()
+	header.Set("Content-Type", "text/html; charset=utf-8")
+	header.Set("Content-Length", strconv.Itoa(len(body)))
+	// 目录内容是同步后随时会变的视图，别让浏览器拿旧页面骗人。
+	header.Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(body)
+	}
+	return true, nil
+}
+
+// allowHeader 给 405 补 Allow，其它状态码原样透传。
+type allowHeader struct {
+	http.ResponseWriter
+}
+
+func (w allowHeader) WriteHeader(code int) {
+	if code == http.StatusMethodNotAllowed && w.Header().Get("Allow") == "" {
+		w.Header().Set("Allow", allowMethods)
+	}
+	w.ResponseWriter.WriteHeader(code)
 }
 
 // authorized 校验 Basic 凭据。
