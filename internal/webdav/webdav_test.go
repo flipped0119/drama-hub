@@ -656,8 +656,9 @@ func TestReadOnly(t *testing.T) {
 	}
 }
 
-// `Depth` 的真实语义（MKACG-651 功能检测纠正的口径）：0 = 只有资源自己、1 = 直接子项、
-// 省略头或 infinity = 递归整棵子树、数值 ≥2 = 协议库直接 400。
+// `Depth` 的真实语义（MKACG-651 功能检测纠正的口径，MKACG-678 起 infinity 被拦）：
+// 0 = 只有资源自己、1 = 直接子项、省略头或 infinity = 递归整棵子树（本服务改为 403
+// + propfind-finite-depth 拒绝）、数值 ≥2 = 协议库直接 400。
 //
 // 这条测试的存在原因很具体：交付文档曾经断言「本服务只支持 Depth 0/1，不存在一次请求
 // 拉多层」，而 `x/net/webdav` 缺头时默认 infiniteDepth，实测 21.6 万剧的分类目录在
@@ -713,24 +714,23 @@ func TestPropfindDepthSemantics(t *testing.T) {
 		}
 	})
 
-	t.Run("省略 Depth 等价于 infinity，递归整棵子树", func(t *testing.T) {
+	t.Run("省略 Depth 等价于 infinity，被拦为 403", func(t *testing.T) {
 		resp := f.request(t, "PROPFIND", "/"+f.genre, nil, nil)
-		if resp.StatusCode != http.StatusMultiStatus {
-			t.Fatalf("状态码 = %d, 期望 207", resp.StatusCode)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("状态码 = %d, 期望 403（省略 Depth 与 infinity 同义）", resp.StatusCode)
 		}
-		got := hrefs(t, resp)
-		if !got[strm] {
-			t.Errorf("省略 Depth 时没递归到孙级文件 %s（文档口径依赖这条事实）：%v", strm, got)
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatalf("读 body: %v", err)
 		}
 	})
 
-	t.Run("显式 infinity 同样递归", func(t *testing.T) {
+	t.Run("显式 infinity 同样被拦为 403", func(t *testing.T) {
 		resp := f.request(t, "PROPFIND", "/"+f.genre, nil, map[string]string{"Depth": "infinity"})
-		if resp.StatusCode != http.StatusMultiStatus {
-			t.Fatalf("状态码 = %d, 期望 207", resp.StatusCode)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("状态码 = %d, 期望 403", resp.StatusCode)
 		}
-		if got := hrefs(t, resp); !got[strm] {
-			t.Errorf("Depth:infinity 没递归到孙级文件 %s：%v", strm, got)
+		if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+			t.Fatalf("读 body: %v", err)
 		}
 	})
 
@@ -1314,5 +1314,94 @@ func TestPosterFetchFailureIsNotFound(t *testing.T) {
 	}
 	if _, ok := entries(t, ms)["/webdav"+f.dramaPath()+"/poster.jpg"]; ok {
 		t.Fatal("回源失败的 poster.jpg 仍出现在列举里")
+	}
+}
+
+// MKACG-678 AC：Depth: infinity 在每一层都被拦（根 / 分类 / 剧目录 / 季目录），回
+// 403 + RFC 4918 §9.1 的 <D:propfind-finite-depth/>；Content-Length 与 body 一致，
+// 客户端据此改回递归 Depth: 1。
+func TestPropfindDepthInfinityRejected(t *testing.T) {
+	f := newFixture(t)
+	for _, path := range []string{"/", "/" + f.genre, f.dramaPath(), f.seasonPath()} {
+		t.Run(path, func(t *testing.T) {
+			resp := f.request(t, "PROPFIND", path, nil, map[string]string{"Depth": "infinity"})
+			if resp.StatusCode != http.StatusForbidden {
+				t.Fatalf("Depth:infinity %s 状态码 = %d, 期望 403", path, resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("读 403 body: %v", err)
+			}
+			if !bytes.Contains(body, []byte("<D:propfind-finite-depth/>")) {
+				t.Errorf("403 body 缺 <D:propfind-finite-depth/>：%s", body)
+			}
+			if ct := resp.Header.Get("Content-Type"); ct != "application/xml; charset=utf-8" {
+				t.Errorf("Content-Type = %q, 期望 application/xml; charset=utf-8", ct)
+			}
+			if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(body)) {
+				t.Errorf("Content-Length = %q, body 长度 = %d", cl, len(body))
+			}
+		})
+	}
+}
+
+// MKACG-678 AC：拦截发生在协议层之前——Depth: infinity 不打树（不 List、不 Render），
+// 所以根目录再大也是毫秒级返回。计数树把「零工作量」变成可断言的事实。
+func TestPropfindDepthInfinitySkipsTree(t *testing.T) {
+	f := newBulkFixture(t, 3)
+	f.tree.reset()
+
+	resp := f.request(t, "PROPFIND", "/", nil, map[string]string{"Depth": "infinity"})
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("状态码 = %d, 期望 403", resp.StatusCode)
+	}
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Fatalf("读 403 body: %v", err)
+	}
+	if f.tree.lists != 0 || f.tree.renders != 0 {
+		t.Errorf("Depth:infinity 仍然打了树：List=%d Render=%d", f.tree.lists, f.tree.renders)
+	}
+}
+
+// MKACG-678 AC（范围外约束）：未认证的 Depth: infinity 仍 401——拦截点必须在认证之后。
+func TestPropfindDepthInfinityRequiresAuth(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "PROPFIND", f.srv.URL+MountPath, nil)
+	if err != nil {
+		t.Fatalf("构造请求: %v", err)
+	}
+	req.Header.Set("Depth", "infinity")
+	resp, err := f.client.Do(req)
+	if err != nil {
+		t.Fatalf("PROPFIND（无认证）: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("未认证 Depth:infinity 状态码 = %d, 期望 401", resp.StatusCode)
+	}
+}
+
+// MKACG-678 AC：OPTIONS 的 Allow 含 GET/HEAD（集合与文件都断言），DAV 合规头不变。
+func TestOptionsAllowIncludesGetHead(t *testing.T) {
+	f := newFixture(t)
+	file := f.seasonPath() + "/" + f.episodeBase(f.epIDs[0]) + ".strm"
+	for _, path := range []string{"/", "/" + f.genre, f.dramaPath(), f.seasonPath(), file} {
+		t.Run(path, func(t *testing.T) {
+			resp := f.request(t, http.MethodOptions, path, nil, nil)
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("OPTIONS %s 状态码 = %d, 期望 200", path, resp.StatusCode)
+			}
+			allow := resp.Header.Get("Allow")
+			for _, method := range []string{"OPTIONS", "GET", "HEAD", "PROPFIND"} {
+				if !allowHasMethod(allow, method) {
+					t.Errorf("OPTIONS %s 的 Allow = %q，缺 %s", path, allow, method)
+				}
+			}
+			if dav := resp.Header.Get("DAV"); dav != "1, 2" {
+				t.Errorf("OPTIONS %s 的 DAV = %q, 期望 1, 2", path, dav)
+			}
+		})
 	}
 }

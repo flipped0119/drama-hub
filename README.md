@@ -62,7 +62,7 @@ curl -X PATCH -H "X-Admin-Token: $DRAMA_HUB_ADMIN_TOKEN" \
 | 端点 | 方法 | 状态 | 说明 |
 |---|---|---|---|
 | `/healthz` | GET（HEAD 隐式） | 200 `{"status":"ok"}` | 存活探测 |
-| `/webdav/` 及全部子路径 | 任意 | 207/200/308/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength；**排障请带 `Depth: 1`**——数值深度 ≥2 由 `x/net/webdav` 直接 400，而**省略 `Depth` 等价于 `infinity`，会递归整棵树**，21.6 万剧的分类目录实测 369 MB / 116 s / RSS +501 MB，见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）、**集合的 GET/HEAD → 200 `text/html` 目录页**（浏览器/文件管理器列目录用；单页 ≤ settings `webdav_page_size`（默认 1000），超出显示「共 M 项，已显示前 N」，`.strm` 的链接指向 `/video/…` 而不是 DAV 自身路径，见 `docs/DIRECTORY-CONTRACT.md`「集合 GET」）、GET strm/nfo 200；树是 `/{分类}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；认证后 `/webdav`（无尾斜杠）308 到 `/webdav/`（跳转在认证之后，凭据不会丢）；405 一律带 `Allow`；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
+| `/webdav/` 及全部子路径 | 任意 | 207/200/308/401/403/404/405/415/500 | 只读 WebDAV：PROPFIND 207（带 getcontentlength；**`Depth: infinity` 与省略 `Depth` 一律 `403` + `<D:propfind-finite-depth/>`**，见 RFC 4918 §9.1 与 `docs/adr/0017`——客户端收到后改回递归 `Depth: 1`；数值深度 ≥2 仍由 `x/net/webdav` 直接 400。拦截前的实测代价见 `docs/DIRECTORY-CONTRACT.md`「单目录子项上限」）、**集合的 GET/HEAD → 200 `text/html` 目录页**（浏览器/文件管理器列目录用；单页 ≤ settings `webdav_page_size`（默认 1000），超出显示「共 M 项，已显示前 N」，`.strm` 的链接指向 `/video/…` 而不是 DAV 自身路径，见 `docs/DIRECTORY-CONTRACT.md`「集合 GET」）、GET strm/nfo 200；树是 `/{分类}/{剧名} ({年份})/Season 01/<集>.{strm,nfo}`；Basic 认证（settings `webdav_user`/`webdav_pass`），无认证 401；认证后 `/webdav`（无尾斜杠）308 到 `/webdav/`（跳转在认证之后，凭据不会丢）；405 一律带 `Allow`，OPTIONS 的 `Allow` 含 `GET, HEAD`（集合也能列目录）；写意图被拒的状态码由协议层决定（`PUT` 404、`MOVE`/`COPY` 403、`DELETE`/无 body 的 `MKCOL` 405、带 body 的 `MKCOL` 415、`PROPPATCH` 500，逐格前置条件见 `docs/DEV-STANDARDS.md`「只读」） |
 | `/video/{id}.m3u8` | GET / HEAD | 200/401/403/404/501/502/503 | 自造 VOD playlist：单集与合并集**同一路径形态**，集边界带 `#EXT-X-DISCONTINUITY` |
 | `/video/{id}/{seq}.m4s` | GET / HEAD | 200/206/401/403/404/501/502/503 | 整集 fMP4 分片：本地缓存命中即回，未命中整集转封装并落缓存 |
 | `/s/{token}/…`、`/dav/…` | 任意 | 404 | 已退役（不留兼容层） |
@@ -144,7 +144,8 @@ curl -i -X POST -H 'Content-Type: application/json' \
 ```bash
 curl -i http://127.0.0.1:8080/healthz   # 200 {"status":"ok"}
 curl -u <webdav_user>:<webdav_pass> -X PROPFIND -H 'Depth: 1' http://127.0.0.1:8080/webdav/  # 207 + getcontentlength
-# Depth 只认 0 / 1 / infinity（数值深度 ≥2 → 400，x/net/webdav 的限制）；省略 Depth = infinity（递归整棵树），所以手工请求一律显式带 Depth: 1
+# Depth 只认 0 / 1 / infinity；数值深度 ≥2 → 400。`Depth: infinity` 与省略 Depth 会被直接拒成
+# 403 + <D:propfind-finite-depth/>（不再递归整棵树，ADR-0017），所以手工请求写 Depth: 1。
 ```
 
 每个请求输出一条结构化访问日志（`method` / `path` / `status` / `duration_ms`，见
