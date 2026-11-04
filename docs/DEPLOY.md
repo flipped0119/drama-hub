@@ -332,7 +332,7 @@ bash scripts/acceptance.sh              # 或只跑某段：bash scripts/accepta
 |---|---|
 | 首启后 PATCH 关调度，库还在涨 | 第一轮在启动后约 0.15 秒已派出，PATCH 只拦下一轮；本轮会跑到 `refresh_timeout_sec`（默认 900 秒）。见 3.1 |
 | 客户端列出的文件数 ≠ `对外集数×2 + 剧数` | 若首轮仍在灌库，清单与库是两个时刻的快照。等 `/api/status` 的 `running=false` 再比 |
-| App 通道连续几分钟全是 `/video` 502，日志 `App 取流 … "bytes":0` + `reason:"ErrSchema"` | 上游端点 `200 + 空响应体`。实测连续 25 分钟后自行恢复（同期同一 vid 之前是 18 KB 正常体）。按契约回 502 且不回落预览是正确行为；重试即可，不要当代码缺陷 |
+| App 通道连续几分钟全是 `/video` 502，日志 `App 取流 … "bytes":0` + `reason:"ErrRejected"`（可能还有 `renew_reason:"ErrRejected"`） | 上游端点 `200 + 空响应体`，是它拒绝请求的形态，不是契约结构变了（MKACG-673）。插件会换一次身份自愈；换身份有 ≤1 次/分钟闸，连续空体时本分钟内的重试直接失败，等到下一分钟再试。实测曾连续 25 分钟后自行恢复（同期同一 vid 之前是 18 KB 正常体） |
 
 `docs/SCHEDULER-MODEL.md` 把「首启立刻跑一轮」写成既定行为；本文件的 3.1 只讲怎么在验收时
 绕开它，不改调度语义。
