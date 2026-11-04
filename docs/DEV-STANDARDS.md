@@ -147,6 +147,7 @@ env；env 缺省或值非法（secret 不足 32 字节）时只记一条 warn、
 | `stream_secret` | 必填 | ≥ 32 字节 | 即时（每请求） | 出流 HMAC 签名密钥（见 ADR-0003）；换了之后所有旧 URL 失效 |
 | `merge_chunk_size` | `10` | 1–500 | 即时（每次派生对外剧集） | 每 N 集并成 1 条对外剧集（ADR-0010 / 0014）。库里只存原始集，列举与播放每次现读本值重算，改完下一次读取即生效、不用重启也不用同步；改 N 会重排全库对外集号，旧合并 uid 随即 404（分片缓存靠 LRU 过期，不主动清） |
 | `webdav_user` / `webdav_pass` | 必填 | 非空字符串 | 即时（每请求） | WebDAV Basic 认证 |
+| `webdav_page_size` | `1000` | 1–100000 | 即时（每次目录页请求） | WebDAV 集合 GET 目录页的单页条数：超出部分不渲染，页面上写「共 M 项，已显示前 N」。分类层有 21.8 万项目录，整页铺开会生成百 MB 级 HTML（MKACG-671；语义见 `docs/DIRECTORY-CONTRACT.md`「集合 GET」） |
 | `cache_dir` | `./data/cache`（镜像 `/data/cache`） | 非空路径 | 即时（每次读写） | 本地缓存根目录：海报 `cover/`、分片 `seg/`，临时文件 `tmp/`（`docs/CACHE-MODEL.md`）；三个目录在启动时预先建出 |
 | `cache_max_mb` | `8192` | 0–1048576 | ≤5 分钟（下一轮淘汰） | 分片缓存上限（MB）；`0` = 不按大小淘汰 |
 | `cache_lru_days` | `30` | 1–365 | ≤5 分钟（下一轮淘汰） | 超过 N 天未命中的缓存条目（所有 kind 都算）删除 |

@@ -207,9 +207,12 @@ func newFixtureWith(t *testing.T, cover *coverFixture) fixture {
 		coverPath = row.Path
 	}
 
-	// 与 cmd 的装配方式一致：handler 挂在 MountPath 上，路径前缀由它自己剥。
+	// 与 cmd 的装配方式一致：handler 挂在 MountPath 上，路径前缀由它自己剥；
+	// 无尾斜杠的同一挂载点也注册到它（认证后 308，见 MKACG-671）。
 	mux := http.NewServeMux()
-	mux.Handle(MountPath, NewHandler(vfs.NewTree(st, settings, stubID, covers, newDiscardLogger()), settings, newDiscardLogger()))
+	dav := NewHandler(vfs.NewTree(st, settings, stubID, covers, newDiscardLogger()), settings, newDiscardLogger())
+	mux.Handle(MountPath, dav)
+	mux.Handle(MountPathNoSlash, dav)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

@@ -38,9 +38,13 @@ const (
 	KeyStreamSecret SettingKey = "stream_secret"
 	KeyWebDAVUser   SettingKey = "webdav_user"
 	KeyWebDAVPass   SettingKey = "webdav_pass"
-	KeyCacheDir     SettingKey = "cache_dir"
-	KeyCacheMaxMB   SettingKey = "cache_max_mb"
-	KeyCacheLRUDays SettingKey = "cache_lru_days"
+	// KeyWebDAVPageSize 是浏览器目录页的单页条数（默认 1000，范围 1–100000）。分类层
+	// 有 21.8 万项目录，整页铺开会生成百 MB 级 HTML；每次请求现读，改完下一次刷新即生效
+	// （MKACG-671，语义见 docs/DIRECTORY-CONTRACT.md「集合 GET」）。
+	KeyWebDAVPageSize SettingKey = "webdav_page_size"
+	KeyCacheDir       SettingKey = "cache_dir"
+	KeyCacheMaxMB     SettingKey = "cache_max_mb"
+	KeyCacheLRUDays   SettingKey = "cache_lru_days"
 	// KeyCoverTimeoutSec 是海报下载的单次出站超时（秒）。默认值、范围与理由见
 	// docs/DEV-STANDARDS.md「配置」表：海报是三方 CDN 上的百 KB 级图片，比页面请求
 	// 该更早放弃，因此单独一项，不跟插件超时走（MKACG-620）。
@@ -407,6 +411,10 @@ func specFor(key SettingKey) (settingSpec, bool) {
 		return settingSpec{kind: kindString, required: true}, true
 	case KeyWebDAVPass:
 		return settingSpec{kind: kindString, required: true}, true
+	case KeyWebDAVPageSize:
+		// 目录页单页条数：默认值取自「21.8 万项也不允许生成百 MB 级 HTML」的量级，
+		// 上限 10 万只是防手误把整棵树铺一页。
+		return settingSpec{kind: kindInt, def: "1000", min: 1, max: 100000}, true
 	case KeyCacheDir:
 		// 缓存根目录：海报与分片落 <cache_dir>/{cover,seg}/…；写盘时按需 MkdirAll。
 		return settingSpec{kind: kindString, def: "./data/cache"}, true
